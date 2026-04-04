@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="${CLAUDEFORM_REPO:-peterschmidt85/claudeform}"
+REPO="${CLAUDEFORM_REPO:-dstackai/claudeform}"
 INSTALL_DIR="${CLAUDEFORM_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${CLAUDEFORM_VERSION:-latest}"
 
@@ -15,11 +15,11 @@ Usage:
 Environment overrides:
   CLAUDEFORM_VERSION      Tag to install (example: v0.1.0, v0.2.0-rc.1)
   CLAUDEFORM_INSTALL_DIR  Destination directory (default: ~/.local/bin)
-  CLAUDEFORM_REPO         GitHub repo (default: peterschmidt85/claudeform)
+  CLAUDEFORM_REPO         GitHub repo (default: dstackai/claudeform)
 
 Examples:
-  curl -fsSL https://raw.githubusercontent.com/peterschmidt85/claudeform/main/install.sh | sh
-  CLAUDEFORM_VERSION=v0.2.0-rc.1 curl -fsSL https://raw.githubusercontent.com/peterschmidt85/claudeform/main/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/dstackai/claudeform/main/install.sh | sh
+  CLAUDEFORM_VERSION=v0.2.0-rc.1 curl -fsSL https://raw.githubusercontent.com/dstackai/claudeform/main/install.sh | sh
 EOF
 }
 

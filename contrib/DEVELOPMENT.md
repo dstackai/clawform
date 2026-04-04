@@ -19,14 +19,14 @@ Expected for authenticated runs: a successful status output.
 Install latest stable release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/peterschmidt85/claudeform/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/dstackai/claudeform/main/install.sh | sh
 ```
 
 Install a pinned version (including pre-release tags):
 
 ```bash
-CLAUDEFORM_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/peterschmidt85/claudeform/main/install.sh | sh
-CLAUDEFORM_VERSION=v0.2.0-rc.1 curl -fsSL https://raw.githubusercontent.com/peterschmidt85/claudeform/main/install.sh | sh
+CLAUDEFORM_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/dstackai/claudeform/main/install.sh | sh
+CLAUDEFORM_VERSION=v0.2.0-rc.1 curl -fsSL https://raw.githubusercontent.com/dstackai/claudeform/main/install.sh | sh
 ```
 
 Notes:
