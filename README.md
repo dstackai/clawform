@@ -49,13 +49,13 @@ After execution, Claudeform stores:
 Install latest stable:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/peterschmidt85/claudeform/main/install.sh | sh
 ```
 
 Install a specific version:
 
 ```bash
-CLAUDEFORM_VERSION=v0.0.2 curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh | sh
+CLAUDEFORM_VERSION=v0.0.2 curl -fsSL https://raw.githubusercontent.com/peterschmidt85/claudeform/main/install.sh | sh
 ```
 
 ## Quick Start
@@ -76,13 +76,7 @@ CLAUDEFORM_VERSION=v0.0.2 curl -fsSL https://raw.githubusercontent.com/<owner>/<
 }
 ```
 
-2. Use the example program:
-
-```bash
-cat examples/smoke.md
-```
-
-3. Run:
+2. Run:
 
 ```bash
 cf apply -f examples/smoke.md
