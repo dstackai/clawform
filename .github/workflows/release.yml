@@ -19,7 +19,7 @@ jobs:
           - runner: ubuntu-latest
             archive_os: linux
             archive_arch: x86_64
-          - runner: macos-13
+          - runner: macos-15-intel
             archive_os: darwin
             archive_arch: x86_64
           - runner: macos-14
