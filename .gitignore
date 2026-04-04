@@ -1,0 +1,26 @@
+# Rust
+/target/
+
+# Swift Package Manager
+/.build/
+calculator-app/.build/
+calculator-app/build/
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log
+
+# Local workspace metadata
+.claudeform/
+.module-cache/
+.modulecache/
+.cache/
+example-data/
+.cache/

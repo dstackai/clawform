@@ -1,0 +1,18 @@
+[package]
+name = "claudeform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+default-run = "claudeform"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+claudeform-core = { path = "../claudeform-core" }
+
+[dev-dependencies]
+anyhow.workspace = true
+tempfile.workspace = true
+serial_test = "3.2"
