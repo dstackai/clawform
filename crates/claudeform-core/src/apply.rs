@@ -71,8 +71,8 @@ pub struct ApplyResult {
 pub enum AgentStatus {
     Success,
     Partial,
-    Blocked,
-    Failed,
+    #[serde(alias = "failed", alias = "blocked")]
+    Failure,
 }
 
 impl AgentStatus {
@@ -80,8 +80,7 @@ impl AgentStatus {
         match self {
             Self::Success => "success",
             Self::Partial => "partial",
-            Self::Blocked => "blocked",
-            Self::Failed => "failed",
+            Self::Failure => "failure",
         }
     }
 }
@@ -90,22 +89,27 @@ impl AgentStatus {
 pub struct AgentResult {
     pub status: AgentStatus,
     pub message: Option<String>,
-    pub diff_handled: bool,
-    pub criteria_met: Vec<String>,
-    pub criteria_unmet: Vec<String>,
-    pub evidence: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AgentResultFile {
     status: AgentStatus,
     #[serde(default)]
     message: Option<String>,
-    diff_handled: bool,
-    criteria_met: Vec<String>,
-    criteria_unmet: Vec<String>,
-    evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum AgentOutputManifestEntry {
+    Path(String),
+    Record(AgentOutputManifestRecord),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AgentOutputManifestRecord {
+    path: String,
+    #[serde(default)]
+    change: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,7 +153,7 @@ struct SharedPlanData {
     program_id: String,
     program_file: String,
     model: Option<String>,
-    program_diff_vs_last_success: PlanProgramDiff,
+    program_diff_vs_last_session: PlanProgramDiff,
     last_session: Option<PlanLastSession>,
 }
 
@@ -489,9 +493,7 @@ fn execute_apply<R: ProviderRunner>(
     let (files_total, insertions, deletions, files_changed) =
         summarize_reported_files(&file_results);
 
-    if let Err(err) =
-        validate_agent_completion(&agent_result, &plan_data.program_diff_vs_last_success)
-    {
+    if let Err(err) = validate_agent_completion(&agent_result) {
         let _ = persist_session_outcome(
             &request.workspace_root,
             &context.program_key,
@@ -699,35 +701,10 @@ fn summarize_reported_files(file_results: &[FileResult]) -> (usize, usize, usize
     (files_total, insertions, deletions, files_changed)
 }
 
-fn validate_agent_completion(
-    agent_result: &Option<AgentResult>,
-    program_diff: &PlanProgramDiff,
-) -> Result<()> {
-    let result = agent_result
+fn validate_agent_completion(agent_result: &Option<AgentResult>) -> Result<()> {
+    let _ = agent_result
         .as_ref()
         .ok_or_else(|| anyhow!("missing required '{}'", AGENT_RESULT_REL))?;
-
-    if program_diff.status == "changed" && !result.diff_handled {
-        return Err(anyhow!(
-            "invalid '{}': `diff_handled` must be true when program diff is changed",
-            AGENT_RESULT_REL
-        ));
-    }
-
-    if result.status == AgentStatus::Success && !result.criteria_unmet.is_empty() {
-        return Err(anyhow!(
-            "invalid '{}': success status cannot include `criteria_unmet`",
-            AGENT_RESULT_REL
-        ));
-    }
-
-    if result.status == AgentStatus::Success && result.evidence.is_empty() {
-        return Err(anyhow!(
-            "invalid '{}': success status requires non-empty `evidence`",
-            AGENT_RESULT_REL
-        ));
-    }
-
     Ok(())
 }
 
@@ -740,12 +717,12 @@ fn build_shared_plan_data(
         program_id: context.program_key.clone(),
         program_file: context.program_file.clone(),
         model: context.resolved_model.clone(),
-        program_diff_vs_last_success: compute_program_diff_vs_last_success(
+        program_diff_vs_last_session: compute_program_diff_vs_last_session(
             workspace_root,
             &context.program_key,
             &context.program_file,
             &context.program_raw,
-            history.last_success.as_ref(),
+            history.last_session.as_ref(),
         ),
         last_session: history.last_session.as_ref().map(|rec| PlanLastSession {
             session_id: rec.session_id.clone(),
@@ -765,14 +742,14 @@ fn build_shared_plan_data(
     }
 }
 
-fn compute_program_diff_vs_last_success(
+fn compute_program_diff_vs_last_session(
     workspace_root: &Path,
     program_id: &str,
     program_file: &str,
     current_program_raw: &str,
-    last_success: Option<&RunHistoryRecord>,
+    last_session: Option<&RunHistoryRecord>,
 ) -> PlanProgramDiff {
-    let Some(last_success) = last_success else {
+    let Some(last_session) = last_session else {
         return PlanProgramDiff {
             status: "first_apply".to_string(),
             file: program_file.to_string(),
@@ -782,7 +759,7 @@ fn compute_program_diff_vs_last_success(
         };
     };
 
-    let Some(session_id) = last_success.session_id.as_deref() else {
+    let Some(session_id) = last_session.session_id.as_deref() else {
         return PlanProgramDiff {
             status: "unavailable".to_string(),
             file: program_file.to_string(),
@@ -816,6 +793,13 @@ fn compute_program_diff_vs_last_success(
         lines_changed: line_stats.changed,
         lines_added: line_stats.added,
         lines_deleted: line_stats.deleted,
+    }
+}
+
+fn run_status_str(status: &RunStatus) -> &'static str {
+    match status {
+        RunStatus::Success => "success",
+        RunStatus::Failure => "failure",
     }
 }
 
@@ -904,54 +888,220 @@ fn truncate_chars(raw: &str, max: usize) -> String {
     out
 }
 
-fn build_runtime_prompt(program_raw: &str, plan_data: &SharedPlanData) -> Result<String> {
+fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Result<String> {
     let mut block = String::new();
-    block.push_str(program_raw);
-    block.push_str("\n\n---\n");
-    block.push_str("Claudeform plan context (v1, compact, non-authoritative):\n");
-    block.push_str("```json\n");
-    block.push_str(
-        &serde_json::to_string_pretty(plan_data)
-            .context("failed serializing shared plan data for prompt")?,
-    );
-    block.push_str("\n```\n\n");
-    block.push_str("Claudeform runtime instructions (v0):\n");
-    block.push_str("- Treat the markdown body as agent-facing intent and context.\n");
-    block.push_str("- Claudeform does not pre-parse or validate input/output contracts in v0.\n");
-    block.push_str(
-        "- Use plan context only as a hint. Current markdown program is source of truth.\n",
-    );
-    block.push_str("- Treat every explicit requirement in the markdown (Task/Output/Requirements or equivalent) as a completion criterion, not optional guidance.\n");
-    block.push_str("- Treat `program_diff_vs_last_success` in the plan context as a high-priority delta signal.\n");
-    block.push_str("- If `program_diff_vs_last_success.status` is `changed`, explicitly adapt work to the changed program lines instead of repeating the previous run by default.\n");
-    block.push_str("- Before finishing, verify each completion criterion with concrete evidence (files/commands/tests as relevant).\n");
-    block.push_str("- Do not claim an output exists unless you verified it in this run (for example with `ls`, `test -f`, `file`, or equivalent checks).\n");
-    block.push_str("- If blocked by environment/tooling constraints, avoid repeated retries for the same root cause. Try at most two distinct remediation attempts, then stop and report the blocker clearly.\n");
-    block.push_str("- Modify workspace files as needed to satisfy the task.\n");
-    block.push_str("- Keep changes scoped to the requested task.\n");
-    block.push_str("- After finishing, write `./");
-    block.push_str(AGENT_RESULT_REL);
-    block.push_str("` as JSON object with shape: {\"status\":\"success|partial|blocked|failed\",\"message\":\"optional\",\"diff_handled\":true|false,\"criteria_met\":[...],\"criteria_unmet\":[...],\"evidence\":[...]}.\n");
-    block.push_str("- `diff_handled` must be true whenever program diff status is `changed`.\n");
-    block.push_str("- In `agent_result.message`, summarize criteria_met, criteria_unmet, and blocker (if any) in one compact line.\n");
-    block.push_str(
-        "- Do not finish the run until `agent_result` is written with final status and evidence.\n",
-    );
-    block.push_str("- After finishing, write `./");
+    let program_file = plan_data.program_file.as_str();
+    let program_id = plan_data.program_id.as_str();
+    let program_dir = sanitize_storage_token(program_id, "program");
+
+    if let Some(last) = &plan_data.last_session {
+        let session_id_raw = last
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let session_id = sanitize_storage_token(session_id_raw.as_str(), "session");
+        let session_root = format!(".claudeform/programs/{program_dir}/sessions/{session_id}");
+        let last_program_file = format!("{session_root}/program.md");
+        let last_output_file = format!("{session_root}/output.md");
+        let history_path = format!(".claudeform/programs/{program_dir}/sessions/");
+        let change_summary = match plan_data.program_diff_vs_last_session.status.as_str() {
+            "unavailable" => "unavailable".to_string(),
+            _ => format_program_diff_totals(
+                plan_data.program_diff_vs_last_session.lines_changed,
+                plan_data.program_diff_vs_last_session.lines_added,
+                plan_data.program_diff_vs_last_session.lines_deleted,
+            ),
+        };
+        let compare_from = if plan_data.program_diff_vs_last_session.status == "unavailable" {
+            "not available".to_string()
+        } else {
+            last_program_file.clone()
+        };
+
+        block.push_str("Claudeform apply session contract\n\n");
+        block.push_str("You are running the \"current session\".\n\n");
+        block.push_str("Fixed terms used in this prompt:\n");
+        block.push_str("- \"program\": the new program version for this session, stored at `");
+        block.push_str(program_file);
+        block.push_str("`\n");
+        block.push_str("- \"current session\": this session\n");
+        block.push_str("- \"last session\": the most recent finished session for this program\n\n");
+        block.push_str("What is expected in this \"current session\":\n");
+        block.push_str("- Complete the \"program\".\n");
+        block.push_str("- Use files and tools in the workspace as needed to complete the \"program\".\n");
+        block.push_str("- Use \"last session\" details to understand what was already done.\n");
+        block.push_str("- Keep correct work from \"last session\"; do not redo work without a clear reason.\n");
+        block.push_str("- If program changes require updates, apply only the updates required by those changes.\n");
+        block.push_str("- If verification shows issues, fix them in this \"current session\".\n");
+        block.push_str("- Continue until the program result is correct, or stop only when there is no practical way forward.\n");
+        block.push_str("- You may change workspace files, but only files needed to complete the \"program\".\n\n");
+        block.push_str("Required execution order:\n");
+        block.push_str("1) Read the new program version: `");
+        block.push_str(program_file);
+        block.push_str("`.\n");
+        block.push_str("2) Read \"last session\" files:\n");
+        block.push_str("   `");
+        block.push_str(last_program_file.as_str());
+        block.push_str("`\n");
+        block.push_str("   and\n");
+        block.push_str("   `");
+        block.push_str(last_output_file.as_str());
+        block.push_str("`.\n");
+        block.push_str("3) Read program changes between:\n");
+        block.push_str("   `");
+        block.push_str(compare_from.as_str());
+        block.push_str("`\n");
+        block.push_str("   and\n");
+        block.push_str("   the new program version (`");
+        block.push_str(program_file);
+        block.push_str("`).\n");
+        block.push_str("4) Execute the \"program\" for this \"current session\".\n");
+        block.push_str("5) Before finishing, write both required report files:\n");
+        block.push_str("   `./");
+        block.push_str(AGENT_OUTPUT_MANIFEST_REL);
+        block.push_str("`\n");
+        block.push_str("   and\n");
+        block.push_str("   `./");
+        block.push_str(AGENT_RESULT_REL);
+        block.push_str("`.\n\n");
+        block.push_str("Program\n\n");
+        block.push_str("- Program ID: `");
+        block.push_str(program_id);
+        block.push_str("`\n");
+        block.push_str("- New program version: `");
+        block.push_str(program_file);
+        block.push_str("`\n\n---\n\n");
+        block.push_str("Last session details\n\n");
+        block.push_str("- last_session_id: `");
+        block.push_str(session_id_raw.as_str());
+        block.push_str("`\n");
+        block.push_str("- last_session_status: `");
+        block.push_str(run_status_str(&last.status));
+        block.push_str("`\n");
+        block.push_str("- last_session_time_unix: `");
+        block.push_str(last.ts_unix.to_string().as_str());
+        block.push_str("`\n");
+        block.push_str("- last_session_program_file: `");
+        block.push_str(last_program_file.as_str());
+        block.push_str("`\n");
+        block.push_str("- last_session_output_file: `");
+        block.push_str(last_output_file.as_str());
+        block.push_str("`\n");
+        block.push_str("- session_history_path (open only if needed): `");
+        block.push_str(history_path.as_str());
+        block.push_str("`\n\n");
+        block.push_str("How to use \"last session\" details in this \"current session\":\n");
+        block.push_str("- Understand what was completed in \"last session\".\n");
+        block.push_str("- Verify whether that result is still correct for the \"program\".\n");
+        block.push_str("- If \"last session\" work is still correct and program changes do not require more edits, keep that work.\n");
+        block.push_str("- If \"last session\" work is incorrect or incomplete for the \"program\", update it.\n\n---\n\n");
+        block.push_str("Program changes since last session\n\n");
+        block.push_str("- Last session program file to compare from:\n");
+        block.push_str("  `");
+        block.push_str(compare_from.as_str());
+        block.push_str("`\n");
+        block.push_str("- Program file for the \"current session\" to compare to:\n");
+        block.push_str("  `");
+        block.push_str(program_file);
+        block.push_str("`\n");
+        block.push_str("- Program change summary:\n");
+        block.push_str("  `");
+        block.push_str(change_summary.as_str());
+        block.push_str("`\n\n");
+        block.push_str("How to apply program changes in this \"current session\":\n");
+        block.push_str("- Treat the new program version as what you must implement now.\n");
+        block.push_str("- Use the program change summary in this prompt to understand what changed since \"last session\".\n");
+        block.push_str("- Apply only the edits needed to satisfy the changed program.\n");
+        block.push_str("- If no meaningful program change exists, first verify the result is still correct; only edit files if verification finds a real gap.\n\n---\n\n");
+        block.push_str("Execution and stop rules for this \"current session\"\n\n");
+        block.push_str("- Keep working until the new program version is satisfied.\n");
+        block.push_str(
+            "- Stop only if there is no practical way to complete the \"program\" in this environment.\n",
+        );
+        block.push_str("- If blocked, report that in the required status file.\n");
+        block.push_str("- Keep edits within program scope:\n");
+        block.push_str("  files required to satisfy the \"program\".\n");
+        block.push_str("- Do not make unrelated edits.\n\n---\n\n");
+        block.push_str("Required report files for this \"current session\" (must write both)\n\n");
+        block.push_str("1) `./");
+        block.push_str(AGENT_OUTPUT_MANIFEST_REL);
+        block.push_str("`\n\n");
+        block.push_str("Exact format:\n");
+        block.push_str("```json\n[\n  { \"path\": \"relative/path.ext\", \"change\": \"created|modified|deleted\" }\n]\n```\n\n");
+        block.push_str("Rules:\n");
+        block.push_str("- Include files created/modified/deleted in this \"current session\".\n");
+        block.push_str("- Use repo-relative paths.\n");
+        block.push_str("- Exclude `.claudeform/*` bookkeeping files.\n");
+        block.push_str("- Deduplicate entries.\n\n");
+        block.push_str("2) `./");
+        block.push_str(AGENT_RESULT_REL);
+        block.push_str("`\n\n");
+        block.push_str("Exact format:\n");
+        block.push_str("```json\n{\n  \"status\": \"success|partial|failure\",\n  \"message\": \"short human-readable summary\"\n}\n```\n\n");
+        block.push_str("Rules:\n");
+        block.push_str("- `success`: the \"program\" is complete and correct.\n");
+        block.push_str("- `partial`: useful progress was made, but program is not complete.\n");
+        block.push_str("- `failure`: program could not be completed.\n");
+        block.push_str("- `message`: one short sentence about this \"current session\" result.\n\n---\n\n");
+        block.push_str("User-facing message rule for this \"current session\"\n\n");
+        block.push_str("- In user-facing text, describe program results only.\n");
+        block.push_str(
+            "- Do not mention `.claudeform/*` bookkeeping files unless user explicitly asks.\n",
+        );
+        return Ok(block);
+    } else {
+        block.push_str("Claudeform apply session contract\n\n");
+        block.push_str("Current session\n");
+        block.push_str("- Program ID: `");
+        block.push_str(program_id);
+        block.push_str("`\n");
+        block.push_str("- Program: `");
+        block.push_str(program_file);
+        block.push_str("`\n\n");
+        block.push_str("Session context\n");
+        block.push_str("- This program is being performed for the first time (no previous sessions).\n\n");
+        block.push_str("What to do in this session\n");
+        block.push_str("- Read and implement `");
+        block.push_str(program_file);
+        block.push_str("`.\n");
+        block.push_str("- Use workspace files and tools as needed.\n");
+        block.push_str("- Continue until the program result is correct, or stop only when there is no practical way forward.\n");
+        block.push_str("- Keep edits scoped to files needed for this program.\n");
+        block.push_str("- Do not make unrelated edits.\n\n");
+        block.push_str("Before finishing this session (required)\n");
+        block.push_str("- Write `./");
+        block.push_str(AGENT_OUTPUT_MANIFEST_REL);
+        block.push_str("`.\n");
+        block.push_str("- Write `./");
+        block.push_str(AGENT_RESULT_REL);
+        block.push_str("`.\n\n");
+    }
+
+    block.push_str("Required report files\n\n");
+    block.push_str("1) `./");
     block.push_str(AGENT_OUTPUT_MANIFEST_REL);
-    block.push_str(
-        "` as JSON array of relative file paths changed by this run (created or modified).\n",
-    );
-    block.push_str("- The output manifest must include only repo files changed for the task and must exclude `.claudeform/*` bookkeeping files.\n");
-    block.push_str(
-        "- If requirements are unmet or blocked, set status to `partial`, `blocked`, or `failed` and explain in `message`.\n",
-    );
-    block.push_str("- In user-facing text output, report task results only; do not mention Claudeform bookkeeping/system files unless explicitly requested.\n");
-    block.push_str("- Do not write/update `.claudeform/*` bookkeeping files unless explicitly asked, except `./");
+    block.push_str("`\n\n");
+    block.push_str("Exact format:\n");
+    block.push_str("```json\n[\n  { \"path\": \"relative/path.ext\", \"change\": \"created|modified|deleted\" }\n]\n```\n\n");
+    block.push_str("Rules:\n");
+    block.push_str("- Include files created/modified/deleted in this session.\n");
+    block.push_str("- Use repo-relative paths.\n");
+    block.push_str("- Exclude `.claudeform/*` bookkeeping files.\n");
+    block.push_str("- Deduplicate entries.\n\n");
+    block.push_str("2) `./");
     block.push_str(AGENT_RESULT_REL);
-    block.push_str("` and `./");
-    block.push_str(AGENT_OUTPUT_MANIFEST_REL);
-    block.push_str("`.\n");
+    block.push_str("`\n\n");
+    block.push_str("Exact format:\n");
+    block.push_str("```json\n{\n  \"status\": \"success|partial|failure\",\n  \"message\": \"short human-readable summary\"\n}\n```\n\n");
+    block.push_str("Rules:\n");
+    block.push_str("- `success`: program is complete and correct.\n");
+    block.push_str("- `partial`: useful progress was made, but program is not complete.\n");
+    block.push_str("- `failure`: program could not be completed.\n");
+    block.push_str("- `message`: one short sentence about this session result.\n\n");
+    block.push_str("User-facing message rule\n");
+    block.push_str("- In user-facing text, describe program results only.\n");
+    block.push_str("- Do not mention `.claudeform/*` bookkeeping files unless explicitly asked.\n");
+
     Ok(block)
 }
 
@@ -963,12 +1113,24 @@ fn read_agent_reported_files(workspace_root: &Path) -> Result<Vec<String>> {
 
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("failed reading agent output manifest '{}'", path.display()))?;
-    let parsed: Vec<String> = serde_json::from_str(&raw)
+    let parsed: Vec<AgentOutputManifestEntry> = serde_json::from_str(&raw)
         .with_context(|| format!("invalid JSON in agent output manifest '{}'", path.display()))?;
 
     let mut out = Vec::new();
     for item in parsed {
-        if let Some(normalized) = normalize_reported_rel_path(&item) {
+        let path_str = match item {
+            AgentOutputManifestEntry::Path(path) => path,
+            AgentOutputManifestEntry::Record(record) => {
+                if let Some(change) = record.change.as_deref() {
+                    let normalized_change = change.trim().to_ascii_lowercase();
+                    if !matches!(normalized_change.as_str(), "created" | "modified" | "deleted") {
+                        continue;
+                    }
+                }
+                record.path
+            }
+        };
+        if let Some(normalized) = normalize_reported_rel_path(&path_str) {
             if is_internal_reported_path(normalized.as_str()) {
                 continue;
             }
@@ -1278,21 +1440,10 @@ fn read_agent_result(workspace_root: &Path) -> Result<Option<AgentResult>> {
             Some(trimmed.to_string())
         }
     });
-    let normalize_vec = |items: Vec<String>| -> Vec<String> {
-        items
-            .into_iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    };
 
     Ok(Some(AgentResult {
         status: parsed.status,
         message,
-        diff_handled: parsed.diff_handled,
-        criteria_met: normalize_vec(parsed.criteria_met),
-        criteria_unmet: normalize_vec(parsed.criteria_unmet),
-        evidence: normalize_vec(parsed.evidence),
     }))
 }
 
@@ -1986,15 +2137,15 @@ fn format_program_diff_totals(changed: usize, insertions: usize, deletions: usiz
 }
 
 fn format_program_diff_preview(plan: &SharedPlanData) -> (String, String) {
-    let diff_file = plan.program_diff_vs_last_success.file.clone();
-    let diff_summary = match plan.program_diff_vs_last_success.status.as_str() {
+    let diff_file = plan.program_diff_vs_last_session.file.clone();
+    let diff_summary = match plan.program_diff_vs_last_session.status.as_str() {
         "first_apply" => "first apply".to_string(),
         "unavailable" => "snapshot unavailable".to_string(),
         "unchanged" => "unchanged".to_string(),
         _ => format_program_diff_totals(
-            plan.program_diff_vs_last_success.lines_changed,
-            plan.program_diff_vs_last_success.lines_added,
-            plan.program_diff_vs_last_success.lines_deleted,
+            plan.program_diff_vs_last_session.lines_changed,
+            plan.program_diff_vs_last_session.lines_added,
+            plan.program_diff_vs_last_session.lines_deleted,
         ),
     };
     (diff_file, diff_summary)
@@ -2158,6 +2309,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const PROMPT_EXAMPLE_WITH_LAST: &str = include_str!("../../../prompt_example_with_last_changes.md");
+    const PROMPT_EXAMPLE_NO_LAST: &str = include_str!("../../../prompt_example_no_last_session.md");
+
     #[test]
     fn normalize_reported_path_rejects_parent_dir_escape() {
         assert_eq!(normalize_reported_rel_path("../x.txt"), None);
@@ -2172,14 +2326,14 @@ mod tests {
     }
 
     #[test]
-    fn runtime_prompt_includes_no_bookkeeping_text_rule() {
+    fn runtime_prompt_exact_match_without_last_session_fixture() {
         let plan = SharedPlanData {
-            program_id: "smoke".to_string(),
-            program_file: "smoke.md".to_string(),
-            model: Some("gpt-5-codex".to_string()),
-            program_diff_vs_last_success: PlanProgramDiff {
-                status: "unchanged".to_string(),
-                file: "smoke.md".to_string(),
+            program_id: "calculator".to_string(),
+            program_file: "examples/calc.md".to_string(),
+            model: None,
+            program_diff_vs_last_session: PlanProgramDiff {
+                status: "first_apply".to_string(),
+                file: "examples/calc.md".to_string(),
                 lines_changed: 0,
                 lines_added: 0,
                 lines_deleted: 0,
@@ -2188,54 +2342,41 @@ mod tests {
         };
 
         let prompt = build_runtime_prompt("# test\n", &plan).expect("prompt should build");
-        assert!(prompt.contains("report task results only; do not mention Claudeform bookkeeping/system files unless explicitly requested."));
-        assert!(!prompt.contains(AGENT_HUMAN_OUTPUT_REL));
-        assert!(prompt.contains(AGENT_OUTPUT_MANIFEST_REL));
-        assert!(prompt.contains(AGENT_RESULT_REL));
-        assert!(prompt.contains("program_diff_vs_last_success"));
-        assert!(prompt.contains("high-priority delta signal"));
-        assert!(prompt.contains("\"diff_handled\":true|false"));
-        assert!(!prompt.contains("DIFF_ACK:"));
+        assert_eq!(prompt, PROMPT_EXAMPLE_NO_LAST);
     }
 
     #[test]
-    fn runtime_prompt_includes_last_session_files_sample_context() {
+    fn runtime_prompt_exact_match_with_last_session_fixture() {
         let plan = SharedPlanData {
-            program_id: "smoke".to_string(),
-            program_file: "smoke.md".to_string(),
-            model: Some("gpt-5-codex".to_string()),
-            program_diff_vs_last_success: PlanProgramDiff {
-                status: "unchanged".to_string(),
-                file: "smoke.md".to_string(),
-                lines_changed: 0,
+            program_id: "calculator".to_string(),
+            program_file: "examples/calc.md".to_string(),
+            model: None,
+            program_diff_vs_last_session: PlanProgramDiff {
+                status: "changed".to_string(),
+                file: "examples/calc.md".to_string(),
+                lines_changed: 6,
                 lines_added: 0,
-                lines_deleted: 0,
+                lines_deleted: 24,
             },
             last_session: Some(PlanLastSession {
-                session_id: Some("session-1".to_string()),
-                ts_unix: 1,
+                session_id: Some("019d55f0-fd15-7041-bca3-979c467b67eb".to_string()),
+                ts_unix: 1775263601,
                 status: RunStatus::Success,
-                model: Some("gpt-5-codex".to_string()),
-                summary_short: Some("updated smoke output".to_string()),
-                files_total: 2,
-                files_sample: vec![
-                    "example-data/output-smoke.txt".to_string(),
-                    "README.md".to_string(),
-                ],
-                insertions: 3,
-                deletions: 1,
-                input_tokens: Some(1000),
-                output_tokens: Some(100),
-                cached_input_tokens: Some(200),
+                model: None,
+                summary_short: None,
+                files_total: 0,
+                files_sample: Vec::new(),
+                insertions: 0,
+                deletions: 0,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
                 error_short: None,
             }),
         };
 
         let prompt = build_runtime_prompt("# test\n", &plan).expect("prompt should build");
-        assert!(prompt.contains("\"last_session\""));
-        assert!(prompt.contains("\"files_sample\""));
-        assert!(prompt.contains("example-data/output-smoke.txt"));
-        assert!(prompt.contains("\"program_diff_vs_last_success\""));
+        assert_eq!(prompt, PROMPT_EXAMPLE_WITH_LAST);
     }
 
     #[test]
@@ -2247,7 +2388,7 @@ mod tests {
         }
         fs::write(
             path,
-            r#"{"status":"partial","message":"could not run integration tests","diff_handled":true,"criteria_met":["updated code"],"criteria_unmet":["run integration tests"],"evidence":["command: cargo test"]}"#,
+            r#"{"status":"partial","message":"could not run integration tests"}"#,
         )?;
 
         let result = read_agent_result(dir.path())?;
@@ -2256,11 +2397,31 @@ mod tests {
             Some(AgentResult {
                 status: AgentStatus::Partial,
                 message: Some("could not run integration tests".to_string()),
-                diff_handled: true,
-                criteria_met: vec!["updated code".to_string()],
-                criteria_unmet: vec!["run integration tests".to_string()],
-                evidence: vec!["command: cargo test".to_string()],
             })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_agent_output_manifest_object_records() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(AGENT_OUTPUT_MANIFEST_REL);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            path,
+            r#"[
+  {"path":"out.txt","change":"modified"},
+  {"path":"./nested/new.txt","change":"created"},
+  {"path":".claudeform/agent_result.json","change":"modified"}
+]"#,
+        )?;
+
+        let files = read_agent_reported_files(dir.path())?;
+        assert_eq!(
+            files,
+            vec!["nested/new.txt".to_string(), "out.txt".to_string()]
         );
         Ok(())
     }
@@ -2377,35 +2538,16 @@ mod tests {
 
     #[test]
     fn validation_rejects_missing_agent_result() {
-        let diff = PlanProgramDiff {
-            status: "unchanged".to_string(),
-            file: "p.md".to_string(),
-            lines_changed: 0,
-            lines_added: 0,
-            lines_deleted: 0,
-        };
-        let err = validate_agent_completion(&None, &diff).expect_err("must fail");
+        let err = validate_agent_completion(&None).expect_err("must fail");
         assert!(format!("{:#}", err).contains(AGENT_RESULT_REL));
     }
 
     #[test]
-    fn validation_rejects_success_without_evidence() {
-        let diff = PlanProgramDiff {
-            status: "changed".to_string(),
-            file: "p.md".to_string(),
-            lines_changed: 1,
-            lines_added: 1,
-            lines_deleted: 0,
-        };
+    fn validation_accepts_minimal_agent_result() {
         let result = AgentResult {
             status: AgentStatus::Success,
             message: Some("done".to_string()),
-            diff_handled: true,
-            criteria_met: vec!["x".to_string()],
-            criteria_unmet: Vec::new(),
-            evidence: Vec::new(),
         };
-        let err = validate_agent_completion(&Some(result), &diff).expect_err("must fail");
-        assert!(format!("{:#}", err).contains("evidence"));
+        validate_agent_completion(&Some(result)).expect("minimal result should pass");
     }
 }

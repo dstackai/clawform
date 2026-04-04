@@ -631,6 +631,7 @@ fn collect_with_progress(
     let mut raw_stderr = String::new();
     let mut emitted_progress_events = 0usize;
     let mut last_activity = String::new();
+    let mut active_progress_items: Vec<(String, String)> = Vec::new();
     let mut last_agent_text_line: Option<String> = None;
     let mut canonical_records: Vec<CanonicalEventRecord> = Vec::new();
     let mut canonical_seq: u64 = 0;
@@ -733,11 +734,16 @@ fn collect_with_progress(
                                     summary.as_deref(),
                                     show_intermediate_steps,
                                 ) {
-                                    last_activity =
-                                        status_activity_label(item_type, summary.as_deref());
+                                    let label = status_activity_label(item_type, summary.as_deref());
+                                    if let Some(id) = item_id.as_ref() {
+                                        active_progress_items.retain(|(active_id, _)| active_id != id);
+                                        active_progress_items.push((id.clone(), label.clone()));
+                                    }
+                                    last_activity = label;
                                 }
                             }
                             ProviderEvent::ItemCompleted {
+                                ref item_id,
                                 ref item_type,
                                 ref summary,
                                 ..
@@ -747,8 +753,13 @@ fn collect_with_progress(
                                     summary.as_deref(),
                                     show_intermediate_steps,
                                 ) {
-                                    last_activity =
-                                        status_activity_label(item_type, summary.as_deref());
+                                    if let Some(id) = item_id.as_ref() {
+                                        active_progress_items.retain(|(active_id, _)| active_id != id);
+                                    }
+                                    last_activity = active_progress_items
+                                        .last()
+                                        .map(|(_, label)| label.clone())
+                                        .unwrap_or_default();
                                 }
                             }
                             ProviderEvent::TurnCompleted { ref usage } => {
@@ -1527,7 +1538,9 @@ fn simplify_command_summary(command: &str) -> String {
         return format!("write {}", path);
     }
 
-    truncate_one_line(cmd, 72)
+    // Keep command lines compact but long enough to preserve most real file paths
+    // so terminal path detection remains useful.
+    truncate_one_line(cmd, 240)
 }
 
 fn extract_heredoc_write_path(command: &str) -> Option<String> {
@@ -2003,9 +2016,38 @@ fn colorize_done_payload(payload: &str) -> String {
 fn colorize_done_segment(segment: &str) -> String {
     if looks_like_duration_label(segment) {
         format!("\x1b[2m{}\x1b[0m", segment)
+    } else if let Some(colored) = colorize_link_segment(segment) {
+        colored
     } else {
         colorize_paths(segment)
     }
+}
+
+fn colorize_link_segment(segment: &str) -> Option<String> {
+    let trimmed = segment.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if matches!(trimmed, "out" | "msg" | "file") {
+        return Some(format!("\x1b[95m{}\x1b[0m", segment));
+    }
+
+    for prefix in ["out=", "msg=", "file="] {
+        if let Some(rest) = segment.strip_prefix(prefix) {
+            return Some(format!(
+                "\x1b[95m{}\x1b[0m{}",
+                prefix,
+                colorize_paths(rest)
+            ));
+        }
+    }
+
+    if segment.contains("\x1b]8;;") {
+        return Some(format!("\x1b[95m{}\x1b[0m", segment));
+    }
+
+    None
 }
 
 fn looks_like_duration_label(s: &str) -> bool {
@@ -2532,5 +2574,11 @@ mod tests {
     fn colorize_done_payload_dims_trailing_duration_without_pipe() {
         let rendered = colorize_done_payload("write example-data/output-smoke.txt 1ms");
         assert!(rendered.contains("\x1b[2m1ms\x1b[0m"));
+    }
+
+    #[test]
+    fn colorize_done_payload_highlights_out_link_segment() {
+        let rendered = colorize_done_payload("write example-data/output-smoke.txt | 1ms | out");
+        assert!(rendered.contains("\x1b[95mout\x1b[0m"));
     }
 }

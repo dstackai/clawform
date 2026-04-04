@@ -9,8 +9,9 @@ use tempfile::TempDir;
 use claudeform_core::provider::{ProviderRequest, ProviderRunResult, ProviderRunner};
 use claudeform_core::{run_apply, AgentStatus, ApplyRequest, RunHistoryRecord, RunStatus};
 
-const AGENT_RESULT_SUCCESS_JSON: &str = r#"{"status":"success","message":"done","diff_handled":true,"criteria_met":["completed task"],"criteria_unmet":[],"evidence":["file: out.txt"]}"#;
-const AGENT_RESULT_PARTIAL_JSON: &str = r#"{"status":"partial","message":"could not run tests in this environment","diff_handled":true,"criteria_met":["updated code"],"criteria_unmet":["run tests"],"evidence":["command: cargo test"]}"#;
+const AGENT_RESULT_SUCCESS_JSON: &str = r#"{"status":"success","message":"done"}"#;
+const AGENT_RESULT_PARTIAL_JSON: &str =
+    r#"{"status":"partial","message":"could not run tests in this environment"}"#;
 
 #[derive(Clone)]
 struct MockRunner {
@@ -378,8 +379,10 @@ Write ./out.txt.
 
     let prompts = runner2.prompts.lock().expect("prompt mutex poisoned");
     let last = prompts.last().cloned().unwrap_or_default();
-    assert!(last.contains("Claudeform plan context"));
-    assert!(last.contains("\"program_diff_vs_last_success\""));
+    assert!(last.contains("Claudeform apply session contract"));
+    assert!(last.contains("Last session details"));
+    assert!(last.contains("Program changes since last session"));
+    assert!(last.contains(".claudeform/programs/mock_program/sessions/mock-session-ok/program.md"));
     Ok(())
 }
 
@@ -436,9 +439,9 @@ Update ./out.txt with `v2` and verify it.
 
     let prompts = runner2.prompts.lock().expect("prompt mutex poisoned");
     let last = prompts.last().cloned().unwrap_or_default();
-    assert!(last.contains("\"program_diff_vs_last_success\""));
-    assert!(last.contains("\"status\": \"changed\""));
-    assert!(!last.contains("DIFF_ACK:"));
+    assert!(last.contains("Program changes since last session"));
+    assert!(last.contains("Program change summary:"));
+    assert!(!last.contains("Claudeform plan context"));
     Ok(())
 }
 

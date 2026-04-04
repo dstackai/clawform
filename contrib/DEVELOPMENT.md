@@ -98,10 +98,10 @@ Hide intermediate progress steps:
 cargo run -p claudeform -- apply -f examples/smoke.md --no-intermediate
 ```
 
-Ask for confirmation before execution:
+Skip confirmation prompt:
 
 ```bash
-cargo run -p claudeform -- apply -f examples/smoke.md --confirm
+cargo run -p claudeform -- apply -f examples/smoke.md --yes
 ```
 
 ## Test
@@ -154,5 +154,5 @@ Notes:
 - In v0, Claudeform does not enforce its own max runtime timeout; provider behavior determines run duration.
 
 5. Unexpected file writes after apply
-- v0 treats markdown I/O as agent-interpreted and promotes changed files from temp workspace.
+- v0 treats markdown I/O as agent-interpreted and runs directly in the current workspace.
 - Tighten the markdown instruction text if the agent is writing too broadly.

@@ -1,49 +1,39 @@
 # Claudeform Architecture
 
 Last updated: 2026-04-04  
-Status: v0 (execution-first)
-
-This file is the source of truth for v0 behavior.
+Status: v0 (implemented baseline)
 
 ## 1) Product Goal
 
-Claudeform runs markdown programs with agents from files instead of chat windows.
+Claudeform runs agent work from markdown files instead of chat windows.
 
-A **program** is one `*.md` file that represents one task.
+A **program** is one markdown file (`*.md`) representing one task.
 
-- frontmatter is strict and tool-owned (`id`, `model`)
-- markdown body is agent-owned and free-form
+- frontmatter is tool-owned and strict (`id`, `model`)
+- markdown body is agent-facing and free-form
 
-## 2) v0 Scope
+## 2) Implemented v0 Scope
 
-1. One public command surface with two binary names: `claudeform apply -f <program.md> [--confirm]` and `cf apply -f <program.md> [--confirm]`
-2. One program file = one task
-3. Strict config file at `<cwd>/.claudeform/config.json`
-4. Local state at `<cwd>/.claudeform/state`
-5. Codex provider only in v0
-6. Optional confirmation (`Proceed? (y/N)` only when `--confirm`)
-7. Live progress stream from provider is enabled by default (`--no-progress` disables it)
-8. Provider execution has heartbeat output; runtime budget/timeout policy is provider-defined in v0
+1. Public command: `claudeform apply -f <program.md>` (alias: `cf apply -f <program.md>`)
+2. Confirmation prompt is default in interactive shell; use `--yes` to skip
+3. One program file = one session execution
+4. Config path is fixed: `<cwd>/.claudeform/config.json`
+5. Provider support in v0: Codex only
+6. Live progress events are on by default (`--no-progress` disables)
+7. Session artifacts and run history are stored under `.claudeform/`
 
-## 3) Critical v0 Principle
+## 3) Config and Program
 
-Claudeform does **not** parse or enforce strict input/output contracts from markdown body in v0.
+## 3.1 Config
 
-- Inputs/Outputs in markdown are for the agent to interpret.
-- Terraform-like strict I/O planning is out-of-scope for v0.
+Path:
 
-## 4) Files and Ownership
+- `<cwd>/.claudeform/config.json`
 
-## 4.1 `.claudeform/config.json`
+Rules:
 
-Purpose:
-
-- tool configuration only (not agent prompt content)
-- provider selection and default model
-
-Path resolution in v0:
-
-- Claudeform loads exactly `<cwd>/.claudeform/config.json`
+1. exactly one provider has `"default": true`
+2. provider `type` must be `"codex"` in v0
 
 Example:
 
@@ -61,209 +51,109 @@ Example:
 }
 ```
 
-Validation:
+## 3.2 Program
 
-1. exactly one provider must set `"default": true`
-2. provider `type` must be `"codex"` in v0
-
-## 4.2 Program Markdown (`*.md`)
-
-Frontmatter (strict, tool-owned):
+Frontmatter (strict):
 
 - `id` (optional)
 - `model` (optional override)
 
-Body (free-form, agent-owned):
+Program key resolution:
 
-- instructions, context, examples, any markdown structure
+1. use `id` if present
+2. otherwise use filename stem
 
-Program key:
+Markdown body remains untyped in v0 and is interpreted by the agent.
 
-1. if `id` exists, key = `id`
-2. otherwise key = filename stem
+## 4) Apply Session Flow (Current Behavior)
 
-## 5) Runtime Model
+1. Load program + config and resolve model.
+2. Build preview from last session context:
+   - last session status/summary (if exists)
+   - program diff vs last session snapshot (if available)
+3. Ask for confirmation (interactive default; skipped by `--yes`).
+4. Run provider in the current workspace (no temp workspace copy).
+5. Stream provider events to terminal and persist artifacts.
+6. Read agent status from `.claudeform/agent_result.json` (required).
+7. Collect reported changed files (events-first, manifest fallback).
+8. Persist session artifacts + history record.
+9. Persist program snapshot (`program.md`) on success.
 
-`apply` pipeline:
+## 5) State and Storage Layout
 
-1. load program markdown
-2. load strict config
-3. resolve provider + model
-4. optionally ask confirmation (`Proceed? (y/N)` with `--confirm`)
-5. copy workspace to temp directory
-6. run `codex exec` in temp workspace with:
-   - full markdown program
-   - Claudeform runtime instruction block
-   - instruction to write `./.claudeform/agent_outputs.json` (JSON array of changed files)
-7. detect changed files by diffing temp workspace files against real workspace files
-8. promote changed files from temp to real workspace
-9. read agent output manifest for user-facing output summary (informational only)
-10. persist local state on success
+## 5.1 Session Artifacts
 
-State is never updated on failed provider run.
+Per program/session:
 
-## 5.1 Provider Layer (Codex-first)
+- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/prompt.md`
+- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/plan.json`
+- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/events.ndjson`
+- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/provider.stdout.log`
+- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/provider.stderr.log`
+- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/outcome.json`
+- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/output.md` (Claudeform summary)
+- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/program.md` (success snapshot)
+- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/commands/*` (captured command outputs)
+- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/messages/*` (captured message outputs)
 
-Claudeform v0 uses a provider adapter layer even though only Codex is implemented.
+## 5.2 Run History Index
 
-Why:
+- `<cwd>/.claudeform/history/index.jsonl`
 
-- keep Claudeform runtime/provider boundary stable
-- make Claude/other providers an adapter task, not a core rewrite
+This is Claudeform-owned history, independent from provider-side memory.
 
-Current adapter in v0:
+## 5.3 Agent Report Files in Workspace Root
 
-- `CodexRunner` (invokes `codex exec`)
+Agent may write:
 
-Provider contract in v0 (high-level):
+- `<cwd>/.claudeform/agent_result.json` (required)
+- `<cwd>/.claudeform/agent_output.md` (optional human summary)
+- `<cwd>/.claudeform/agent_outputs.json` (optional fallback list of changed files)
 
-1. `run(request)` executes one apply run
-2. `capabilities()` returns provider feature support flags
-3. provider emits live progress events (when enabled) that Claudeform normalizes for UI
+These files are execution protocol files, not user deliverables.
 
-## 5.2 Normalized Event Model
+## 6) Known v0 Limits
 
-Claudeform normalizes provider stream events into a common internal model:
+1. Markdown body is untyped/unvalidated (no strict input/output schema).
+2. No standalone `plan` command.
+3. No MCP/tool integration schema yet.
+4. No multi-agent orchestration.
+5. No Claude provider adapter yet.
 
-- `run_started`
-- `turn_started`
-- `turn_completed` (with usage if available)
-- `turn_failed`
-- `item_started` / `item_updated` / `item_completed`
-- `error`
-- `heartbeat`
-- `raw_event` / `raw_text` (passthrough fallback)
+## 7) TODO (Next)
 
-This model is intentionally small in v0.  
-It is for progress UX and orchestration, not for strict planning.
+## 7.1 Interrupted Session Semantics
 
-## 5.3 Capability Handshake
+Problem today:
 
-Before running, Claudeform can read provider capabilities from the adapter.
+- `Ctrl+C` is recorded as `failure`, which can later show `snapshot unavailable` in preview.
 
-v0 capability fields:
+Need:
 
-- `live_events`
-- `partial_text`
-- `tool_call_events`
-- `file_change_events`
-- `resume`
-- `cancel`
-- `approvals`
+1. introduce explicit interrupted/canceled session reason in session outcome/history
+2. preview should show `interrupted`/`canceled` instead of generic `failure` when applicable
+3. program diff fallback should use last successful snapshot when last session has no snapshot
+4. inject this context clearly to agent in next session prompt
 
-Codex v0 capability profile:
+## 7.2 Changes/Diff Reliability
 
-- live events: yes
-- partial text: no (v0 does not rely on token deltas)
-- tool call events: yes (from Codex item events)
-- file change events: yes
-- resume: yes
-- cancel: no
-- approvals: no
+Need:
 
-## 5.4 Codex Mapping in v0
+1. make changed-file reporting consistent between normal mode and debug mode
+2. improve noise filtering for generated/build-cache files
+3. keep preview/apply/history change summaries aligned
 
-Codex JSON event types (for example `thread.started`, `turn.*`, `item.*`, `error`) are mapped into the normalized event model.
+## 7.3 Apply Contract Polish
 
-Claudeform then:
+Need:
 
-1. prints concise progress lines
-2. uses heartbeat for liveness visibility (no Claudeform-imposed runtime timeout in v0)
-3. keeps raw stdout/stderr for debug output
+1. tighten prompt contract so reruns focus on required deltas
+2. clarify when agent should rework vs verify vs no-op
+3. keep status semantics (`success`/`partial`/`failure`) explicit and consistent
 
-## 6) Safety Model
+## 7.4 Future Decisions (Out of Scope for v0)
 
-1. Provider execution happens in a temp workspace copy.
-2. Claudeform promotes changed files from temp to real workspace.
-3. `.git`, `target`, `.claudeform/state`, and `.claudeform/agent_outputs.json` are excluded from copy/promote scanning.
-4. Confirmation gate is optional (`--confirm`).
-
-## 7) Local State
-
-Location:
-
-- `<cwd>/.claudeform/state/index.json`
-- `<cwd>/.claudeform/state/programs/<program_key>.json`
-
-Program state includes:
-
-- `program_key`
-- source program path
-- resolved model
-- provider fingerprint
-- program fingerprint
-- last success timestamp
-- hashes map of files promoted in last successful run
-
-State is Claudeform-owned and independent from agent session memory.
-
-## 8) Out of Scope (v0)
-
-1. Strict typed input/output schema in markdown body
-2. Canonical I/O extraction/IR and strict output validation
-3. Deterministic `no-op` planning based on typed I/O contracts
-4. Standalone `plan` command
-5. Saved plan artifact (`plan` file passed to `apply`)
-6. MCP/tool integration schema and auth bootstrap
-7. Skills configuration policy
-8. Multi-agent orchestration
-9. OpenClaw integration
-10. Remote/shared state backends
-11. Multi-user locking/concurrency model
-12. Claude provider adapter implementation
-13. Variables
-14. Configurable runtime budget / max-time policy
-15. Automatic workspace forking and revert/rollback semantics (including failure-time revert)
-
-## 8.1 TODO (Post-v0): Multi-agent Orchestrator
-
-Codex CLI does not provide a first-class parent/child multi-agent primitive for Claudeform v0.
-
-Planned direction after v0:
-
-1. Claudeform orchestrates multiple provider runs in parallel (external orchestration layer)
-2. each run is an isolated task unit with its own state checkpoint
-3. Claudeform merges outputs/conflicts and emits one combined progress view
-
-## 8.2 TODO (Post-v0): Runtime Strategy Decision
-
-For advanced capabilities (tool calling, MCP integration, richer model controls, multi-agent orchestration), Claudeform must choose one runtime strategy:
-
-1. Adapter-over-agent-CLIs
-   - pros: fastest integration for existing agent UX
-   - cons: inconsistent event schemas, weaker cross-provider parity, less control over orchestration internals
-2. Direct provider runtime (own orchestrator over provider APIs/SDKs)
-   - pros: strongest control for unified events, tool routing, MCP policy, and orchestration
-   - cons: highest implementation and maintenance cost
-3. Hybrid (CLI adapters in v1, direct runtime for critical paths later)
-   - pros: fastest path now, controlled migration path later
-   - cons: temporary dual architecture complexity
-
-Decision status: deferred post-v0.  
-v0 remains Codex-adapter-first and intentionally minimal.
-
-## 8.3 TODO (Post-v0): Canonical Log
-
-Goal:
-
-- keep an exact run history with minimum Claudeform-specific interpretation
-- separate provider facts from Claudeform-derived summaries
-
-Planned approach:
-
-1. store append-only raw provider events as NDJSON (canonical source of provider behavior)
-2. store Claudeform-observed outcomes separately (real changed files, diff stats, apply status)
-3. keep derived UI projections rebuildable from canonical + outcomes logs
-4. avoid mixed blobs that combine text, commands, and file contents in one field
-
-Proposed layout:
-
-- `<cwd>/.claudeform/sessions/<program_key>/<session_id>/events.ndjson`
-- `<cwd>/.claudeform/sessions/<program_key>/<session_id>/outcome.json`
-- `<cwd>/.claudeform/sessions/index.jsonl` (compact cross-program index)
-
-Notes:
-
-- canonical log should preserve provider-native identifiers (for example session/thread ids)
-- Claudeform should only add minimal envelope fields (sequence, receive timestamp, provider name)
-- high-level summaries should remain optional views, not source of truth
+1. MCP and broader tool integration model
+2. multi-agent orchestration model
+3. additional providers beyond Codex
+4. strict typed program schema for markdown body

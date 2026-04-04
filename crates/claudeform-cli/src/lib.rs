@@ -332,18 +332,11 @@ fn print_agent_status_line(agent_result: Option<&AgentResult>, use_color: bool) 
                 ("partial", "◐")
             }
         }
-        AgentStatus::Blocked => {
+        AgentStatus::Failure => {
             if use_color {
-                ("\x1b[31mblocked\x1b[0m", "\x1b[31m⛔\x1b[0m")
+                ("\x1b[31mfailure\x1b[0m", "\x1b[31m✖\x1b[0m")
             } else {
-                ("blocked", "⛔")
-            }
-        }
-        AgentStatus::Failed => {
-            if use_color {
-                ("\x1b[31mfailed\x1b[0m", "\x1b[31m✖\x1b[0m")
-            } else {
-                ("failed", "✖")
+                ("failure", "✖")
             }
         }
     };
@@ -399,16 +392,12 @@ fn print_reported_files(file_results: &[FileResult], use_color: bool) {
     paths.sort();
 
     if paths.is_empty() {
-        println!(" changes: 0 files");
+        println!("changes: 0 files");
         return;
     }
 
     let total = paths.len();
-    println!(
-        " changes: {} file{}",
-        total,
-        if total == 1 { "" } else { "s" }
-    );
+    println!("changes: {} file{}", total, if total == 1 { "" } else { "s" });
 
     if total <= MAX_REPORTED_FILES_DISPLAY {
         for path in paths {
