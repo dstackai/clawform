@@ -14,6 +14,27 @@ codex login status
 
 Expected for authenticated runs: a successful status output.
 
+## Install From Releases (No Source Build)
+
+Install latest stable release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/peterschmidt85/claudeform/main/install.sh | sh
+```
+
+Install a pinned version (including pre-release tags):
+
+```bash
+CLAUDEFORM_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/peterschmidt85/claudeform/main/install.sh | sh
+CLAUDEFORM_VERSION=v0.2.0-rc.1 curl -fsSL https://raw.githubusercontent.com/peterschmidt85/claudeform/main/install.sh | sh
+```
+
+Notes:
+
+- default install target is `~/.local/bin`
+- installer verifies `SHA256SUMS` from GitHub Release artifacts
+- `latest` resolves only latest stable GitHub release (pre-releases are opt-in via explicit version pinning)
+
 ## Build
 
 From repository root:
@@ -134,6 +155,23 @@ Notes:
 - These tests require DNS/connectivity to `api.openai.com`.
 - They may consume API credits and run slower/flakier than mock tests.
 - Keep them opt-in locally and in CI.
+
+## Release Automation
+
+GitHub release workflow:
+
+- file: `.github/workflows/release.yml`
+- trigger: push tag matching `v*`
+- outputs:
+  - `claudeform_linux_x86_64.tar.gz`
+  - `claudeform_darwin_x86_64.tar.gz`
+  - `claudeform_darwin_aarch64.tar.gz`
+  - `SHA256SUMS`
+
+Release type:
+
+- tags without `-` become stable releases (for example `v0.3.0`)
+- tags with `-` become pre-releases (for example `v0.3.0-rc.1`)
 
 ## Troubleshooting
 

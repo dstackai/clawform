@@ -1,0 +1,103 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build-${{ matrix.archive_os }}-${{ matrix.archive_arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            archive_os: linux
+            archive_arch: x86_64
+          - runner: macos-13
+            archive_os: darwin
+            archive_arch: x86_64
+          - runner: macos-14
+            archive_os: darwin
+            archive_arch: aarch64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build binaries
+        run: cargo build --release -p claudeform
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="claudeform_${{ matrix.archive_os }}_${{ matrix.archive_arch }}.tar.gz"
+          mkdir -p dist
+          cp target/release/claudeform dist/claudeform
+          cp target/release/cf dist/cf
+          chmod +x dist/claudeform dist/cf
+          tar -C dist -czf "$asset" claudeform cf
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > "${asset}.sha256"
+          else
+            shasum -a 256 "$asset" > "${asset}.sha256"
+          fi
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.archive_os }}-${{ matrix.archive_arch }}
+          path: |
+            claudeform_${{ matrix.archive_os }}_${{ matrix.archive_arch }}.tar.gz
+            claudeform_${{ matrix.archive_os }}_${{ matrix.archive_arch }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish-release
+    runs-on: ubuntu-latest
+    needs: [build]
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Prepare release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          find dist -type f -name "*.tar.gz" -exec cp {} dist/ \;
+          find dist -type f -name "*.tar.gz.sha256" -print0 \
+            | sort -z \
+            | xargs -0 cat > dist/SHA256SUMS
+          ls -lah dist
+
+      - name: Detect release type
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ "${tag}" == *-* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ steps.meta.outputs.is_prerelease }}
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
