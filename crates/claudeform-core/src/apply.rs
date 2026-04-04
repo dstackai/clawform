@@ -2309,8 +2309,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const PROMPT_EXAMPLE_WITH_LAST: &str = include_str!("../../../prompt_example_with_last_changes.md");
-    const PROMPT_EXAMPLE_NO_LAST: &str = include_str!("../../../prompt_example_no_last_session.md");
+    const PROMPT_EXAMPLE_WITH_LAST: &str =
+        include_str!("../../../test_data/runtime_prompt_with_last_session.md");
+    const PROMPT_EXAMPLE_NO_LAST: &str =
+        include_str!("../../../test_data/runtime_prompt_first_session.md");
 
     #[test]
     fn normalize_reported_path_rejects_parent_dir_escape() {
