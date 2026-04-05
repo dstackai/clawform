@@ -9,8 +9,49 @@ permissions:
   contents: write
 
 jobs:
+  validate-tag-version:
+    name: validate-tag-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate tag matches Cargo version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          cargo_version="$(
+            awk '
+              /^\[workspace\.package\]/ { in_section=1; next }
+              /^\[/ { if (in_section) exit }
+              in_section && $1 == "version" {
+                gsub(/"/, "", $3)
+                print $3
+                exit
+              }
+            ' Cargo.toml
+          )"
+
+          if [[ -z "${cargo_version}" ]]; then
+            echo "Could not resolve workspace.package.version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          expected_tag="v${cargo_version}"
+          if [[ "${tag}" != "${expected_tag}" ]]; then
+            echo "Tag/version mismatch:" >&2
+            echo "  tag: ${tag}" >&2
+            echo "  Cargo.toml workspace version: ${cargo_version}" >&2
+            echo "  expected tag: ${expected_tag}" >&2
+            exit 1
+          fi
+
+          echo "Tag/version check passed: ${tag}"
+
   build:
     name: build-${{ matrix.archive_os }}-${{ matrix.archive_arch }}
+    needs: [validate-tag-version]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
