@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use tempfile::TempDir;
 
 use claudeform_core::provider::{ProviderRequest, ProviderRunResult, ProviderRunner};
-use claudeform_core::{run_apply, AgentStatus, ApplyRequest, RunHistoryRecord, RunStatus};
+use claudeform_core::{run_apply, ApplyRequest, RunHistoryRecord, RunStatus, SandboxMode};
 
 const AGENT_RESULT_SUCCESS_JSON: &str = r#"{"status":"success","message":"done"}"#;
 const AGENT_RESULT_PARTIAL_JSON: &str =
@@ -113,9 +113,11 @@ fn run(
             confirm: false,
             debug: false,
             progress: false,
+            render_progress: false,
             interactive_ui: false,
             show_intermediate_steps: false,
             use_history_context,
+            sandbox_mode: SandboxMode::Auto,
         },
         runner,
     )
@@ -261,7 +263,7 @@ Write ./out.txt.
 }
 
 #[test]
-fn reads_agent_result_status_without_affecting_system_success() -> Result<()> {
+fn partial_agent_result_marks_apply_as_failure() -> Result<()> {
     let ws = setup_workspace(
         r#"---
 id: mock_program
@@ -281,25 +283,13 @@ Write ./out.txt.
         false,
     );
 
-    let result = run(&ws, &runner, false)?;
-    assert_eq!(
-        result.agent_result.as_ref().map(|r| &r.status),
-        Some(&AgentStatus::Partial)
-    );
-    assert_eq!(
-        result
-            .agent_result
-            .as_ref()
-            .and_then(|r| r.message.as_deref()),
-        Some("could not run tests in this environment")
-    );
-    assert!(!result
-        .file_results
-        .iter()
-        .any(|f| f.path == ".claudeform/agent_result.json"));
+    let err = run(&ws, &runner, false)
+        .err()
+        .context("expected apply failure for partial agent status")?;
+    assert!(format!("{:#}", err).contains("partial completion"));
     let history = read_history(ws.path())?;
     assert_eq!(history.len(), 1);
-    assert_eq!(history[0].status, RunStatus::Success);
+    assert_eq!(history[0].status, RunStatus::Failure);
     Ok(())
 }
 

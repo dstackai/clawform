@@ -99,16 +99,16 @@ Show provider raw logs (debug mode):
 cargo run -p claudeform -- apply -f examples/smoke.md --debug
 ```
 
-Disable live progress events:
+Disable progress rendering entirely:
 
 ```bash
-cargo run -p claudeform -- apply -f examples/smoke.md --no-progress
+cargo run -p claudeform -- apply -f examples/smoke.md --progress off
 ```
 
 Force plain (non-interactive) progress output even in a TTY:
 
 ```bash
-cargo run -p claudeform -- apply -f examples/smoke.md --no-interactive
+cargo run -p claudeform -- apply -f examples/smoke.md --progress plain
 ```
 
 Intermediate progress steps (read/search/text/turn details) are enabled by default.
@@ -116,13 +116,63 @@ Intermediate progress steps (read/search/text/turn details) are enabled by defau
 Hide intermediate progress steps:
 
 ```bash
-cargo run -p claudeform -- apply -f examples/smoke.md --no-intermediate
+cargo run -p claudeform -- apply -f examples/smoke.md --quiet
+```
+
+Ignore prior run history context for a fresh apply:
+
+```bash
+cargo run -p claudeform -- apply -f examples/smoke.md --reset
+```
+
+Control sandbox policy for model-generated shell commands:
+
+```bash
+# default behavior (auto escalation when needed)
+cargo run -p claudeform -- apply -f examples/smoke.md --sandbox auto
+
+# force sandboxed execution
+cargo run -p claudeform -- apply -f examples/smoke.md --sandbox workspace-write
+
+# force unsandboxed execution
+cargo run -p claudeform -- apply -f examples/smoke.md --sandbox danger-full-access
+```
+
+Simple sandbox behavior check:
+
+```bash
+# force sandboxed mode (network fetch may fail in restricted environments)
+cargo run -p claudeform -- apply -f examples/sandbox-check.md --sandbox workspace-write --yes
+
+# auto mode may escalate and complete with NETWORK_OK
+cargo run -p claudeform -- apply -f examples/sandbox-check.md --sandbox auto --yes
+cat example-data/output-sandbox-check.txt
 ```
 
 Skip confirmation prompt:
 
 ```bash
 cargo run -p claudeform -- apply -f examples/smoke.md --yes
+```
+
+Reset session history:
+
+```bash
+# delete history for one program (interactive confirm in TTY)
+cargo run -p claudeform -- reset --program smoke
+
+# delete history for one program without prompt
+cargo run -p claudeform -- reset --program smoke --yes
+
+# delete history for all programs
+cargo run -p claudeform -- reset --all
+```
+
+Installed binary equivalents:
+
+```bash
+claudeform reset --program smoke
+cf reset --all --yes
 ```
 
 ## Test

@@ -24,8 +24,11 @@ pub struct ProviderRequest {
     pub artifacts_root: Option<PathBuf>,
     pub program_id: Option<String>,
     pub model: Option<String>,
+    pub agent_result_rel: String,
+    pub sandbox_mode: SandboxMode,
     pub prompt: String,
     pub progress: bool,
+    pub render_progress: bool,
     pub verbose_events: bool,
     pub interactive_ui: bool,
     pub show_intermediate_steps: bool,
@@ -38,6 +41,29 @@ pub struct ProviderRunResult {
     pub stdout: String,
     pub stderr: String,
     pub usage: ProviderUsage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxMode {
+    Auto,
+    Sandboxed,
+    Unsandboxed,
+}
+
+impl SandboxMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Sandboxed => "workspace-write",
+            Self::Unsandboxed => "danger-full-access",
+        }
+    }
+}
+
+impl Default for SandboxMode {
+    fn default() -> Self {
+        Self::Auto
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,8 +177,8 @@ enum CodexExecutionMode {
 impl CodexExecutionMode {
     fn label(self) -> &'static str {
         match self {
-            Self::Sandboxed => "sandboxed",
-            Self::Unsandboxed => "unsandboxed",
+            Self::Sandboxed => "workspace-write",
+            Self::Unsandboxed => "danger-full-access",
         }
     }
 }
@@ -163,7 +189,6 @@ const PROVIDER_INTERACTIVE_POLL_MS: u64 = 250;
 const PROVIDER_MAX_ATTEMPTS: usize = 2;
 const PROVIDER_RETRY_BACKOFF_MS: u64 = 1_500;
 const PROVIDER_CANCEL_POLL_MS: u64 = 100;
-
 static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CTRL_C_HANDLER_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
@@ -375,14 +400,35 @@ impl ProviderRunner for CodexRunner {
     fn run(&self, request: &ProviderRequest) -> Result<ProviderRunResult> {
         preflight_codex_connectivity()?;
 
+        match request.sandbox_mode {
+            SandboxMode::Sandboxed => {
+                return run_codex_with_retries(request, CodexExecutionMode::Sandboxed);
+            }
+            SandboxMode::Unsandboxed => {
+                return run_codex_with_retries(request, CodexExecutionMode::Unsandboxed);
+            }
+            SandboxMode::Auto => {}
+        }
+
+        let sandbox_started_at = SystemTime::now();
         let sandboxed = run_codex_with_retries(request, CodexExecutionMode::Sandboxed)?;
         if sandboxed.exit_code == Some(0) {
+            if should_retry_unsandboxed_after_success(request, &sandboxed, sandbox_started_at) {
+                println!(
+                    "provider_retry | mode=danger-full-access | reason=agent_reported_network_restriction_auto_escalate"
+                );
+                return run_codex_with_retries(request, CodexExecutionMode::Unsandboxed);
+            }
             return Ok(sandboxed);
         }
 
-        if is_sandbox_restriction_failure(&sandboxed) {
+        if should_retry_unsandboxed_after_failure_with_agent_result(
+            request,
+            &sandboxed,
+            sandbox_started_at,
+        ) {
             println!(
-                "provider_retry | mode=unsandboxed | reason=sandbox_restriction_auto_escalate"
+                "provider_retry | mode=danger-full-access | reason=sandbox_or_network_restriction_auto_escalate"
             );
             return run_codex_with_retries(request, CodexExecutionMode::Unsandboxed);
         }
@@ -491,6 +537,7 @@ fn run_codex_once(
     if request.progress {
         return collect_with_progress(
             child,
+            request.render_progress,
             request.verbose_events,
             request.interactive_ui,
             request.show_intermediate_steps,
@@ -590,6 +637,130 @@ fn is_sandbox_restriction_failure(run: &ProviderRunResult) -> bool {
     has_permission_error && has_sandbox_context
 }
 
+fn should_retry_unsandboxed_after_failure(run: &ProviderRunResult) -> bool {
+    is_sandbox_restriction_failure(run)
+        || is_network_restriction_failure(run)
+        || output_reports_blocked_network(run)
+}
+
+fn should_retry_unsandboxed_after_failure_with_agent_result(
+    request: &ProviderRequest,
+    run: &ProviderRunResult,
+    run_started_at: SystemTime,
+) -> bool {
+    should_retry_unsandboxed_after_failure(run)
+        || agent_result_reports_blocked_network(
+            &request.workspace_root,
+            request.agent_result_rel.as_str(),
+            run_started_at,
+        )
+}
+
+fn should_retry_unsandboxed_after_success(
+    request: &ProviderRequest,
+    run: &ProviderRunResult,
+    run_started_at: SystemTime,
+) -> bool {
+    agent_result_reports_blocked_network(
+        &request.workspace_root,
+        request.agent_result_rel.as_str(),
+        run_started_at,
+    ) || output_reports_blocked_network(run)
+}
+
+fn is_network_restriction_failure(run: &ProviderRunResult) -> bool {
+    if run.exit_code == Some(0) {
+        return false;
+    }
+
+    let text = format!("{}\n{}", run.stdout, run.stderr).to_ascii_lowercase();
+    output_has_network_restriction_markers(&text)
+}
+
+fn output_reports_blocked_network(run: &ProviderRunResult) -> bool {
+    let text = format!("{}\n{}", run.stdout, run.stderr).to_ascii_lowercase();
+    output_has_network_restriction_markers(&text) && output_has_blocked_markers(&text)
+}
+
+fn agent_result_reports_blocked_network(
+    workspace_root: &Path,
+    result_rel: &str,
+    run_started_at: SystemTime,
+) -> bool {
+    if result_rel.trim().is_empty() {
+        return false;
+    }
+    agent_result_path_reports_blocked_network(workspace_root.join(result_rel), run_started_at)
+}
+
+fn agent_result_path_reports_blocked_network(path: PathBuf, run_started_at: SystemTime) -> bool {
+    let metadata = match fs::metadata(&path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    let modified = match metadata.modified() {
+        Ok(ts) => ts,
+        Err(_) => return false,
+    };
+    if modified < run_started_at {
+        return false;
+    }
+
+    let raw = match fs::read_to_string(&path) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let parsed: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let status = parsed
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !["failure", "failed", "blocked", "partial"].contains(&status.as_str()) {
+        return false;
+    }
+
+    let message = parsed
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let joined = format!("{} {}", status, message);
+    output_has_network_restriction_markers(&joined) && output_has_blocked_markers(&joined)
+}
+
+fn output_has_network_restriction_markers(text: &str) -> bool {
+    let markers = [
+        "could not resolve host",
+        "failed to lookup address information",
+        "nodename nor servname provided",
+        "dns error",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "network is unreachable",
+        "no route to host",
+        "connection timed out",
+        "network restrictions",
+    ];
+    markers.iter().any(|needle| text.contains(needle))
+}
+
+fn output_has_blocked_markers(text: &str) -> bool {
+    let markers = [
+        "blocked",
+        "restriction",
+        "unable to execute",
+        "cannot download required",
+        "required release note downloads unavailable",
+    ];
+    markers.iter().any(|needle| text.contains(needle))
+}
+
 fn is_transient_codex_error(err: &anyhow::Error) -> bool {
     let text = format!("{:#}", err).to_ascii_lowercase();
     transient_transport_markers()
@@ -608,6 +779,7 @@ fn transient_transport_markers() -> &'static [&'static str] {
 
 fn collect_with_progress(
     mut child: std::process::Child,
+    render_progress: bool,
     verbose_events: bool,
     interactive_ui: bool,
     show_intermediate_steps: bool,
@@ -637,7 +809,7 @@ fn collect_with_progress(
     let mut canonical_seq: u64 = 0;
     let mut item_started_at: HashMap<String, Instant> = HashMap::new();
     let mut usage_totals = ProviderUsage::default();
-    let mut printer = ProgressPrinter::new(interactive_ui);
+    let mut printer = ProgressPrinter::new(render_progress && interactive_ui);
     let mut last_heartbeat_at = Instant::now();
     let mut status = None;
     let mut channel_closed = false;
@@ -734,9 +906,11 @@ fn collect_with_progress(
                                     summary.as_deref(),
                                     show_intermediate_steps,
                                 ) {
-                                    let label = status_activity_label(item_type, summary.as_deref());
+                                    let label =
+                                        status_activity_label(item_type, summary.as_deref());
                                     if let Some(id) = item_id.as_ref() {
-                                        active_progress_items.retain(|(active_id, _)| active_id != id);
+                                        active_progress_items
+                                            .retain(|(active_id, _)| active_id != id);
                                         active_progress_items.push((id.clone(), label.clone()));
                                     }
                                     last_activity = label;
@@ -754,7 +928,8 @@ fn collect_with_progress(
                                     show_intermediate_steps,
                                 ) {
                                     if let Some(id) = item_id.as_ref() {
-                                        active_progress_items.retain(|(active_id, _)| active_id != id);
+                                        active_progress_items
+                                            .retain(|(active_id, _)| active_id != id);
                                     }
                                     last_activity = active_progress_items
                                         .last()
@@ -797,7 +972,7 @@ fn collect_with_progress(
                             verbose_events,
                             show_intermediate_steps,
                         );
-                        if progress_line.is_none() {
+                        if show_intermediate_steps && progress_line.is_none() {
                             if let ProviderEvent::TurnCompleted { ref usage } = normalized {
                                 progress_line = format_turn_usage_line(turn_index, usage);
                             }
@@ -831,12 +1006,16 @@ fn collect_with_progress(
                             if is_text_event_line(&progress_line) {
                                 last_agent_text_line = Some(progress_line.clone());
                             }
-                            printer.print_event(&progress_line);
+                            if render_progress {
+                                printer.print_event(&progress_line);
+                            }
                         }
                     }
                 } else if emitted_progress_events == 0 {
                     if let Some(hint) = extract_startup_stderr_hint(&line) {
-                        printer.print_event(&format!("startup_hint | {}", hint));
+                        if render_progress {
+                            printer.print_event(&format!("startup_hint | {}", hint));
+                        }
                     }
                 }
             }
@@ -853,7 +1032,10 @@ fn collect_with_progress(
             {
                 status = Some(done);
             } else {
-                if Instant::now().duration_since(last_heartbeat_at) >= heartbeat_interval {
+                if render_progress
+                    && show_intermediate_steps
+                    && Instant::now().duration_since(last_heartbeat_at) >= heartbeat_interval
+                {
                     printer.print_status(&format_status_line(&last_activity));
                     last_heartbeat_at = Instant::now();
                 }
@@ -864,7 +1046,7 @@ fn collect_with_progress(
     join_reader(stdout_handle, "stdout")?;
     join_reader(stderr_handle, "stderr")?;
 
-    if emitted_progress_events == 0 {
+    if render_progress && show_intermediate_steps && emitted_progress_events == 0 {
         printer.print_event("no_live_events");
     }
     printer.finish();
@@ -1608,10 +1790,15 @@ fn format_terminal_event(
     show_intermediate_steps: bool,
 ) -> Option<String> {
     match event {
-        ProviderEvent::RunStarted { run_id } => Some(match run_id.as_deref() {
-            Some(id) => format!("session {}", id),
-            None => "session started".to_string(),
-        }),
+        ProviderEvent::RunStarted { run_id } => {
+            if !show_intermediate_steps {
+                return None;
+            }
+            Some(match run_id.as_deref() {
+                Some(id) => format!("session {}", id),
+                None => "session started".to_string(),
+            })
+        }
         ProviderEvent::TurnStarted => None,
         ProviderEvent::TurnCompleted { .. } => None,
         ProviderEvent::TurnFailed { message } => Some(format!(
@@ -1651,6 +1838,9 @@ fn format_terminal_event(
         }
         ProviderEvent::RawText { .. } => None,
         ProviderEvent::Heartbeat { elapsed_secs } => {
+            if !show_intermediate_steps {
+                return None;
+            }
             Some(format!("running | elapsed={}s", elapsed_secs))
         }
     }
@@ -1663,10 +1853,11 @@ fn format_item_event(
     summary: Option<&str>,
     show_intermediate_steps: bool,
 ) -> Option<String> {
+    if !show_intermediate_steps {
+        return None;
+    }
+
     if is_reasoning_item_type(item_type) {
-        if !show_intermediate_steps {
-            return None;
-        }
         let text = summary?;
         if is_low_signal_note(text) {
             return None;
@@ -1675,9 +1866,6 @@ fn format_item_event(
     }
 
     if is_agent_text_item_type(item_type) {
-        if !show_intermediate_steps {
-            return None;
-        }
         let text = summary?;
         if is_low_signal_note(text) {
             return None;
@@ -1700,10 +1888,6 @@ fn format_item_event(
     if kind == "cmd" && is_claudeform_housekeeping_command(summary) {
         return None;
     }
-    if kind == "cmd" && is_low_signal_command(summary) && !show_intermediate_steps {
-        return None;
-    }
-
     if kind == "cmd" {
         return Some(format!("✔ {}", summary));
     }
@@ -1748,6 +1932,14 @@ fn is_claudeform_housekeeping_command(summary: &str) -> bool {
         || s.starts_with("cat .claudeform/agent_summary.md")
         || s.starts_with("cat .claudeform/agent_outputs.json")
         || s.starts_with("cat .claudeform/agent_result.json")
+        || {
+            let is_read_write = s.starts_with("write ") || s.starts_with("cat ");
+            is_read_write
+                && s.contains(".claudeform/programs/")
+                && (s.contains("/reports/agent_output")
+                    || s.contains("/reports/agent_outputs")
+                    || s.contains("/reports/agent_result"))
+        }
 }
 
 fn is_low_signal_note(text: &str) -> bool {
@@ -2035,11 +2227,7 @@ fn colorize_link_segment(segment: &str) -> Option<String> {
 
     for prefix in ["out=", "msg=", "file="] {
         if let Some(rest) = segment.strip_prefix(prefix) {
-            return Some(format!(
-                "\x1b[95m{}\x1b[0m{}",
-                prefix,
-                colorize_paths(rest)
-            ));
+            return Some(format!("\x1b[95m{}\x1b[0m{}", prefix, colorize_paths(rest)));
         }
     }
 
@@ -2299,6 +2487,14 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_mode_labels_match_cli_values() {
+        assert_eq!(SandboxMode::default(), SandboxMode::Auto);
+        assert_eq!(SandboxMode::Auto.label(), "auto");
+        assert_eq!(SandboxMode::Sandboxed.label(), "workspace-write");
+        assert_eq!(SandboxMode::Unsandboxed.label(), "danger-full-access");
+    }
+
+    #[test]
     fn non_json_line_maps_to_raw_text_without_progress_line() {
         let ev = parse_codex_stream_line("OpenAI Codex v0.118.0").expect("expected raw text");
         assert!(matches!(ev, ProviderEvent::RawText { .. }));
@@ -2353,6 +2549,100 @@ mod tests {
             usage: ProviderUsage::default(),
         };
         assert!(!is_sandbox_restriction_failure(&run));
+    }
+
+    #[test]
+    fn classifies_network_restriction_failure_from_output() {
+        let run = ProviderRunResult {
+            session_id: None,
+            exit_code: Some(1),
+            stdout: "curl: (6) Could not resolve host: api.github.com".to_string(),
+            stderr: String::new(),
+            usage: ProviderUsage::default(),
+        };
+        assert!(is_network_restriction_failure(&run));
+        assert!(should_retry_unsandboxed_after_failure(&run));
+    }
+
+    #[test]
+    fn detects_blocked_network_message_in_successful_run_output() {
+        let run = ProviderRunResult {
+            session_id: None,
+            exit_code: Some(0),
+            stdout: "Blocked by network restrictions; required release note downloads unavailable. could not resolve host".to_string(),
+            stderr: String::new(),
+            usage: ProviderUsage::default(),
+        };
+        assert!(output_reports_blocked_network(&run));
+    }
+
+    #[test]
+    fn reads_recent_agent_result_for_blocked_network_detection() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir
+            .path()
+            .join(".claudeform/programs/release-notes/reports/agent_result.json");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create reports dir");
+        }
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(
+            &path,
+            r#"{"status":"failure","message":"Blocked by network restrictions; could not resolve host"}"#,
+        )
+        .expect("write agent_result");
+
+        assert!(agent_result_reports_blocked_network(
+            dir.path(),
+            ".claudeform/programs/release-notes/reports/agent_result.json",
+            started
+        ));
+    }
+
+    #[test]
+    fn retries_unsandboxed_when_failed_run_has_blocked_network_in_agent_result() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace_root = dir.path().to_path_buf();
+        let result_path =
+            workspace_root.join(".claudeform/programs/release-notes/reports/agent_result.json");
+        if let Some(parent) = result_path.parent() {
+            std::fs::create_dir_all(parent).expect("create reports dir");
+        }
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(
+            &result_path,
+            r#"{"status":"failure","message":"Blocked by network restrictions; required release note downloads unavailable"}"#,
+        )
+        .expect("write agent_result");
+
+        let request = ProviderRequest {
+            workspace_root,
+            artifacts_root: None,
+            program_id: Some("release-notes".to_string()),
+            model: None,
+            agent_result_rel: ".claudeform/programs/release-notes/reports/agent_result.json"
+                .to_string(),
+            sandbox_mode: SandboxMode::Auto,
+            prompt: "x".to_string(),
+            progress: true,
+            render_progress: false,
+            verbose_events: false,
+            interactive_ui: false,
+            show_intermediate_steps: false,
+        };
+        let run = ProviderRunResult {
+            session_id: None,
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: String::new(),
+            usage: ProviderUsage::default(),
+        };
+
+        assert!(should_retry_unsandboxed_after_failure_with_agent_result(
+            &request, &run, started
+        ));
     }
 
     #[test]
@@ -2435,13 +2725,39 @@ mod tests {
             &ProviderEvent::ItemCompleted {
                 item_type: "command_execution".to_string(),
                 item_id: Some("x".to_string()),
-                summary: Some("ls .claudeform".to_string()),
+                summary: Some("ls src".to_string()),
             },
             true,
             true,
         )
         .expect("expected command line");
-        assert!(line.contains("ls .claudeform"));
+        assert!(line.contains("ls src"));
+    }
+
+    #[test]
+    fn hides_command_events_when_intermediate_disabled() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "command_execution".to_string(),
+                item_id: Some("x".to_string()),
+                summary: Some("cargo test -q".to_string()),
+            },
+            true,
+            false,
+        );
+        assert!(line.is_none());
+    }
+
+    #[test]
+    fn hides_session_line_when_intermediate_disabled() {
+        let line = format_terminal_event(
+            &ProviderEvent::RunStarted {
+                run_id: Some("thread_123".to_string()),
+            },
+            true,
+            false,
+        );
+        assert!(line.is_none());
     }
 
     #[test]
@@ -2450,7 +2766,10 @@ mod tests {
             &ProviderEvent::ItemCompleted {
                 item_type: "command_execution".to_string(),
                 item_id: Some("x".to_string()),
-                summary: Some("write .claudeform/agent_result.json".to_string()),
+                summary: Some(
+                    "write .claudeform/programs/release-notes/reports/agent_result.json"
+                        .to_string(),
+                ),
             },
             true,
             true,
@@ -2462,12 +2781,12 @@ mod tests {
     fn housekeeping_commands_do_not_count_as_progress_activity() {
         assert!(!should_count_item_progress(
             "command_execution",
-            Some("write .claudeform/agent_outputs.json"),
+            Some("write .claudeform/programs/release-notes/reports/agent_outputs.json"),
             true
         ));
         assert!(!should_count_item_progress(
             "command_execution",
-            Some("cat .claudeform/agent_result.json"),
+            Some("cat .claudeform/programs/release-notes/reports/agent_result.json"),
             false
         ));
     }

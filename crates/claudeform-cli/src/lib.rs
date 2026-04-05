@@ -1,17 +1,43 @@
 use std::collections::BTreeMap;
 use std::env;
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 use claudeform_core::{
     reset_history, run_apply, AgentResult, AgentStatus, ApplyRequest, CodexRunner, FileResult,
-    HistoryResetTarget, ProviderRunner, ProviderUsage,
+    HistoryResetTarget, ProviderRunner, ProviderUsage, SandboxMode,
 };
 
 const MAX_REPORTED_FILES_DISPLAY: usize = 20;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliSandboxMode {
+    Auto,
+    #[value(alias = "sandboxed")]
+    WorkspaceWrite,
+    #[value(alias = "unsandboxed")]
+    DangerFullAccess,
+}
+
+impl From<CliSandboxMode> for SandboxMode {
+    fn from(value: CliSandboxMode) -> Self {
+        match value {
+            CliSandboxMode::Auto => SandboxMode::Auto,
+            CliSandboxMode::WorkspaceWrite => SandboxMode::Sandboxed,
+            CliSandboxMode::DangerFullAccess => SandboxMode::Unsandboxed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum CliProgressMode {
+    Rich,
+    Plain,
+    Off,
+}
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Markdown-first declarative agent apply")]
@@ -29,50 +55,65 @@ enum Commands {
         file: PathBuf,
 
         /// Auto-approve apply without interactive confirmation prompt.
-        #[arg(long)]
+        #[arg(short = 'y', long)]
         yes: bool,
 
         /// Print raw provider stdout/stderr (debug output).
-        #[arg(long)]
+        #[arg(short = 'd', long)]
         debug: bool,
 
-        /// Disable live provider progress events.
-        #[arg(long = "no-progress", action = ArgAction::SetTrue)]
-        no_progress: bool,
+        /// Progress rendering mode.
+        #[arg(
+            short = 'p',
+            long = "progress",
+            value_enum,
+            default_value_t = CliProgressMode::Rich
+        )]
+        progress_mode: CliProgressMode,
 
-        /// Disable interactive rich progress output (forces plain text lines).
-        #[arg(long = "no-interactive", action = ArgAction::SetTrue)]
-        no_interactive: bool,
+        /// Legacy alias for `--progress off`.
+        #[arg(long = "no-progress", action = ArgAction::SetTrue, hide = true)]
+        no_progress_legacy: bool,
 
-        /// Hide intermediate progress steps (read/search/text/turn details).
-        #[arg(long = "no-intermediate", action = ArgAction::SetTrue)]
-        no_intermediate: bool,
+        /// Legacy alias for `--progress plain`.
+        #[arg(long = "no-interactive", action = ArgAction::SetTrue, hide = true)]
+        no_interactive_legacy: bool,
 
-        /// Disable injecting compact run history context.
-        #[arg(long = "no-history-context", action = ArgAction::SetTrue)]
-        no_history_context: bool,
+        /// Quiet mode: hide intermediate progress steps (read/search/text/turn details).
+        #[arg(
+            short = 'q',
+            long = "quiet",
+            alias = "no-intermediate",
+            action = ArgAction::SetTrue
+        )]
+        quiet: bool,
+
+        /// Reset context for this run (ignore prior run history context).
+        #[arg(short = 'r', long = "reset", action = ArgAction::SetTrue)]
+        reset_context: bool,
+
+        /// Sandbox policy for model-generated shell commands (`auto` escalates when needed).
+        #[arg(
+            short = 's',
+            long = "sandbox",
+            alias = "sandbox-mode",
+            value_enum,
+            default_value_t = CliSandboxMode::Auto
+        )]
+        sandbox_mode: CliSandboxMode,
     },
-    /// Manage local run history.
-    History {
-        #[command(subcommand)]
-        command: HistoryCommands,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum HistoryCommands {
-    /// Reset local run history.
+    /// Delete local session history and artifacts.
     Reset {
-        /// Program id to reset.
-        #[arg(long)]
+        /// Program id whose session history should be deleted.
+        #[arg(short = 'p', long)]
         program: Option<String>,
 
-        /// Reset all programs.
-        #[arg(long)]
+        /// Delete session history for all programs.
+        #[arg(short = 'a', long)]
         all: bool,
 
-        /// Confirm destructive reset.
-        #[arg(long)]
+        /// Auto-approve destructive delete without interactive confirmation prompt.
+        #[arg(short = 'y', long)]
         yes: bool,
     },
 }
@@ -82,6 +123,10 @@ pub fn main_entry() {
         if is_user_cancelled_error(&err) {
             print_canceled(true);
             std::process::exit(130);
+        }
+        if is_blocked_error(&err) {
+            print_blocked();
+            std::process::exit(2);
         }
         eprintln!("error: {:#}", err);
         std::process::exit(1);
@@ -96,18 +141,32 @@ fn real_main() -> Result<()> {
             file,
             yes,
             debug,
-            no_progress,
-            no_interactive,
-            no_intermediate,
-            no_history_context,
+            progress_mode,
+            no_progress_legacy,
+            no_interactive_legacy,
+            quiet,
+            reset_context,
+            sandbox_mode,
         } => {
             let workspace_root =
                 env::current_dir().context("failed resolving current working directory")?;
             let runner = CodexRunner;
             let interactive_shell =
                 std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-            let interactive_ui = interactive_shell && !no_interactive;
+            let progress_mode = if no_progress_legacy {
+                CliProgressMode::Off
+            } else if no_interactive_legacy && progress_mode == CliProgressMode::Rich {
+                CliProgressMode::Plain
+            } else {
+                progress_mode
+            };
+            let (render_progress, interactive_ui) = match progress_mode {
+                CliProgressMode::Rich => (true, interactive_shell),
+                CliProgressMode::Plain => (true, false),
+                CliProgressMode::Off => (false, false),
+            };
             let confirm = interactive_shell && !yes;
+            let sandbox_mode: SandboxMode = sandbox_mode.into();
 
             if debug {
                 let caps = runner.capabilities();
@@ -124,12 +183,13 @@ fn real_main() -> Result<()> {
                 );
                 println!(
                     "UI: {}",
-                    if interactive_ui {
-                        "interactive"
-                    } else {
-                        "plain"
+                    match progress_mode {
+                        CliProgressMode::Off => "off",
+                        CliProgressMode::Rich if interactive_ui => "interactive",
+                        _ => "plain",
                     }
                 );
+                println!("Sandbox mode: {}", sandbox_mode.label());
             }
 
             let result = match run_apply(
@@ -138,10 +198,12 @@ fn real_main() -> Result<()> {
                     program_path: file,
                     confirm,
                     debug,
-                    progress: !no_progress,
+                    progress: true,
+                    render_progress,
                     interactive_ui,
-                    show_intermediate_steps: !no_intermediate,
-                    use_history_context: !no_history_context,
+                    show_intermediate_steps: !quiet,
+                    use_history_context: !reset_context,
+                    sandbox_mode,
                 },
                 &runner,
             ) {
@@ -181,7 +243,7 @@ fn real_main() -> Result<()> {
                         result.agent_human_summary_artifact.as_deref(),
                         &result.file_results,
                         &run.usage,
-                        no_progress || no_intermediate,
+                        progress_mode == CliProgressMode::Off || quiet,
                     );
 
                     if debug {
@@ -195,43 +257,78 @@ fn real_main() -> Result<()> {
                 }
             }
         }
-        Commands::History { command } => match command {
-            HistoryCommands::Reset { program, all, yes } => {
-                if !yes {
-                    return Err(anyhow!("history reset requires --yes"));
-                }
-                if all == program.is_some() {
-                    return Err(anyhow!("specify exactly one of --program or --all"));
-                }
-                let workspace_root =
-                    env::current_dir().context("failed resolving current working directory")?;
-                let outcome = if all {
-                    reset_history(&workspace_root, HistoryResetTarget::All)?
-                } else {
-                    reset_history(
-                        &workspace_root,
-                        HistoryResetTarget::Program(program.expect("validated above")),
-                    )?
-                };
-
-                if outcome.index_deleted {
-                    println!("history reset: removed index");
-                } else {
-                    println!(
-                        "history reset: removed {} record{}",
-                        outcome.removed_records,
-                        if outcome.removed_records == 1 {
-                            ""
-                        } else {
-                            "s"
-                        }
-                    );
-                }
-            }
-        },
+        Commands::Reset { program, all, yes } => run_history_reset(program, all, yes)?,
     }
 
     Ok(())
+}
+
+fn run_history_reset(program: Option<String>, all: bool, yes: bool) -> Result<()> {
+    if all == program.is_some() {
+        return Err(anyhow!("specify exactly one of --program or --all"));
+    }
+    let interactive_shell = io::stdin().is_terminal() && io::stdout().is_terminal();
+    if interactive_shell && !yes {
+        let target = if all {
+            "all programs"
+        } else {
+            program.as_deref().unwrap_or("selected program")
+        };
+        if !confirm_history_reset_interactive(target)? {
+            print_canceled(false);
+            return Ok(());
+        }
+    }
+    let workspace_root =
+        env::current_dir().context("failed resolving current working directory")?;
+    let outcome = if all {
+        reset_history(&workspace_root, HistoryResetTarget::All)?
+    } else {
+        reset_history(
+            &workspace_root,
+            HistoryResetTarget::Program(program.expect("validated above")),
+        )?
+    };
+
+    if outcome.index_deleted {
+        println!("history delete: removed history index");
+    } else {
+        println!(
+            "history delete: removed {} session record{}",
+            outcome.removed_records,
+            if outcome.removed_records == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+    }
+
+    Ok(())
+}
+
+fn confirm_history_reset_interactive(target: &str) -> Result<bool> {
+    let use_color = io::stdout().is_terminal();
+    if use_color {
+        print!(
+            "\x1b[1mProceed with deleting session history for {}?\x1b[0m \x1b[2m[y/N]\x1b[0m ",
+            target
+        );
+    } else {
+        print!(
+            "Proceed with deleting session history for {}? [y/N] ",
+            target
+        );
+    }
+    io::stdout()
+        .flush()
+        .context("failed flushing history reset prompt")?;
+
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .context("failed reading history reset confirmation")?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
 fn yes_no(v: bool) -> &'static str {
@@ -282,12 +379,44 @@ fn print_canceled(ctrl_c: bool) {
     }
 }
 
+fn print_blocked() {
+    let use_color = std::io::stderr().is_terminal() && std::io::stdout().is_terminal();
+    let base = if use_color {
+        "\x1b[31mBlocked\x1b[0m"
+    } else {
+        "Blocked"
+    };
+    eprintln!("{}.", base);
+}
+
 fn is_user_cancelled_error(err: &anyhow::Error) -> bool {
     let text = format!("{:#}", err).to_ascii_lowercase();
     text.contains("cancelled by user")
         || text.contains("ctrl-c")
         || text.contains("interrupted")
         || text.contains("signal 2")
+}
+
+fn is_blocked_error(err: &anyhow::Error) -> bool {
+    let text = format!("{:#}", err).to_ascii_lowercase();
+    if is_user_cancelled_error(err) {
+        return false;
+    }
+
+    let markers = [
+        "blocked",
+        "sandbox restriction",
+        "network restriction",
+        "permission denied",
+        "operation not permitted",
+        "cannot download required",
+        "could not resolve host",
+        "failed to lookup address information",
+        "network is unreachable",
+        "no route to host",
+        "temporary failure in name resolution",
+    ];
+    markers.iter().any(|marker| text.contains(marker))
 }
 
 fn print_file_summary(
@@ -397,7 +526,11 @@ fn print_reported_files(file_results: &[FileResult], use_color: bool) {
     }
 
     let total = paths.len();
-    println!("changes: {} file{}", total, if total == 1 { "" } else { "s" });
+    println!(
+        "changes: {} file{}",
+        total,
+        if total == 1 { "" } else { "s" }
+    );
 
     if total <= MAX_REPORTED_FILES_DISPLAY {
         for path in paths {

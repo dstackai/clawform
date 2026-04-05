@@ -21,7 +21,7 @@ use crate::program::load_program;
 use crate::provider::clear_interrupt_request;
 use crate::provider::ensure_interrupt_handler;
 use crate::provider::interrupt_requested;
-use crate::provider::{ProviderRequest, ProviderRunResult, ProviderRunner};
+use crate::provider::{ProviderRequest, ProviderRunResult, ProviderRunner, SandboxMode};
 
 const AGENT_OUTPUT_MANIFEST_REL: &str = ".claudeform/agent_outputs.json";
 const AGENT_HUMAN_OUTPUT_REL: &str = ".claudeform/agent_output.md";
@@ -43,9 +43,11 @@ pub struct ApplyRequest {
     pub confirm: bool,
     pub debug: bool,
     pub progress: bool,
+    pub render_progress: bool,
     pub interactive_ui: bool,
     pub show_intermediate_steps: bool,
     pub use_history_context: bool,
+    pub sandbox_mode: SandboxMode,
 }
 
 #[derive(Debug, Clone)]
@@ -280,8 +282,11 @@ fn execute_apply<R: ProviderRunner>(
         artifacts_root: Some(request.workspace_root.clone()),
         program_id: Some(context.program_key.clone()),
         model: context.resolved_model.clone(),
+        agent_result_rel: AGENT_RESULT_REL.to_string(),
+        sandbox_mode: request.sandbox_mode,
         prompt,
         progress: request.progress,
+        render_progress: request.render_progress,
         verbose_events: true,
         interactive_ui: request.interactive_ui,
         show_intermediate_steps: request.show_intermediate_steps,
@@ -702,10 +707,31 @@ fn summarize_reported_files(file_results: &[FileResult]) -> (usize, usize, usize
 }
 
 fn validate_agent_completion(agent_result: &Option<AgentResult>) -> Result<()> {
-    let _ = agent_result
+    let result = agent_result
         .as_ref()
         .ok_or_else(|| anyhow!("missing required '{}'", AGENT_RESULT_REL))?;
-    Ok(())
+
+    match result.status {
+        AgentStatus::Success => Ok(()),
+        AgentStatus::Partial => Err(anyhow!(
+            "agent reported partial completion in '{}': {}",
+            AGENT_RESULT_REL,
+            result
+                .message
+                .as_deref()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or("no message provided")
+        )),
+        AgentStatus::Failure => Err(anyhow!(
+            "agent reported failure in '{}': {}",
+            AGENT_RESULT_REL,
+            result
+                .message
+                .as_deref()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or("no message provided")
+        )),
+    }
 }
 
 fn build_shared_plan_data(
@@ -928,9 +954,13 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
         block.push_str("- \"last session\": the most recent finished session for this program\n\n");
         block.push_str("What is expected in this \"current session\":\n");
         block.push_str("- Complete the \"program\".\n");
-        block.push_str("- Use files and tools in the workspace as needed to complete the \"program\".\n");
+        block.push_str(
+            "- Use files and tools in the workspace as needed to complete the \"program\".\n",
+        );
         block.push_str("- Use \"last session\" details to understand what was already done.\n");
-        block.push_str("- Keep correct work from \"last session\"; do not redo work without a clear reason.\n");
+        block.push_str(
+            "- Keep correct work from \"last session\"; do not redo work without a clear reason.\n",
+        );
         block.push_str("- If program changes require updates, apply only the updates required by those changes.\n");
         block.push_str("- If verification shows issues, fix them in this \"current session\".\n");
         block.push_str("- Continue until the program result is correct, or stop only when there is no practical way forward.\n");
@@ -1042,7 +1072,9 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
         block.push_str("- `success`: the \"program\" is complete and correct.\n");
         block.push_str("- `partial`: useful progress was made, but program is not complete.\n");
         block.push_str("- `failure`: program could not be completed.\n");
-        block.push_str("- `message`: one short sentence about this \"current session\" result.\n\n---\n\n");
+        block.push_str(
+            "- `message`: one short sentence about this \"current session\" result.\n\n---\n\n",
+        );
         block.push_str("User-facing message rule for this \"current session\"\n\n");
         block.push_str("- In user-facing text, describe program results only.\n");
         block.push_str(
@@ -1059,7 +1091,9 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
         block.push_str(program_file);
         block.push_str("`\n\n");
         block.push_str("Session context\n");
-        block.push_str("- This program is being performed for the first time (no previous sessions).\n\n");
+        block.push_str(
+            "- This program is being performed for the first time (no previous sessions).\n\n",
+        );
         block.push_str("What to do in this session\n");
         block.push_str("- Read and implement `");
         block.push_str(program_file);
@@ -1123,7 +1157,10 @@ fn read_agent_reported_files(workspace_root: &Path) -> Result<Vec<String>> {
             AgentOutputManifestEntry::Record(record) => {
                 if let Some(change) = record.change.as_deref() {
                     let normalized_change = change.trim().to_ascii_lowercase();
-                    if !matches!(normalized_change.as_str(), "created" | "modified" | "deleted") {
+                    if !matches!(
+                        normalized_change.as_str(),
+                        "created" | "modified" | "deleted"
+                    ) {
                         continue;
                     }
                 }
@@ -2542,6 +2579,26 @@ mod tests {
     fn validation_rejects_missing_agent_result() {
         let err = validate_agent_completion(&None).expect_err("must fail");
         assert!(format!("{:#}", err).contains(AGENT_RESULT_REL));
+    }
+
+    #[test]
+    fn validation_rejects_partial_agent_result() {
+        let result = AgentResult {
+            status: AgentStatus::Partial,
+            message: Some("network was unavailable".to_string()),
+        };
+        let err = validate_agent_completion(&Some(result)).expect_err("partial must fail");
+        assert!(format!("{:#}", err).contains("partial completion"));
+    }
+
+    #[test]
+    fn validation_rejects_failure_agent_result() {
+        let result = AgentResult {
+            status: AgentStatus::Failure,
+            message: Some("blocked".to_string()),
+        };
+        let err = validate_agent_completion(&Some(result)).expect_err("failure must fail");
+        assert!(format!("{:#}", err).contains("reported failure"));
     }
 
     #[test]

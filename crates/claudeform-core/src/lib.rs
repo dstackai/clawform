@@ -14,5 +14,5 @@ pub use history::{
 };
 pub use provider::{
     CodexRunner, ProviderCapabilities, ProviderEvent, ProviderRequest, ProviderRunResult,
-    ProviderRunner, ProviderUsage,
+    ProviderRunner, ProviderUsage, SandboxMode,
 };
