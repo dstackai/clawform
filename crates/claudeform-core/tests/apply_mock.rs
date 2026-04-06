@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -106,10 +107,20 @@ fn run(
     runner: &MockRunner,
     use_history_context: bool,
 ) -> Result<claudeform_core::ApplyResult> {
+    run_with_variables(ws, runner, use_history_context, BTreeMap::new())
+}
+
+fn run_with_variables(
+    ws: &TempDir,
+    runner: &MockRunner,
+    use_history_context: bool,
+    program_variables: BTreeMap<String, String>,
+) -> Result<claudeform_core::ApplyResult> {
     run_apply(
         &ApplyRequest {
             workspace_root: ws.path().to_path_buf(),
             program_path: ws.path().join("program.md"),
+            program_variables,
             confirm: false,
             debug: false,
             progress: false,
@@ -180,6 +191,141 @@ Write ./out.txt.
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].status, RunStatus::Success);
     assert_eq!(history[0].program_id, "mock_program");
+    Ok(())
+}
+
+#[test]
+fn apply_with_program_variables_persists_variables_snapshot() -> Result<()> {
+    let ws = setup_workspace(
+        r#"---
+id: mock_program
+variables:
+  APP_NAME: {}
+  APP_PORT:
+    default: "8080"
+---
+## Instruction
+Write ./out.txt using ${{ var.APP_NAME }} and ${{ var.APP_PORT }}.
+"#,
+    )?;
+    let (runner, _) = make_runner(
+        vec![
+            (PathBuf::from("out.txt"), "OK\n"),
+            (
+                PathBuf::from(".claudeform/agent_result.json"),
+                AGENT_RESULT_SUCCESS_JSON,
+            ),
+        ],
+        false,
+    );
+
+    run_with_variables(
+        &ws,
+        &runner,
+        false,
+        BTreeMap::from([("APP_NAME".to_string(), "calc".to_string())]),
+    )?;
+
+    let vars_path = ws
+        .path()
+        .join(".claudeform/programs/mock_program/sessions/mock-session-ok/variables.json");
+    let raw = fs::read_to_string(&vars_path)?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+    assert_eq!(
+        parsed,
+        serde_json::json!({
+            "APP_NAME": "calc",
+            "APP_PORT": "8080"
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn apply_fails_when_required_program_variable_missing() -> Result<()> {
+    let ws = setup_workspace(
+        r#"---
+id: mock_program
+variables:
+  APP_NAME: {}
+---
+## Instruction
+Write ./out.txt using ${{ var.APP_NAME }}.
+"#,
+    )?;
+    let (runner, calls) = make_runner(
+        vec![(
+            PathBuf::from(".claudeform/agent_result.json"),
+            AGENT_RESULT_SUCCESS_JSON,
+        )],
+        false,
+    );
+
+    let err = run(&ws, &runner, false)
+        .err()
+        .context("expected missing required variable error")?;
+    assert!(format!("{:#}", err).contains("missing required apply variable"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[test]
+fn apply_fails_when_program_references_undefined_variable() -> Result<()> {
+    let ws = setup_workspace(
+        r#"---
+id: mock_program
+variables:
+  APP_NAME:
+    default: "calc"
+---
+## Instruction
+Write ./out.txt using ${{ var.APP_PORT }}.
+"#,
+    )?;
+    let (runner, calls) = make_runner(
+        vec![(
+            PathBuf::from(".claudeform/agent_result.json"),
+            AGENT_RESULT_SUCCESS_JSON,
+        )],
+        false,
+    );
+
+    let err = run(&ws, &runner, false)
+        .err()
+        .context("expected undefined variable reference error")?;
+    assert!(format!("{:#}", err).contains("undefined variable"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[test]
+fn apply_fails_when_apply_variable_is_not_declared() -> Result<()> {
+    let ws = setup_workspace(
+        r#"---
+id: mock_program
+---
+## Instruction
+Write ./out.txt.
+"#,
+    )?;
+    let (runner, calls) = make_runner(
+        vec![(
+            PathBuf::from(".claudeform/agent_result.json"),
+            AGENT_RESULT_SUCCESS_JSON,
+        )],
+        false,
+    );
+
+    let err = run_with_variables(
+        &ws,
+        &runner,
+        false,
+        BTreeMap::from([("APP_NAME".to_string(), "calc".to_string())]),
+    )
+    .err()
+    .context("expected undeclared apply variable error")?;
+    assert!(format!("{:#}", err).contains("is not defined"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
     Ok(())
 }
 

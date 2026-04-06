@@ -54,6 +54,10 @@ enum Commands {
         #[arg(short = 'f', long = "file")]
         file: PathBuf,
 
+        /// Program variable value (`NAME=VALUE`). Repeatable.
+        #[arg(long = "var", value_name = "NAME=VALUE", action = ArgAction::Append)]
+        vars: Vec<String>,
+
         /// Auto-approve apply without interactive confirmation prompt.
         #[arg(short = 'y', long)]
         yes: bool,
@@ -139,6 +143,7 @@ fn real_main() -> Result<()> {
     match cli.command {
         Commands::Apply {
             file,
+            vars,
             yes,
             debug,
             progress_mode,
@@ -167,6 +172,7 @@ fn real_main() -> Result<()> {
             };
             let confirm = interactive_shell && !yes;
             let sandbox_mode: SandboxMode = sandbox_mode.into();
+            let program_variables = parse_apply_variables(&vars)?;
 
             if debug {
                 let caps = runner.capabilities();
@@ -196,6 +202,7 @@ fn real_main() -> Result<()> {
                 &ApplyRequest {
                     workspace_root,
                     program_path: file,
+                    program_variables,
                     confirm,
                     debug,
                     progress: true,
@@ -329,6 +336,44 @@ fn confirm_history_reset_interactive(target: &str) -> Result<bool> {
         .read_line(&mut line)
         .context("failed reading history reset confirmation")?;
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
+fn parse_apply_variables(entries: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for raw in entries {
+        let Some((name_raw, value_raw)) = raw.split_once('=') else {
+            return Err(anyhow!("invalid --var '{}': expected NAME=VALUE", raw));
+        };
+        let name = name_raw.trim();
+        if name.is_empty() {
+            return Err(anyhow!(
+                "invalid --var '{}': variable name cannot be empty",
+                raw
+            ));
+        }
+        if !is_valid_variable_name(name) {
+            return Err(anyhow!(
+                "invalid --var '{}': NAME must match [A-Za-z_][A-Za-z0-9_]*",
+                raw
+            ));
+        }
+        if out.contains_key(name) {
+            return Err(anyhow!("duplicate --var for '{}'", name));
+        }
+        out.insert(name.to_string(), value_raw.to_string());
+    }
+    Ok(out)
+}
+
+fn is_valid_variable_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn yes_no(v: bool) -> &'static str {
@@ -736,5 +781,20 @@ mod tests {
                 ("b".to_string(), 1),
             ]
         );
+    }
+
+    #[test]
+    fn parse_apply_variables_parses_name_value_pairs() {
+        let vars =
+            parse_apply_variables(&["APP_NAME=calc".to_string(), "APP_PORT=8080".to_string()])
+                .expect("must parse");
+        assert_eq!(vars.get("APP_NAME").map(String::as_str), Some("calc"));
+        assert_eq!(vars.get("APP_PORT").map(String::as_str), Some("8080"));
+    }
+
+    #[test]
+    fn parse_apply_variables_rejects_invalid_name() {
+        let err = parse_apply_variables(&["BAD-NAME=x".to_string()]).expect_err("must fail");
+        assert!(format!("{:#}", err).contains("NAME must match"));
     }
 }
