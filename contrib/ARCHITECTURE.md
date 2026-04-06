@@ -59,7 +59,9 @@ Frontmatter (strict):
 - `model` (optional override)
 - `variables` (optional map)
   - key: variable name (`[A-Za-z_][A-Za-z0-9_]*`)
-  - value: optional `default` string
+  - value:
+    - required (no default): `NAME: {}`
+    - optional default: `NAME: { default: "value" }`
 
 Program key resolution:
 
