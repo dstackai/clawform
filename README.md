@@ -88,6 +88,8 @@ Override a program variable for one run:
 cf apply -f examples/smoke.md --var SMOKE_VALUE=YU
 ```
 
+The confirmation preview includes a variables summary, for example: `variables: 1 value changed, 0 added, 0 removed`.
+
 Program variables are defined in frontmatter under `variables` (`NAME: {}` for required, `NAME: { default: "..." }` for optional defaults) and referenced as `${{ var.NAME }}`.
 
 Example output (will vary by session/model):
