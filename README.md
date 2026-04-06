@@ -82,12 +82,22 @@ CLAUDEFORM_VERSION=v0.0.2 curl -fsSL https://raw.githubusercontent.com/dstackai/
 cf apply -f examples/smoke.md
 ```
 
+Override a program variable for one run:
+
+```bash
+cf apply -f examples/smoke.md --var SMOKE_VALUE=YU
+```
+
+The confirmation preview includes a variables summary, for example: `variables: 1 value changed, 0 added, 0 removed`.
+
+Program variables are defined in frontmatter under `variables` (`NAME: {}` for required, `NAME: { default: "..." }` for optional defaults) and referenced as `${{ var.NAME }}`.
+
 Example output (will vary by session/model):
 
 ```text
 cf apply -f examples/smoke.md
 Last session: 019d5843-eb2d-70b1-b49a-343033117944 (success, 43m ago)
-  program diff: examples/smoke.md unchanged
+  program: examples/smoke.md unchanged
   changes: 0 files
 Proceed? [y/N] y
 session 019d586b-aa65-78b2-8a0d-27b5543c59bb

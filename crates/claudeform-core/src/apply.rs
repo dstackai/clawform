@@ -27,6 +27,7 @@ const AGENT_OUTPUT_MANIFEST_REL: &str = ".claudeform/agent_outputs.json";
 const AGENT_HUMAN_OUTPUT_REL: &str = ".claudeform/agent_output.md";
 const AGENT_HUMAN_OUTPUT_LEGACY_REL: &str = ".claudeform/agent_summary.md";
 const AGENT_RESULT_REL: &str = ".claudeform/agent_result.json";
+const RUNTIME_VARIABLES_INPUT_REL: &str = ".claudeform/agent_variables.json";
 const SESSION_PROMPT_ARTIFACT_FILE: &str = "prompt.md";
 const SESSION_PLAN_ARTIFACT_FILE: &str = "plan.json";
 const SESSION_STDOUT_ARTIFACT_FILE: &str = "provider.stdout.log";
@@ -40,6 +41,7 @@ const SNAPSHOT_TEXT_LIMIT_BYTES: usize = 256 * 1024;
 pub struct ApplyRequest {
     pub workspace_root: PathBuf,
     pub program_path: PathBuf,
+    pub program_variables: BTreeMap<String, String>,
     pub confirm: bool,
     pub debug: bool,
     pub progress: bool,
@@ -133,6 +135,7 @@ struct ApplyContext {
     program_file: String,
     resolved_model: Option<String>,
     program_raw: String,
+    program_variables: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -158,8 +161,26 @@ struct SharedPlanData {
     program_id: String,
     program_file: String,
     model: Option<String>,
+    program_variables: Option<PlanProgramVariables>,
+    program_variables_diff_vs_last_session: Option<PlanProgramVariablesDiff>,
     program_diff_vs_last_session: PlanProgramDiff,
     last_session: Option<PlanLastSession>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PlanProgramVariables {
+    values_total: usize,
+    current_session_file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_session_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PlanProgramVariablesDiff {
+    status: String,
+    values_changed: usize,
+    values_added: usize,
+    values_removed: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -250,6 +271,7 @@ fn build_context(request: &ApplyRequest) -> Result<ApplyContext> {
     let program = load_program(&request.program_path)?;
     let program_key = program.program_key()?;
     let resolved_model = program.resolved_model(provider.default_model.as_deref());
+    let program_variables = program.resolve_variables(&request.program_variables)?;
     let program_file = display_program_file(&request.workspace_root, &request.program_path);
 
     Ok(ApplyContext {
@@ -257,6 +279,7 @@ fn build_context(request: &ApplyRequest) -> Result<ApplyContext> {
         program_file,
         resolved_model,
         program_raw: program.raw_markdown,
+        program_variables,
     })
 }
 
@@ -277,6 +300,7 @@ fn execute_apply<R: ProviderRunner>(
     let history_injected_success = history_context.last_success.is_some();
     let history_injected_failure = history_context.last_failure.is_some();
 
+    sync_runtime_variables_input(&request.workspace_root, &context.program_variables)?;
     let prompt = build_runtime_prompt(&context.program_raw, &plan_data)?;
     let prompt_for_debug = prompt.clone();
 
@@ -544,6 +568,12 @@ fn execute_apply<R: ProviderRunner>(
         &success_session_id,
         &context.program_raw,
     );
+    let _ = persist_program_variables_snapshot(
+        &request.workspace_root,
+        &context.program_key,
+        &success_session_id,
+        &context.program_variables,
+    );
     let _ = persist_session_outcome(
         &request.workspace_root,
         &context.program_key,
@@ -737,15 +767,78 @@ fn validate_agent_completion(agent_result: &Option<AgentResult>) -> Result<()> {
     }
 }
 
+fn sync_runtime_variables_input(
+    workspace_root: &Path,
+    variables: &BTreeMap<String, String>,
+) -> Result<()> {
+    let path = workspace_root.join(RUNTIME_VARIABLES_INPUT_REL);
+    if variables.is_empty() {
+        if path.exists() {
+            fs::remove_file(&path).with_context(|| {
+                format!(
+                    "failed removing runtime variables file '{}'",
+                    path.display()
+                )
+            })?;
+        }
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed creating runtime variables directory '{}'",
+                parent.display()
+            )
+        })?;
+    }
+    let body =
+        serde_json::to_string_pretty(variables).context("failed serializing runtime variables")?;
+    fs::write(&path, format!("{}\n", body))
+        .with_context(|| format!("failed writing runtime variables file '{}'", path.display()))?;
+    Ok(())
+}
+
 fn build_shared_plan_data(
     workspace_root: &Path,
     context: &ApplyContext,
     history: &ProgramHistoryContext,
 ) -> SharedPlanData {
+    let last_session_vars_rel = history
+        .last_session
+        .as_ref()
+        .and_then(|rec| rec.session_id.as_deref())
+        .and_then(|sid| {
+            let abs = program_variables_snapshot_path(workspace_root, &context.program_key, sid);
+            if !abs.exists() {
+                return None;
+            }
+            Some(
+                abs.strip_prefix(workspace_root)
+                    .map(to_slash_path)
+                    .unwrap_or_else(|_| to_slash_path(&abs)),
+            )
+        });
+
     SharedPlanData {
         program_id: context.program_key.clone(),
         program_file: context.program_file.clone(),
         model: context.resolved_model.clone(),
+        program_variables: if context.program_variables.is_empty() {
+            None
+        } else {
+            Some(PlanProgramVariables {
+                values_total: context.program_variables.len(),
+                current_session_file: RUNTIME_VARIABLES_INPUT_REL.to_string(),
+                last_session_file: last_session_vars_rel.clone(),
+            })
+        },
+        program_variables_diff_vs_last_session: compute_program_variables_diff_vs_last_session(
+            workspace_root,
+            &context.program_key,
+            &context.program_variables,
+            history.last_session.as_ref(),
+        ),
         program_diff_vs_last_session: compute_program_diff_vs_last_session(
             workspace_root,
             &context.program_key,
@@ -769,6 +862,101 @@ fn build_shared_plan_data(
             error_short: rec.error_short.clone(),
         }),
     }
+}
+
+fn compute_program_variables_diff_vs_last_session(
+    workspace_root: &Path,
+    program_id: &str,
+    current_values: &BTreeMap<String, String>,
+    last_session: Option<&RunHistoryRecord>,
+) -> Option<PlanProgramVariablesDiff> {
+    let Some(last_session) = last_session else {
+        if current_values.is_empty() {
+            return None;
+        }
+        return Some(PlanProgramVariablesDiff {
+            status: "first_apply".to_string(),
+            values_changed: 0,
+            values_added: current_values.len(),
+            values_removed: 0,
+        });
+    };
+
+    let Some(session_id) = last_session.session_id.as_deref() else {
+        if current_values.is_empty() {
+            return None;
+        }
+        return Some(PlanProgramVariablesDiff {
+            status: "unavailable".to_string(),
+            values_changed: 0,
+            values_added: 0,
+            values_removed: 0,
+        });
+    };
+
+    let snapshot_path = program_variables_snapshot_path(workspace_root, program_id, session_id);
+    let previous_values = match fs::read_to_string(&snapshot_path) {
+        Ok(raw) => match serde_json::from_str::<BTreeMap<String, String>>(&raw) {
+            Ok(values) => values,
+            Err(_) => {
+                if current_values.is_empty() {
+                    return None;
+                }
+                return Some(PlanProgramVariablesDiff {
+                    status: "unavailable".to_string(),
+                    values_changed: 0,
+                    values_added: 0,
+                    values_removed: 0,
+                });
+            }
+        },
+        Err(_) => {
+            if current_values.is_empty() {
+                return None;
+            }
+            return Some(PlanProgramVariablesDiff {
+                status: "unavailable".to_string(),
+                values_changed: 0,
+                values_added: 0,
+                values_removed: 0,
+            });
+        }
+    };
+
+    if current_values.is_empty() && previous_values.is_empty() {
+        return None;
+    }
+
+    let keys: BTreeSet<&str> = current_values
+        .keys()
+        .map(String::as_str)
+        .chain(previous_values.keys().map(String::as_str))
+        .collect();
+
+    let mut values_changed = 0usize;
+    let mut values_added = 0usize;
+    let mut values_removed = 0usize;
+    for key in keys {
+        match (current_values.get(key), previous_values.get(key)) {
+            (Some(current), Some(previous)) if current != previous => values_changed += 1,
+            (Some(_), None) => values_added += 1,
+            (None, Some(_)) => values_removed += 1,
+            _ => {}
+        }
+    }
+
+    let status = if values_changed == 0 && values_added == 0 && values_removed == 0 {
+        "unchanged"
+    } else {
+        "changed"
+    };
+
+    Some(PlanProgramVariablesDiff {
+        status: status.to_string(),
+        values_changed,
+        values_added,
+        values_removed,
+    })
 }
 
 fn compute_program_diff_vs_last_session(
@@ -922,6 +1110,7 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
     let program_file = plan_data.program_file.as_str();
     let program_id = plan_data.program_id.as_str();
     let program_dir = sanitize_storage_token(program_id, "program");
+    let program_variables = plan_data.program_variables.as_ref();
 
     if let Some(last) = &plan_data.last_session {
         let session_id_raw = last
@@ -965,6 +1154,9 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
             "- Keep correct work from \"last session\"; do not redo work without a clear reason.\n",
         );
         block.push_str("- If program changes require updates, apply only the updates required by those changes.\n");
+        if program_variables.is_some() {
+            block.push_str("- Use the resolved program variable values provided in this prompt as the source of truth for `${{ var.NAME }}` references.\n");
+        }
         block.push_str("- If verification shows issues, fix them in this \"current session\".\n");
         block.push_str("- Continue until the program result is correct, or stop only when there is no practical way forward.\n");
         block.push_str("- You may change workspace files, but only files needed to complete the \"program\".\n\n");
@@ -1003,7 +1195,29 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
         block.push_str("`\n");
         block.push_str("- New program version: `");
         block.push_str(program_file);
-        block.push_str("`\n\n---\n\n");
+        block.push_str("`\n");
+        if let Some(vars) = program_variables {
+            block.push_str("- Resolved program variables: `");
+            block.push_str(vars.values_total.to_string().as_str());
+            block.push_str("`\n");
+            block.push_str("- Resolved program variables file: `./");
+            block.push_str(vars.current_session_file.as_str());
+            block.push_str("`\n");
+        }
+        block.push('\n');
+
+        if let Some(vars) = program_variables {
+            block.push_str("Resolved program variables for this \"current session\"\n\n");
+            block.push_str("- Read this file for `${{ var.NAME }}` values:\n");
+            block.push_str("  `./");
+            block.push_str(vars.current_session_file.as_str());
+            block.push_str("`\n");
+            block.push_str("- The file contains `");
+            block.push_str(vars.values_total.to_string().as_str());
+            block.push_str("` resolved variable value(s) for this run.\n\n---\n\n");
+        } else {
+            block.push_str("---\n\n");
+        }
         block.push_str("Last session details\n\n");
         block.push_str("- last_session_id: `");
         block.push_str(session_id_raw.as_str());
@@ -1020,12 +1234,21 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
         block.push_str("- last_session_output_file: `");
         block.push_str(last_output_file.as_str());
         block.push_str("`\n");
+        if let Some(last_vars_file) = program_variables.and_then(|v| v.last_session_file.as_deref())
+        {
+            block.push_str("- last_session_variables_file: `");
+            block.push_str(last_vars_file);
+            block.push_str("`\n");
+        }
         block.push_str("- session_history_path (open only if needed): `");
         block.push_str(history_path.as_str());
         block.push_str("`\n\n");
         block.push_str("How to use \"last session\" details in this \"current session\":\n");
         block.push_str("- Understand what was completed in \"last session\".\n");
         block.push_str("- Verify whether that result is still correct for the \"program\".\n");
+        if program_variables.is_some() {
+            block.push_str("- Treat current session variable values in this prompt as the source of truth for this run.\n");
+        }
         block.push_str("- If \"last session\" work is still correct and program changes do not require more edits, keep that work.\n");
         block.push_str("- If \"last session\" work is incorrect or incomplete for the \"program\", update it.\n\n---\n\n");
         block.push_str("Program changes since last session\n\n");
@@ -1056,7 +1279,9 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
         block.push_str("- In that case, do not spend time on network workarounds (forced IP/`--resolve`, alternate download tools, local TLS/proxy emulation).\n");
         block.push_str("- Immediately write `./");
         block.push_str(AGENT_RESULT_REL);
-        block.push_str("` with `status: failure` and `reason: sandbox_network_blocked`, then stop.\n");
+        block.push_str(
+            "` with `status: failure` and `reason: sandbox_network_blocked`, then stop.\n",
+        );
         block.push_str("- Keep edits within program scope:\n");
         block.push_str("  files required to satisfy the \"program\".\n");
         block.push_str("- Do not make unrelated edits.\n\n---\n\n");
@@ -1108,15 +1333,31 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
         block.push_str("- Read and implement `");
         block.push_str(program_file);
         block.push_str("`.\n");
+        if program_variables.is_some() {
+            block.push_str("- Use the resolved program variable values provided in this prompt as the source of truth for `${{ var.NAME }}` references.\n");
+        }
         block.push_str("- Use workspace files and tools as needed.\n");
         block.push_str("- Continue until the program result is correct, or stop only when there is no practical way forward.\n");
         block.push_str("- If a required network command fails in sandbox with DNS/connectivity errors (for example: `Could not resolve host`, `failed to lookup address information`, `network is unreachable`, `no route to host`, `connection timed out`), treat it as sandbox network restriction immediately.\n");
         block.push_str("- In that case, do not spend time on network workarounds (forced IP/`--resolve`, alternate download tools, local TLS/proxy emulation).\n");
         block.push_str("- Immediately write `./");
         block.push_str(AGENT_RESULT_REL);
-        block.push_str("` with `status: failure` and `reason: sandbox_network_blocked`, then stop.\n");
+        block.push_str(
+            "` with `status: failure` and `reason: sandbox_network_blocked`, then stop.\n",
+        );
         block.push_str("- Keep edits scoped to files needed for this program.\n");
         block.push_str("- Do not make unrelated edits.\n\n");
+        if let Some(vars) = program_variables {
+            block.push_str("Resolved program variables for this session\n");
+            block.push_str("- Read `${{ var.NAME }}` values from `./");
+            block.push_str(vars.current_session_file.as_str());
+            block.push_str("` for `");
+            block.push_str(program_file);
+            block.push_str("`.\n");
+            block.push_str("- Resolved variable count: `");
+            block.push_str(vars.values_total.to_string().as_str());
+            block.push_str("`.\n\n");
+        }
         block.push_str("Before finishing this session (required)\n");
         block.push_str("- Write `./");
         block.push_str(AGENT_OUTPUT_MANIFEST_REL);
@@ -1436,6 +1677,7 @@ fn is_internal_reported_path(path: &str) -> bool {
         || path == AGENT_HUMAN_OUTPUT_REL
         || path == AGENT_HUMAN_OUTPUT_LEGACY_REL
         || path == AGENT_RESULT_REL
+        || path == RUNTIME_VARIABLES_INPUT_REL
 }
 
 fn read_agent_human_summary(workspace_root: &Path) -> Result<Option<String>> {
@@ -1675,6 +1917,14 @@ fn program_snapshot_path(workspace_root: &Path, program_id: &str, session_id: &s
     program_session_dir(workspace_root, program_id, session_id).join("program.md")
 }
 
+fn program_variables_snapshot_path(
+    workspace_root: &Path,
+    program_id: &str,
+    session_id: &str,
+) -> PathBuf {
+    program_session_dir(workspace_root, program_id, session_id).join("variables.json")
+}
+
 fn persist_program_snapshot(
     workspace_root: &Path,
     program_id: &str,
@@ -1693,6 +1943,38 @@ fn persist_program_snapshot(
 
     fs::write(&abs, program_raw)
         .with_context(|| format!("failed writing program snapshot '{}'", abs.display()))?;
+
+    let rel = abs
+        .strip_prefix(workspace_root)
+        .map(to_slash_path)
+        .unwrap_or_else(|_| to_slash_path(&abs));
+    Ok(rel)
+}
+
+fn persist_program_variables_snapshot(
+    workspace_root: &Path,
+    program_id: &str,
+    session_id: &str,
+    variables: &BTreeMap<String, String>,
+) -> Result<String> {
+    let abs = program_variables_snapshot_path(workspace_root, program_id, session_id);
+    if let Some(parent) = abs.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed creating program variables snapshot directory '{}'",
+                parent.display()
+            )
+        })?;
+    }
+
+    let body = serde_json::to_string_pretty(variables)
+        .context("failed serializing program variables snapshot")?;
+    fs::write(&abs, format!("{}\n", body)).with_context(|| {
+        format!(
+            "failed writing program variables snapshot '{}'",
+            abs.display()
+        )
+    })?;
 
     let rel = abs
         .strip_prefix(workspace_root)
@@ -2088,10 +2370,17 @@ fn print_plan_preview(plan: &SharedPlanData, debug: bool, workspace_root: &Path)
         let (diff_file, diff_summary) = format_program_diff_preview(plan);
         println!(
             "  {} {} {}",
-            color_dim("program diff:", use_color),
+            color_dim("program:", use_color),
             color_path(&diff_file, use_color),
             diff_summary
         );
+        if let Some(variables_summary) = format_program_variables_diff_preview(plan) {
+            println!(
+                "  {} {}",
+                color_dim("variables:", use_color),
+                variables_summary
+            );
+        }
 
         if let Some(summary) = last.summary_short.as_deref() {
             if !summary.trim().is_empty() {
@@ -2106,11 +2395,12 @@ fn print_plan_preview(plan: &SharedPlanData, debug: bool, workspace_root: &Path)
                 } else {
                     "💬"
                 };
+                let msg_link = format_msg_link(workspace_root, &output_hint, use_color);
                 println!(
                     "  {} {} | {}",
                     icon,
                     summary_line,
-                    format_msg_link(workspace_root, &output_hint)
+                    msg_link
                 );
             }
         }
@@ -2132,10 +2422,17 @@ fn print_plan_preview(plan: &SharedPlanData, debug: bool, workspace_root: &Path)
         let (diff_file, diff_summary) = format_program_diff_preview(plan);
         println!(
             "{} {} {}",
-            color_dim("program diff:", use_color),
+            color_dim("program:", use_color),
             color_path(&diff_file, use_color),
             diff_summary
         );
+        if let Some(variables_summary) = format_program_variables_diff_preview(plan) {
+            println!(
+                "{} {}",
+                color_dim("variables:", use_color),
+                variables_summary
+            );
+        }
     }
 
     if debug {
@@ -2216,6 +2513,34 @@ fn format_program_diff_preview(plan: &SharedPlanData) -> (String, String) {
     (diff_file, diff_summary)
 }
 
+fn format_program_variables_diff_totals(changed: usize, added: usize, removed: usize) -> String {
+    match (changed, added, removed) {
+        (0, 0, 0) => "unchanged".to_string(),
+        (c, a, r) => format!(
+            "{} value{} changed, {} added, {} removed",
+            c,
+            if c == 1 { "" } else { "s" },
+            a,
+            r
+        ),
+    }
+}
+
+fn format_program_variables_diff_preview(plan: &SharedPlanData) -> Option<String> {
+    let diff = plan.program_variables_diff_vs_last_session.as_ref()?;
+    let summary = match diff.status.as_str() {
+        "first_apply" => "first apply".to_string(),
+        "unavailable" => "snapshot unavailable".to_string(),
+        "unchanged" => "unchanged".to_string(),
+        _ => format_program_variables_diff_totals(
+            diff.values_changed,
+            diff.values_added,
+            diff.values_removed,
+        ),
+    };
+    Some(summary)
+}
+
 fn fmt_token_compact_opt(value: Option<u64>) -> String {
     value
         .map(format_token_compact)
@@ -2247,12 +2572,14 @@ fn output_artifact_rel_path(workspace_root: &Path, program_id: &str, session_id:
         .unwrap_or_else(|_| to_slash_path(&abs))
 }
 
-fn format_msg_link(workspace_root: &Path, rel_path: &str) -> String {
-    if !supports_terminal_hyperlinks() {
-        return "msg".to_string();
-    }
-    let abs = workspace_root.join(rel_path);
-    terminal_link(&abs, "msg").unwrap_or_else(|| "msg".to_string())
+fn format_msg_link(workspace_root: &Path, rel_path: &str, use_color: bool) -> String {
+    let rendered = if !supports_terminal_hyperlinks() {
+        "msg".to_string()
+    } else {
+        let abs = workspace_root.join(rel_path);
+        terminal_link(&abs, "msg").unwrap_or_else(|| "msg".to_string())
+    };
+    color_link_label(&rendered, use_color)
 }
 
 fn color_dim(text: &str, use_color: bool) -> String {
@@ -2285,6 +2612,30 @@ fn color_path(text: &str, use_color: bool) -> String {
     } else {
         text.to_string()
     }
+}
+
+fn color_link_label(text: &str, use_color: bool) -> String {
+    if !use_color {
+        return text.to_string();
+    }
+    if let Some((start, label, end)) = split_terminal_hyperlink(text) {
+        return format!("{}\x1b[95m{}\x1b[0m{}", start, label, end);
+    }
+    format!("\x1b[95m{}\x1b[0m", text)
+}
+
+fn split_terminal_hyperlink(segment: &str) -> Option<(&str, &str, &str)> {
+    if !segment.starts_with("\x1b]8;;") {
+        return None;
+    }
+    let open_end = segment.find("\x1b\\")? + "\x1b\\".len();
+    let close_seq = "\x1b]8;;\x1b\\";
+    let close_start = segment[open_end..].find(close_seq)? + open_end;
+    Some((
+        &segment[..open_end],
+        &segment[open_end..close_start],
+        &segment[close_start..],
+    ))
 }
 
 fn supports_terminal_hyperlinks() -> bool {
@@ -2361,6 +2712,7 @@ fn should_skip_path(rel: &Path) -> bool {
         || rel_str == AGENT_HUMAN_OUTPUT_REL
         || rel_str == AGENT_HUMAN_OUTPUT_LEGACY_REL
         || rel_str == AGENT_RESULT_REL
+        || rel_str == RUNTIME_VARIABLES_INPUT_REL
         || rel_str == ".claudeform/history"
         || rel_str.starts_with(".claudeform/history/")
         || rel_str == ".claudeform/programs"
@@ -2398,6 +2750,8 @@ mod tests {
             program_id: "calculator".to_string(),
             program_file: "examples/calc.md".to_string(),
             model: None,
+            program_variables: None,
+            program_variables_diff_vs_last_session: None,
             program_diff_vs_last_session: PlanProgramDiff {
                 status: "first_apply".to_string(),
                 file: "examples/calc.md".to_string(),
@@ -2418,6 +2772,8 @@ mod tests {
             program_id: "calculator".to_string(),
             program_file: "examples/calc.md".to_string(),
             model: None,
+            program_variables: None,
+            program_variables_diff_vs_last_session: None,
             program_diff_vs_last_session: PlanProgramDiff {
                 status: "changed".to_string(),
                 file: "examples/calc.md".to_string(),
@@ -2444,6 +2800,87 @@ mod tests {
 
         let prompt = build_runtime_prompt("# test\n", &plan).expect("prompt should build");
         assert_eq!(prompt, PROMPT_EXAMPLE_WITH_LAST);
+    }
+
+    #[test]
+    fn runtime_prompt_includes_variables_block_for_first_session() {
+        let plan = SharedPlanData {
+            program_id: "calculator".to_string(),
+            program_file: "examples/calc.md".to_string(),
+            model: None,
+            program_variables: Some(PlanProgramVariables {
+                values_total: 1,
+                current_session_file: RUNTIME_VARIABLES_INPUT_REL.to_string(),
+                last_session_file: None,
+            }),
+            program_variables_diff_vs_last_session: Some(PlanProgramVariablesDiff {
+                status: "first_apply".to_string(),
+                values_changed: 0,
+                values_added: 1,
+                values_removed: 0,
+            }),
+            program_diff_vs_last_session: PlanProgramDiff {
+                status: "first_apply".to_string(),
+                file: "examples/calc.md".to_string(),
+                lines_changed: 0,
+                lines_added: 0,
+                lines_deleted: 0,
+            },
+            last_session: None,
+        };
+
+        let prompt = build_runtime_prompt("# test\n", &plan).expect("prompt should build");
+        assert!(prompt.contains("Resolved program variables for this session"));
+        assert!(prompt.contains(RUNTIME_VARIABLES_INPUT_REL));
+    }
+
+    #[test]
+    fn runtime_prompt_includes_last_session_variables_hint_when_available() {
+        let plan = SharedPlanData {
+            program_id: "calculator".to_string(),
+            program_file: "examples/calc.md".to_string(),
+            model: None,
+            program_variables: Some(PlanProgramVariables {
+                values_total: 1,
+                current_session_file: RUNTIME_VARIABLES_INPUT_REL.to_string(),
+                last_session_file: Some(
+                    ".claudeform/programs/calculator/sessions/s-1/variables.json".to_string(),
+                ),
+            }),
+            program_variables_diff_vs_last_session: Some(PlanProgramVariablesDiff {
+                status: "changed".to_string(),
+                values_changed: 1,
+                values_added: 0,
+                values_removed: 0,
+            }),
+            program_diff_vs_last_session: PlanProgramDiff {
+                status: "changed".to_string(),
+                file: "examples/calc.md".to_string(),
+                lines_changed: 1,
+                lines_added: 1,
+                lines_deleted: 0,
+            },
+            last_session: Some(PlanLastSession {
+                session_id: Some("s-1".to_string()),
+                ts_unix: 1,
+                status: RunStatus::Success,
+                model: None,
+                summary_short: None,
+                files_total: 0,
+                files_sample: Vec::new(),
+                insertions: 0,
+                deletions: 0,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                error_short: None,
+            }),
+        };
+
+        let prompt = build_runtime_prompt("# test\n", &plan).expect("prompt should build");
+        assert!(prompt.contains("Resolved program variables for this \"current session\""));
+        assert!(prompt.contains("last_session_variables_file"));
+        assert!(prompt.contains("variables.json"));
     }
 
     #[test]
@@ -2626,6 +3063,78 @@ mod tests {
             format_program_diff_totals(2, 3, 1),
             "2 lines changed, 3 added, 1 deleted"
         );
+    }
+
+    #[test]
+    fn program_variables_diff_mixed_counts_are_rendered_compactly() {
+        assert_eq!(
+            format_program_variables_diff_totals(1, 2, 3),
+            "1 value changed, 2 added, 3 removed"
+        );
+    }
+
+    #[test]
+    fn color_link_label_colors_plain_msg_label() {
+        assert_eq!(color_link_label("msg", true), "\x1b[95mmsg\x1b[0m");
+    }
+
+    #[test]
+    fn color_link_label_colors_hyperlink_msg_label_only() {
+        let raw = "\x1b]8;;file:///tmp/output.md\x1b\\msg\x1b]8;;\x1b\\";
+        let rendered = color_link_label(raw, true);
+        assert_eq!(
+            rendered,
+            "\x1b]8;;file:///tmp/output.md\x1b\\\x1b[95mmsg\x1b[0m\x1b]8;;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn computes_program_variables_diff_changed_value() -> Result<()> {
+        let ws = tempfile::tempdir()?;
+        let program_id = "smoke";
+        let session_id = "s-1";
+        let snapshot = program_variables_snapshot_path(ws.path(), program_id, session_id);
+        if let Some(parent) = snapshot.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            &snapshot,
+            serde_json::to_string_pretty(&BTreeMap::from([(
+                "SMOKE_VALUE".to_string(),
+                "SMOKE_OK".to_string(),
+            )]))?
+                + "\n",
+        )?;
+
+        let last_session = RunHistoryRecord {
+            ts_unix: 1,
+            program_id: program_id.to_string(),
+            session_id: Some(session_id.to_string()),
+            status: RunStatus::Success,
+            model: None,
+            summary_short: None,
+            files_total: 0,
+            insertions: 0,
+            deletions: 0,
+            files_sample: Vec::new(),
+            error_short: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+        };
+
+        let diff = compute_program_variables_diff_vs_last_session(
+            ws.path(),
+            program_id,
+            &BTreeMap::from([("SMOKE_VALUE".to_string(), "YU".to_string())]),
+            Some(&last_session),
+        )
+        .expect("diff should be present");
+        assert_eq!(diff.status, "changed");
+        assert_eq!(diff.values_changed, 1);
+        assert_eq!(diff.values_added, 0);
+        assert_eq!(diff.values_removed, 0);
+        Ok(())
     }
 
     #[test]

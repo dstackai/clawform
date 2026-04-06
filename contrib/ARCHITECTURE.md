@@ -1,6 +1,6 @@
 # Claudeform Architecture
 
-Last updated: 2026-04-04  
+Last updated: 2026-04-06  
 Status: v0 (implemented baseline)
 
 ## 1) Product Goal
@@ -9,7 +9,7 @@ Claudeform runs agent work from markdown files instead of chat windows.
 
 A **program** is one markdown file (`*.md`) representing one task.
 
-- frontmatter is tool-owned and strict (`id`, `model`)
+- frontmatter is tool-owned and strict (`id`, `model`, `variables`)
 - markdown body is agent-facing and free-form
 
 ## 2) Implemented v0 Scope
@@ -57,6 +57,11 @@ Frontmatter (strict):
 
 - `id` (optional)
 - `model` (optional override)
+- `variables` (optional map)
+  - key: variable name (`[A-Za-z_][A-Za-z0-9_]*`)
+  - value:
+    - required (no default): `NAME: {}`
+    - optional default: `NAME: { default: "value" }`
 
 Program key resolution:
 
@@ -65,19 +70,30 @@ Program key resolution:
 
 Markdown body remains untyped in v0 and is interpreted by the agent.
 
+Variable rules:
+
+1. markdown may reference variables as `${{ var.NAME }}`
+2. referenced variables must be defined in frontmatter
+3. apply-time `--var NAME=VALUE` overrides frontmatter default
+4. variables without default are required at apply time
+
 ## 4) Apply Session Flow (Current Behavior)
 
 1. Load program + config and resolve model.
-2. Build preview from last session context:
+2. Resolve program variables (frontmatter defaults + CLI `--var` overrides).
+3. Validate variable definitions and `${{ var.NAME }}` references.
+4. Build preview from last session context:
    - last session status/summary (if exists)
    - program diff vs last session snapshot (if available)
-3. Ask for confirmation (interactive default; skipped by `--yes`).
-4. Run provider in the current workspace (no temp workspace copy).
-5. Stream provider events to terminal and persist artifacts.
-6. Read agent status from `.claudeform/agent_result.json` (required).
-7. Collect reported changed files (events-first, manifest fallback).
-8. Persist session artifacts + history record.
-9. Persist program snapshot (`program.md`) on success.
+   - variable diff vs last session variable snapshot (if available)
+5. Ask for confirmation (interactive default; skipped by `--yes`).
+6. Write runtime variables file (`.claudeform/agent_variables.json`) when variables are present.
+7. Run provider in the current workspace (no temp workspace copy).
+8. Stream provider events to terminal and persist artifacts.
+9. Read agent status from `.claudeform/agent_result.json` (required).
+10. Collect reported changed files (events-first, manifest fallback).
+11. Persist session artifacts + history record.
+12. Persist program snapshot (`program.md`) and variable snapshot (`variables.json`) on success.
 
 ## 5) State and Storage Layout
 
@@ -93,6 +109,7 @@ Per program/session:
 - `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/outcome.json`
 - `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/output.md` (Claudeform summary)
 - `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/program.md` (success snapshot)
+- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/variables.json` (success snapshot)
 - `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/commands/*` (captured command outputs)
 - `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/messages/*` (captured message outputs)
 
@@ -109,6 +126,7 @@ Agent may write:
 - `<cwd>/.claudeform/agent_result.json` (required)
 - `<cwd>/.claudeform/agent_output.md` (optional human summary)
 - `<cwd>/.claudeform/agent_outputs.json` (optional fallback list of changed files)
+- `<cwd>/.claudeform/agent_variables.json` (runtime resolved variable values provided by Claudeform)
 
 These files are execution protocol files, not user deliverables.
 
@@ -134,23 +152,21 @@ Actual:
 
 These items are intentionally deferred. Each item describes desired product capability, not implementation.
 
-1. Program variables support  
-   Goal: allow programs to define reusable runtime inputs with clear behavior.
-2. Memory support  
+1. Memory support  
    Goal: support durable context across sessions with predictable usage rules.
-3. Plan support  
+2. Plan support  
    Goal: support planning as a first-class workflow, separate from execution.
-4. Interrupted/canceled session handling  
+3. Interrupted/canceled session handling  
    Goal: represent and communicate non-completed runs clearly to users.
-5. Changes/diff reliability and consistency  
+4. Changes/diff reliability and consistency  
    Goal: for the same session, preview, apply output, debug output, and history should report the same changed-file set and line counts, with generated/noise files handled consistently.
-6. Agent-reported changes as single source of truth  
+5. Agent-reported changes as single source of truth  
    Goal: remove legacy local diff-based change reporting and use agent-reported change data consistently across apply, debug, and history.
-7. MCP and broader tool integration model  
+6. MCP and broader tool integration model  
    Goal: support richer external tool and integration patterns.
-8. Multi-agent orchestration model  
+7. Multi-agent orchestration model  
    Goal: support coordinated workflows that involve more than one agent.
-9. Additional providers beyond Codex  
+8. Additional providers beyond Codex  
    Goal: support multiple model providers in a consistent user experience.
-10. Improved session storage and retrieval performance  
+9. Improved session storage and retrieval performance  
    Goal: keep history/state operations fast and scalable as usage grows.

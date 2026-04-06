@@ -155,6 +155,27 @@ Skip confirmation prompt:
 cargo run -p claudeform -- apply -f examples/smoke.md --yes
 ```
 
+Pass program variables at apply time (repeat `--var` as needed):
+
+```bash
+# uses smoke frontmatter default (SMOKE_OK)
+cargo run -p claudeform -- apply -f examples/smoke.md --yes
+
+# smoke has default SMOKE_OK, and this overrides it for one run
+cargo run -p claudeform -- apply -f examples/smoke.md --var SMOKE_VALUE=YU --yes
+```
+
+Notes:
+
+- Variables are defined in program frontmatter under `variables`.
+- Required variable syntax (no default): `NAME: {}`.
+- Optional variable syntax with default: `NAME: { default: "value" }`.
+- Program body references variables via `${{ var.NAME }}`.
+- Confirmation preview includes a variable-diff summary against last session when available.
+- Runtime resolved values are written to `.claudeform/agent_variables.json` for the agent.
+- Successful sessions persist a snapshot at `.claudeform/programs/<program_id>/sessions/<session_id>/variables.json`.
+- If a required variable is missing at apply time, apply fails before provider execution.
+
 Reset session history:
 
 ```bash
