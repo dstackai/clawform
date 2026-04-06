@@ -2329,11 +2329,30 @@ fn colorize_link_segment(segment: &str) -> Option<String> {
         }
     }
 
+    if let Some((start, label, end)) = split_terminal_hyperlink(segment) {
+        return Some(format!("{}\x1b[95m{}\x1b[0m{}", start, label, end));
+    }
+
     if segment.contains("\x1b]8;;") {
         return Some(format!("\x1b[95m{}\x1b[0m", segment));
     }
 
     None
+}
+
+fn split_terminal_hyperlink(segment: &str) -> Option<(&str, &str, &str)> {
+    if !segment.starts_with("\x1b]8;;") {
+        return None;
+    }
+
+    let open_end = segment.find("\x1b\\")? + "\x1b\\".len();
+    let close_seq = "\x1b]8;;\x1b\\";
+    let close_start = segment[open_end..].find(close_seq)? + open_end;
+    Some((
+        &segment[..open_end],
+        &segment[open_end..close_start],
+        &segment[close_start..],
+    ))
 }
 
 fn looks_like_duration_label(s: &str) -> bool {
@@ -3178,5 +3197,15 @@ mod tests {
     fn colorize_done_payload_highlights_out_link_segment() {
         let rendered = colorize_done_payload("write example-data/output-smoke.txt | 1ms | out");
         assert!(rendered.contains("\x1b[95mout\x1b[0m"));
+    }
+
+    #[test]
+    fn colorize_link_segment_highlights_hyperlink_label_text() {
+        let segment = "\x1b]8;;file:///tmp/claudeform/commands/item_9.txt\x1b\\out\x1b]8;;\x1b\\";
+        let rendered = colorize_link_segment(segment).expect("expected colored hyperlink segment");
+        assert_eq!(
+            rendered,
+            "\x1b]8;;file:///tmp/claudeform/commands/item_9.txt\x1b\\\x1b[95mout\x1b[0m\x1b]8;;\x1b\\"
+        );
     }
 }
