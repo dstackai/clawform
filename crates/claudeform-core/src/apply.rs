@@ -90,12 +90,15 @@ impl AgentStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentResult {
     pub status: AgentStatus,
+    pub reason: Option<String>,
     pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentResultFile {
     status: AgentStatus,
+    #[serde(default)]
+    reason: Option<String>,
     #[serde(default)]
     message: Option<String>,
 }
@@ -1049,6 +1052,11 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
             "- Stop only if there is no practical way to complete the \"program\" in this environment.\n",
         );
         block.push_str("- If blocked, report that in the required status file.\n");
+        block.push_str("- If a required network command fails in sandbox with DNS/connectivity errors (for example: `Could not resolve host`, `failed to lookup address information`, `network is unreachable`, `no route to host`, `connection timed out`), treat it as sandbox network restriction immediately.\n");
+        block.push_str("- In that case, do not spend time on network workarounds (forced IP/`--resolve`, alternate download tools, local TLS/proxy emulation).\n");
+        block.push_str("- Immediately write `./");
+        block.push_str(AGENT_RESULT_REL);
+        block.push_str("` with `status: failure` and `reason: sandbox_network_blocked`, then stop.\n");
         block.push_str("- Keep edits within program scope:\n");
         block.push_str("  files required to satisfy the \"program\".\n");
         block.push_str("- Do not make unrelated edits.\n\n---\n\n");
@@ -1067,11 +1075,13 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
         block.push_str(AGENT_RESULT_REL);
         block.push_str("`\n\n");
         block.push_str("Exact format:\n");
-        block.push_str("```json\n{\n  \"status\": \"success|partial|failure\",\n  \"message\": \"short human-readable summary\"\n}\n```\n\n");
+        block.push_str("```json\n{\n  \"status\": \"success|partial|failure\",\n  \"reason\": \"optional machine-readable reason\",\n  \"message\": \"short human-readable summary\"\n}\n```\n\n");
         block.push_str("Rules:\n");
         block.push_str("- `success`: the \"program\" is complete and correct.\n");
         block.push_str("- `partial`: useful progress was made, but program is not complete.\n");
         block.push_str("- `failure`: program could not be completed.\n");
+        block.push_str("- If blocked by sandbox network restrictions, set `reason` to exactly `sandbox_network_blocked`.\n");
+        block.push_str("- Omit `reason` when not needed.\n");
         block.push_str(
             "- `message`: one short sentence about this \"current session\" result.\n\n---\n\n",
         );
@@ -1100,6 +1110,11 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
         block.push_str("`.\n");
         block.push_str("- Use workspace files and tools as needed.\n");
         block.push_str("- Continue until the program result is correct, or stop only when there is no practical way forward.\n");
+        block.push_str("- If a required network command fails in sandbox with DNS/connectivity errors (for example: `Could not resolve host`, `failed to lookup address information`, `network is unreachable`, `no route to host`, `connection timed out`), treat it as sandbox network restriction immediately.\n");
+        block.push_str("- In that case, do not spend time on network workarounds (forced IP/`--resolve`, alternate download tools, local TLS/proxy emulation).\n");
+        block.push_str("- Immediately write `./");
+        block.push_str(AGENT_RESULT_REL);
+        block.push_str("` with `status: failure` and `reason: sandbox_network_blocked`, then stop.\n");
         block.push_str("- Keep edits scoped to files needed for this program.\n");
         block.push_str("- Do not make unrelated edits.\n\n");
         block.push_str("Before finishing this session (required)\n");
@@ -1126,11 +1141,15 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
     block.push_str(AGENT_RESULT_REL);
     block.push_str("`\n\n");
     block.push_str("Exact format:\n");
-    block.push_str("```json\n{\n  \"status\": \"success|partial|failure\",\n  \"message\": \"short human-readable summary\"\n}\n```\n\n");
+    block.push_str("```json\n{\n  \"status\": \"success|partial|failure\",\n  \"reason\": \"optional machine-readable reason\",\n  \"message\": \"short human-readable summary\"\n}\n```\n\n");
     block.push_str("Rules:\n");
     block.push_str("- `success`: program is complete and correct.\n");
     block.push_str("- `partial`: useful progress was made, but program is not complete.\n");
     block.push_str("- `failure`: program could not be completed.\n");
+    block.push_str(
+        "- If blocked by sandbox network restrictions, set `reason` to exactly `sandbox_network_blocked`.\n",
+    );
+    block.push_str("- Omit `reason` when not needed.\n");
     block.push_str("- `message`: one short sentence about this session result.\n\n");
     block.push_str("User-facing message rule\n");
     block.push_str("- In user-facing text, describe program results only.\n");
@@ -1469,6 +1488,14 @@ fn read_agent_result(workspace_root: &Path) -> Result<Option<AgentResult>> {
         .with_context(|| format!("failed reading agent result '{}'", path.display()))?;
     let parsed: AgentResultFile = serde_json::from_str(&raw)
         .with_context(|| format!("invalid JSON in agent result '{}'", path.display()))?;
+    let reason = parsed.reason.and_then(|r| {
+        let trimmed = r.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
     let message = parsed.message.and_then(|m| {
         let trimmed = m.trim();
         if trimmed.is_empty() {
@@ -1480,6 +1507,7 @@ fn read_agent_result(workspace_root: &Path) -> Result<Option<AgentResult>> {
 
     Ok(Some(AgentResult {
         status: parsed.status,
+        reason,
         message,
     }))
 }
@@ -2435,7 +2463,32 @@ mod tests {
             result,
             Some(AgentResult {
                 status: AgentStatus::Partial,
+                reason: None,
                 message: Some("could not run integration tests".to_string()),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_agent_result_reason_keyword() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(AGENT_RESULT_REL);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            path,
+            r#"{"status":"failure","reason":"sandbox_network_blocked","message":"curl failed"}"#,
+        )?;
+
+        let result = read_agent_result(dir.path())?;
+        assert_eq!(
+            result,
+            Some(AgentResult {
+                status: AgentStatus::Failure,
+                reason: Some("sandbox_network_blocked".to_string()),
+                message: Some("curl failed".to_string()),
             })
         );
         Ok(())
@@ -2585,6 +2638,7 @@ mod tests {
     fn validation_rejects_partial_agent_result() {
         let result = AgentResult {
             status: AgentStatus::Partial,
+            reason: None,
             message: Some("network was unavailable".to_string()),
         };
         let err = validate_agent_completion(&Some(result)).expect_err("partial must fail");
@@ -2595,6 +2649,7 @@ mod tests {
     fn validation_rejects_failure_agent_result() {
         let result = AgentResult {
             status: AgentStatus::Failure,
+            reason: None,
             message: Some("blocked".to_string()),
         };
         let err = validate_agent_completion(&Some(result)).expect_err("failure must fail");
@@ -2605,6 +2660,7 @@ mod tests {
     fn validation_accepts_minimal_agent_result() {
         let result = AgentResult {
             status: AgentStatus::Success,
+            reason: None,
             message: Some("done".to_string()),
         };
         validate_agent_completion(&Some(result)).expect("minimal result should pass");

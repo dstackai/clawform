@@ -79,6 +79,9 @@ Execution and stop rules for this "current session"
 - Keep working until the new program version is satisfied.
 - Stop only if there is no practical way to complete the "program" in this environment.
 - If blocked, report that in the required status file.
+- If a required network command fails in sandbox with DNS/connectivity errors (for example: `Could not resolve host`, `failed to lookup address information`, `network is unreachable`, `no route to host`, `connection timed out`), treat it as sandbox network restriction immediately.
+- In that case, do not spend time on network workarounds (forced IP/`--resolve`, alternate download tools, local TLS/proxy emulation).
+- Immediately write `./.claudeform/agent_result.json` with `status: failure` and `reason: sandbox_network_blocked`, then stop.
 - Keep edits within program scope:
   files required to satisfy the "program".
 - Do not make unrelated edits.
@@ -108,6 +111,7 @@ Exact format:
 ```json
 {
   "status": "success|partial|failure",
+  "reason": "optional machine-readable reason",
   "message": "short human-readable summary"
 }
 ```
@@ -116,6 +120,8 @@ Rules:
 - `success`: the "program" is complete and correct.
 - `partial`: useful progress was made, but program is not complete.
 - `failure`: program could not be completed.
+- If blocked by sandbox network restrictions, set `reason` to exactly `sandbox_network_blocked`.
+- Omit `reason` when not needed.
 - `message`: one short sentence about this "current session" result.
 
 ---

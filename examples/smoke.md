@@ -1,7 +1,7 @@
 ## Outputs
 
 Expected output file:
-- `./example-data/output-smoke-2.txt`
+- `./example-data/output-smoke.txt`
 
 ## Instruction
 
