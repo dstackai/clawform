@@ -2370,7 +2370,7 @@ fn print_plan_preview(plan: &SharedPlanData, debug: bool, workspace_root: &Path)
         let (diff_file, diff_summary) = format_program_diff_preview(plan);
         println!(
             "  {} {} {}",
-            color_dim("program diff:", use_color),
+            color_dim("program:", use_color),
             color_path(&diff_file, use_color),
             diff_summary
         );
@@ -2395,11 +2395,12 @@ fn print_plan_preview(plan: &SharedPlanData, debug: bool, workspace_root: &Path)
                 } else {
                     "💬"
                 };
+                let msg_link = format_msg_link(workspace_root, &output_hint, use_color);
                 println!(
                     "  {} {} | {}",
                     icon,
                     summary_line,
-                    format_msg_link(workspace_root, &output_hint)
+                    msg_link
                 );
             }
         }
@@ -2421,7 +2422,7 @@ fn print_plan_preview(plan: &SharedPlanData, debug: bool, workspace_root: &Path)
         let (diff_file, diff_summary) = format_program_diff_preview(plan);
         println!(
             "{} {} {}",
-            color_dim("program diff:", use_color),
+            color_dim("program:", use_color),
             color_path(&diff_file, use_color),
             diff_summary
         );
@@ -2571,12 +2572,14 @@ fn output_artifact_rel_path(workspace_root: &Path, program_id: &str, session_id:
         .unwrap_or_else(|_| to_slash_path(&abs))
 }
 
-fn format_msg_link(workspace_root: &Path, rel_path: &str) -> String {
-    if !supports_terminal_hyperlinks() {
-        return "msg".to_string();
-    }
-    let abs = workspace_root.join(rel_path);
-    terminal_link(&abs, "msg").unwrap_or_else(|| "msg".to_string())
+fn format_msg_link(workspace_root: &Path, rel_path: &str, use_color: bool) -> String {
+    let rendered = if !supports_terminal_hyperlinks() {
+        "msg".to_string()
+    } else {
+        let abs = workspace_root.join(rel_path);
+        terminal_link(&abs, "msg").unwrap_or_else(|| "msg".to_string())
+    };
+    color_link_label(&rendered, use_color)
 }
 
 fn color_dim(text: &str, use_color: bool) -> String {
@@ -2609,6 +2612,30 @@ fn color_path(text: &str, use_color: bool) -> String {
     } else {
         text.to_string()
     }
+}
+
+fn color_link_label(text: &str, use_color: bool) -> String {
+    if !use_color {
+        return text.to_string();
+    }
+    if let Some((start, label, end)) = split_terminal_hyperlink(text) {
+        return format!("{}\x1b[95m{}\x1b[0m{}", start, label, end);
+    }
+    format!("\x1b[95m{}\x1b[0m", text)
+}
+
+fn split_terminal_hyperlink(segment: &str) -> Option<(&str, &str, &str)> {
+    if !segment.starts_with("\x1b]8;;") {
+        return None;
+    }
+    let open_end = segment.find("\x1b\\")? + "\x1b\\".len();
+    let close_seq = "\x1b]8;;\x1b\\";
+    let close_start = segment[open_end..].find(close_seq)? + open_end;
+    Some((
+        &segment[..open_end],
+        &segment[open_end..close_start],
+        &segment[close_start..],
+    ))
 }
 
 fn supports_terminal_hyperlinks() -> bool {
@@ -3043,6 +3070,21 @@ mod tests {
         assert_eq!(
             format_program_variables_diff_totals(1, 2, 3),
             "1 value changed, 2 added, 3 removed"
+        );
+    }
+
+    #[test]
+    fn color_link_label_colors_plain_msg_label() {
+        assert_eq!(color_link_label("msg", true), "\x1b[95mmsg\x1b[0m");
+    }
+
+    #[test]
+    fn color_link_label_colors_hyperlink_msg_label_only() {
+        let raw = "\x1b]8;;file:///tmp/output.md\x1b\\msg\x1b]8;;\x1b\\";
+        let rendered = color_link_label(raw, true);
+        assert_eq!(
+            rendered,
+            "\x1b]8;;file:///tmp/output.md\x1b\\\x1b[95mmsg\x1b[0m\x1b]8;;\x1b\\"
         );
     }
 
