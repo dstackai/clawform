@@ -112,48 +112,45 @@ Agent may write:
 
 These files are execution protocol files, not user deliverables.
 
-## 6) Known v0 Limits
+## 6) Known Bugs
 
-1. Markdown body is untyped/unvalidated (no strict input/output schema).
-2. No standalone `plan` command.
-3. No MCP/tool integration schema yet.
-4. No multi-agent orchestration.
-5. No Claude provider adapter yet.
+### 6.1 Interrupted Runs Recorded as Failure
 
-## 7) TODO (Next)
+Steps to reproduce:
 
-## 7.1 Interrupted Session Semantics
+1. Start `cf apply -f <program.md>` in interactive mode.
+2. Interrupt with `Ctrl+C`.
+3. Run apply again and inspect the last-session preview/history.
 
-Problem today:
+Expected:
 
-- `Ctrl+C` is recorded as `failure`, which can later show `snapshot unavailable` in preview.
+- Interrupted runs are shown as `interrupted`/`canceled`.
 
-Need:
+Actual:
 
-1. introduce explicit interrupted/canceled session reason in session outcome/history
-2. preview should show `interrupted`/`canceled` instead of generic `failure` when applicable
-3. program diff fallback should use last successful snapshot when last session has no snapshot
-4. inject this context clearly to agent in next session prompt
+- Interrupted runs are recorded and shown as generic `failure`.
 
-## 7.2 Changes/Diff Reliability
+## 7) Backlog (Out of Scope for now)
 
-Need:
+These items are intentionally deferred. Each item describes desired product capability, not implementation.
 
-1. make changed-file reporting consistent between normal mode and debug mode
-2. improve noise filtering for generated/build-cache files
-3. keep preview/apply/history change summaries aligned
-
-## 7.3 Apply Contract Polish
-
-Need:
-
-1. tighten prompt contract so reruns focus on required deltas
-2. clarify when agent should rework vs verify vs no-op
-3. keep status semantics (`success`/`partial`/`failure`) explicit and consistent
-
-## 7.4 Future Decisions (Out of Scope for v0)
-
-1. MCP and broader tool integration model
-2. multi-agent orchestration model
-3. additional providers beyond Codex
-4. strict typed program schema for markdown body
+1. Program variables support  
+   Goal: allow programs to define reusable runtime inputs with clear behavior.
+2. Memory support  
+   Goal: support durable context across sessions with predictable usage rules.
+3. Plan support  
+   Goal: support planning as a first-class workflow, separate from execution.
+4. Interrupted/canceled session handling  
+   Goal: represent and communicate non-completed runs clearly to users.
+5. Changes/diff reliability and consistency  
+   Goal: for the same session, preview, apply output, debug output, and history should report the same changed-file set and line counts, with generated/noise files handled consistently.
+6. Agent-reported changes as single source of truth  
+   Goal: remove legacy local diff-based change reporting and use agent-reported change data consistently across apply, debug, and history.
+7. MCP and broader tool integration model  
+   Goal: support richer external tool and integration patterns.
+8. Multi-agent orchestration model  
+   Goal: support coordinated workflows that involve more than one agent.
+9. Additional providers beyond Codex  
+   Goal: support multiple model providers in a consistent user experience.
+10. Improved session storage and retrieval performance  
+   Goal: keep history/state operations fast and scalable as usage grows.
