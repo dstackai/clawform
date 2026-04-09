@@ -11,7 +11,7 @@ Expected output file:
 
 ## Instruction
 
-This is a smoke test for Claudeform apply.
+This is a smoke test for Clawform apply.
 
 Write exactly one file: `./example-data/output-smoke.txt`.
 File content must be exactly:

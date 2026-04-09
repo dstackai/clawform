@@ -1,4 +1,4 @@
-Claudeform apply session contract
+Clawform apply session contract
 
 You are running the "current session".
 
@@ -20,18 +20,18 @@ What is expected in this "current session":
 Required execution order:
 1) Read the new program version: `examples/calc.md`.
 2) Read "last session" files:
-   `.claudeform/programs/calculator/sessions/019d55f0-fd15-7041-bca3-979c467b67eb/program.md`
+   `.clawform/programs/calculator/sessions/019d55f0-fd15-7041-bca3-979c467b67eb/program.md`
    and
-   `.claudeform/programs/calculator/sessions/019d55f0-fd15-7041-bca3-979c467b67eb/output.md`.
+   `.clawform/programs/calculator/sessions/019d55f0-fd15-7041-bca3-979c467b67eb/output.md`.
 3) Read program changes between:
-   `.claudeform/programs/calculator/sessions/019d55f0-fd15-7041-bca3-979c467b67eb/program.md`
+   `.clawform/programs/calculator/sessions/019d55f0-fd15-7041-bca3-979c467b67eb/program.md`
    and
    the new program version (`examples/calc.md`).
 4) Execute the "program" for this "current session".
 5) Before finishing, write both required report files:
-   `./.claudeform/agent_outputs.json`
+   `./.clawform/agent_outputs.json`
    and
-   `./.claudeform/agent_result.json`.
+   `./.clawform/agent_result.json`.
 
 Program
 
@@ -45,9 +45,9 @@ Last session details
 - last_session_id: `019d55f0-fd15-7041-bca3-979c467b67eb`
 - last_session_status: `success`
 - last_session_time_unix: `1775263601`
-- last_session_program_file: `.claudeform/programs/calculator/sessions/019d55f0-fd15-7041-bca3-979c467b67eb/program.md`
-- last_session_output_file: `.claudeform/programs/calculator/sessions/019d55f0-fd15-7041-bca3-979c467b67eb/output.md`
-- session_history_path (open only if needed): `.claudeform/programs/calculator/sessions/`
+- last_session_program_file: `.clawform/programs/calculator/sessions/019d55f0-fd15-7041-bca3-979c467b67eb/program.md`
+- last_session_output_file: `.clawform/programs/calculator/sessions/019d55f0-fd15-7041-bca3-979c467b67eb/output.md`
+- session_history_path (open only if needed): `.clawform/programs/calculator/sessions/`
 
 How to use "last session" details in this "current session":
 - Understand what was completed in "last session".
@@ -60,7 +60,7 @@ How to use "last session" details in this "current session":
 Program changes since last session
 
 - Last session program file to compare from:
-  `.claudeform/programs/calculator/sessions/019d55f0-fd15-7041-bca3-979c467b67eb/program.md`
+  `.clawform/programs/calculator/sessions/019d55f0-fd15-7041-bca3-979c467b67eb/program.md`
 - Program file for the "current session" to compare to:
   `examples/calc.md`
 - Program change summary:
@@ -81,7 +81,7 @@ Execution and stop rules for this "current session"
 - If blocked, report that in the required status file.
 - If a required network command fails in sandbox with DNS/connectivity errors (for example: `Could not resolve host`, `failed to lookup address information`, `network is unreachable`, `no route to host`, `connection timed out`), treat it as sandbox network restriction immediately.
 - In that case, do not spend time on network workarounds (forced IP/`--resolve`, alternate download tools, local TLS/proxy emulation).
-- Immediately write `./.claudeform/agent_result.json` with `status: failure` and `reason: sandbox_network_blocked`, then stop.
+- Immediately write `./.clawform/agent_result.json` with `status: failure` and `reason: sandbox_network_blocked`, then stop.
 - Keep edits within program scope:
   files required to satisfy the "program".
 - Do not make unrelated edits.
@@ -90,7 +90,7 @@ Execution and stop rules for this "current session"
 
 Required report files for this "current session" (must write both)
 
-1) `./.claudeform/agent_outputs.json`
+1) `./.clawform/agent_outputs.json`
 
 Exact format:
 ```json
@@ -102,10 +102,10 @@ Exact format:
 Rules:
 - Include files created/modified/deleted in this "current session".
 - Use repo-relative paths.
-- Exclude `.claudeform/*` bookkeeping files.
+- Exclude `.clawform/*` bookkeeping files.
 - Deduplicate entries.
 
-2) `./.claudeform/agent_result.json`
+2) `./.clawform/agent_result.json`
 
 Exact format:
 ```json
@@ -129,4 +129,4 @@ Rules:
 User-facing message rule for this "current session"
 
 - In user-facing text, describe program results only.
-- Do not mention `.claudeform/*` bookkeeping files unless user explicitly asks.
+- Do not mention `.clawform/*` bookkeeping files unless user explicitly asks.

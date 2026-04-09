@@ -1,25 +1,25 @@
 #!/bin/sh
 set -eu
 
-REPO="${CLAUDEFORM_REPO:-dstackai/claudeform}"
-INSTALL_DIR="${CLAUDEFORM_INSTALL_DIR:-$HOME/.local/bin}"
-VERSION="${CLAUDEFORM_VERSION:-latest}"
+REPO="${CLAWFORM_REPO:-dstackai/clawform}"
+INSTALL_DIR="${CLAWFORM_INSTALL_DIR:-$HOME/.local/bin}"
+VERSION="${CLAWFORM_VERSION:-latest}"
 
 usage() {
   cat <<'EOF'
-Claudeform installer
+Clawform installer
 
 Usage:
   sh install.sh [--version <tag>] [--install-dir <path>] [--repo <owner/name>]
 
 Environment overrides:
-  CLAUDEFORM_VERSION      Tag to install (example: v0.1.0, v0.2.0-rc.1)
-  CLAUDEFORM_INSTALL_DIR  Destination directory (default: ~/.local/bin)
-  CLAUDEFORM_REPO         GitHub repo (default: dstackai/claudeform)
+  CLAWFORM_VERSION      Tag to install (example: v0.1.0, v0.2.0-rc.1)
+  CLAWFORM_INSTALL_DIR  Destination directory (default: ~/.local/bin)
+  CLAWFORM_REPO         GitHub repo (default: dstackai/clawform)
 
 Examples:
-  curl -fsSL https://raw.githubusercontent.com/dstackai/claudeform/main/install.sh | sh
-  CLAUDEFORM_VERSION=v0.2.0-rc.1 curl -fsSL https://raw.githubusercontent.com/dstackai/claudeform/main/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/dstackai/clawform/main/install.sh | sh
+  CLAWFORM_VERSION=v0.2.0-rc.1 curl -fsSL https://raw.githubusercontent.com/dstackai/clawform/main/install.sh | sh
 EOF
 }
 
@@ -131,7 +131,7 @@ else
   tag="$(normalize_tag "$VERSION")"
 fi
 
-asset="claudeform_${os}_${arch}.tar.gz"
+asset="clawform_${os}_${arch}.tar.gz"
 base_url="https://github.com/${REPO}/releases/download/${tag}"
 asset_url="${base_url}/${asset}"
 checksums_url="${base_url}/SHA256SUMS"
@@ -139,7 +139,7 @@ checksums_url="${base_url}/SHA256SUMS"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT INT TERM
 
-echo "Installing Claudeform ${tag} from ${REPO}"
+echo "Installing Clawform ${tag} from ${REPO}"
 echo "Detected target: ${os}/${arch}"
 echo "Downloading: ${asset}"
 
@@ -163,11 +163,11 @@ fi
 mkdir -p "$INSTALL_DIR"
 tar -xzf "${tmp_dir}/${asset}" -C "$tmp_dir"
 
-install -m 0755 "${tmp_dir}/claudeform" "${INSTALL_DIR}/claudeform"
+install -m 0755 "${tmp_dir}/clawform" "${INSTALL_DIR}/clawform"
 install -m 0755 "${tmp_dir}/cf" "${INSTALL_DIR}/cf"
 
 echo "Installed:"
-echo "  ${INSTALL_DIR}/claudeform"
+echo "  ${INSTALL_DIR}/clawform"
 echo "  ${INSTALL_DIR}/cf"
 echo
 echo "If needed, add to PATH:"

@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use tempfile::TempDir;
 
-use claudeform_core::provider::{ProviderRequest, ProviderRunResult, ProviderRunner};
-use claudeform_core::{run_apply, ApplyRequest, RunHistoryRecord, RunStatus, SandboxMode};
+use clawform_core::provider::{ProviderRequest, ProviderRunResult, ProviderRunner};
+use clawform_core::{run_apply, ApplyRequest, RunHistoryRecord, RunStatus, SandboxMode};
 
 const AGENT_RESULT_SUCCESS_JSON: &str = r#"{"status":"success","message":"done"}"#;
 const AGENT_RESULT_PARTIAL_JSON: &str =
@@ -71,9 +71,9 @@ fn setup_workspace(program_markdown: &str) -> Result<TempDir> {
     let root = temp.path();
 
     write_file(
-        &root.join(".claudeform/config.json"),
+        &root.join(".clawform/config.json"),
         r#"{
-  "claudeform": {
+  "clawform": {
     "providers": {
       "codex": {
         "type": "codex",
@@ -106,7 +106,7 @@ fn run(
     ws: &TempDir,
     runner: &MockRunner,
     use_history_context: bool,
-) -> Result<claudeform_core::ApplyResult> {
+) -> Result<clawform_core::ApplyResult> {
     run_with_variables(ws, runner, use_history_context, BTreeMap::new())
 }
 
@@ -115,7 +115,7 @@ fn run_with_variables(
     runner: &MockRunner,
     use_history_context: bool,
     program_variables: BTreeMap<String, String>,
-) -> Result<claudeform_core::ApplyResult> {
+) -> Result<clawform_core::ApplyResult> {
     run_apply(
         &ApplyRequest {
             workspace_root: ws.path().to_path_buf(),
@@ -148,7 +148,7 @@ Write ./out.txt.
         vec![
             (PathBuf::from("out.txt"), "OK\n"),
             (
-                PathBuf::from(".claudeform/agent_result.json"),
+                PathBuf::from(".clawform/agent_result.json"),
                 AGENT_RESULT_SUCCESS_JSON,
             ),
         ],
@@ -212,7 +212,7 @@ Write ./out.txt using ${{ var.APP_NAME }} and ${{ var.APP_PORT }}.
         vec![
             (PathBuf::from("out.txt"), "OK\n"),
             (
-                PathBuf::from(".claudeform/agent_result.json"),
+                PathBuf::from(".clawform/agent_result.json"),
                 AGENT_RESULT_SUCCESS_JSON,
             ),
         ],
@@ -228,7 +228,7 @@ Write ./out.txt using ${{ var.APP_NAME }} and ${{ var.APP_PORT }}.
 
     let vars_path = ws
         .path()
-        .join(".claudeform/programs/mock_program/sessions/mock-session-ok/variables.json");
+        .join(".clawform/programs/mock_program/sessions/mock-session-ok/variables.json");
     let raw = fs::read_to_string(&vars_path)?;
     let parsed: serde_json::Value = serde_json::from_str(&raw)?;
     assert_eq!(
@@ -255,7 +255,7 @@ Write ./out.txt using ${{ var.APP_NAME }}.
     )?;
     let (runner, calls) = make_runner(
         vec![(
-            PathBuf::from(".claudeform/agent_result.json"),
+            PathBuf::from(".clawform/agent_result.json"),
             AGENT_RESULT_SUCCESS_JSON,
         )],
         false,
@@ -284,7 +284,7 @@ Write ./out.txt using ${{ var.APP_PORT }}.
     )?;
     let (runner, calls) = make_runner(
         vec![(
-            PathBuf::from(".claudeform/agent_result.json"),
+            PathBuf::from(".clawform/agent_result.json"),
             AGENT_RESULT_SUCCESS_JSON,
         )],
         false,
@@ -310,7 +310,7 @@ Write ./out.txt.
     )?;
     let (runner, calls) = make_runner(
         vec![(
-            PathBuf::from(".claudeform/agent_result.json"),
+            PathBuf::from(".clawform/agent_result.json"),
             AGENT_RESULT_SUCCESS_JSON,
         )],
         false,
@@ -343,15 +343,15 @@ Write ./out.txt.
         vec![
             (PathBuf::from("out.txt"), "OK\n"),
             (
-                PathBuf::from(".claudeform/agent_output.md"),
+                PathBuf::from(".clawform/agent_output.md"),
                 "Created out.txt with OK\n",
             ),
             (
-                PathBuf::from(".claudeform/agent_outputs.json"),
-                "[\"out.txt\", \".claudeform/agent_output.md\"]\n",
+                PathBuf::from(".clawform/agent_outputs.json"),
+                "[\"out.txt\", \".clawform/agent_output.md\"]\n",
             ),
             (
-                PathBuf::from(".claudeform/agent_result.json"),
+                PathBuf::from(".clawform/agent_result.json"),
                 AGENT_RESULT_SUCCESS_JSON,
             ),
         ],
@@ -367,11 +367,11 @@ Write ./out.txt.
     assert!(!result
         .file_results
         .iter()
-        .any(|f| f.path == ".claudeform/agent_output.md"));
+        .any(|f| f.path == ".clawform/agent_output.md"));
     assert!(!result
         .file_results
         .iter()
-        .any(|f| f.path == ".claudeform/agent_summary.md"));
+        .any(|f| f.path == ".clawform/agent_summary.md"));
     Ok(())
 }
 
@@ -389,11 +389,11 @@ Write ./out.txt.
         vec![
             (PathBuf::from("out.txt"), "OK\n"),
             (
-                PathBuf::from(".claudeform/agent_summary.md"),
+                PathBuf::from(".clawform/agent_summary.md"),
                 "Legacy summary path still works\n",
             ),
             (
-                PathBuf::from(".claudeform/agent_result.json"),
+                PathBuf::from(".clawform/agent_result.json"),
                 AGENT_RESULT_SUCCESS_JSON,
             ),
         ],
@@ -422,7 +422,7 @@ Write ./out.txt.
         vec![
             (PathBuf::from("out.txt"), "OK\n"),
             (
-                PathBuf::from(".claudeform/agent_result.json"),
+                PathBuf::from(".clawform/agent_result.json"),
                 AGENT_RESULT_PARTIAL_JSON,
             ),
         ],
@@ -453,7 +453,7 @@ Write ./out.txt.
         vec![
             (PathBuf::from("out.txt"), "V1\n"),
             (
-                PathBuf::from(".claudeform/agent_result.json"),
+                PathBuf::from(".clawform/agent_result.json"),
                 AGENT_RESULT_SUCCESS_JSON,
             ),
         ],
@@ -488,11 +488,11 @@ Write ./out.txt.
         vec![
             (PathBuf::from("out.txt"), "OK\n"),
             (
-                PathBuf::from(".claudeform/agent_output.md"),
+                PathBuf::from(".clawform/agent_output.md"),
                 "first summary\n",
             ),
             (
-                PathBuf::from(".claudeform/agent_result.json"),
+                PathBuf::from(".clawform/agent_result.json"),
                 AGENT_RESULT_SUCCESS_JSON,
             ),
         ],
@@ -504,7 +504,7 @@ Write ./out.txt.
         vec![
             (PathBuf::from("out.txt"), "OK\n"),
             (
-                PathBuf::from(".claudeform/agent_result.json"),
+                PathBuf::from(".clawform/agent_result.json"),
                 AGENT_RESULT_SUCCESS_JSON,
             ),
         ],
@@ -515,10 +515,10 @@ Write ./out.txt.
 
     let prompts = runner2.prompts.lock().expect("prompt mutex poisoned");
     let last = prompts.last().cloned().unwrap_or_default();
-    assert!(last.contains("Claudeform apply session contract"));
+    assert!(last.contains("Clawform apply session contract"));
     assert!(last.contains("Last session details"));
     assert!(last.contains("Program changes since last session"));
-    assert!(last.contains(".claudeform/programs/mock_program/sessions/mock-session-ok/program.md"));
+    assert!(last.contains(".clawform/programs/mock_program/sessions/mock-session-ok/program.md"));
     Ok(())
 }
 
@@ -538,7 +538,7 @@ Write ./out.txt with `v1`.
         vec![
             (PathBuf::from("out.txt"), "v1\n"),
             (
-                PathBuf::from(".claudeform/agent_result.json"),
+                PathBuf::from(".clawform/agent_result.json"),
                 AGENT_RESULT_SUCCESS_JSON,
             ),
         ],
@@ -566,7 +566,7 @@ Update ./out.txt with `v2` and verify it.
     let err = run(&ws, &runner2, true)
         .err()
         .context("expected apply to fail without agent_result")?;
-    assert!(format!("{:#}", err).contains(".claudeform/agent_result.json"));
+    assert!(format!("{:#}", err).contains(".clawform/agent_result.json"));
 
     let history = read_history(ws.path())?;
     assert_eq!(history.len(), 2);
@@ -577,12 +577,12 @@ Update ./out.txt with `v2` and verify it.
     let last = prompts.last().cloned().unwrap_or_default();
     assert!(last.contains("Program changes since last session"));
     assert!(last.contains("Program change summary:"));
-    assert!(!last.contains("Claudeform plan context"));
+    assert!(!last.contains("Clawform plan context"));
     Ok(())
 }
 
 fn read_history(workspace_root: &Path) -> Result<Vec<RunHistoryRecord>> {
-    let path = workspace_root.join(".claudeform/history/index.jsonl");
+    let path = workspace_root.join(".clawform/history/index.jsonl");
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("failed reading history file '{}'", path.display()))?;
     let mut out = Vec::new();

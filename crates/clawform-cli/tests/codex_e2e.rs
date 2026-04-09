@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use serial_test::serial;
 
 fn should_run_e2e() -> bool {
-    std::env::var("CLAUDEFORM_E2E_CODEX")
+    std::env::var("CLAWFORM_E2E_CODEX")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -38,9 +38,9 @@ fn write(path: &Path, contents: &str) -> Result<()> {
 fn make_workspace(program_name: &str, program_body: &str) -> Result<tempfile::TempDir> {
     let dir = tempfile::tempdir()?;
     write(
-        &dir.path().join(".claudeform/config.json"),
+        &dir.path().join(".clawform/config.json"),
         r#"{
-  "claudeform": {
+  "clawform": {
     "providers": {
       "codex": {
         "type": "codex",
@@ -56,12 +56,12 @@ fn make_workspace(program_name: &str, program_body: &str) -> Result<tempfile::Te
 }
 
 fn run_apply(dir: &Path, file: &str) -> Result<std::process::Output> {
-    let bin = env!("CARGO_BIN_EXE_claudeform");
+    let bin = env!("CARGO_BIN_EXE_clawform");
     let output = Command::new(bin)
         .args(["apply", "-f", file])
         .current_dir(dir)
         .output()
-        .context("failed running claudeform apply")?;
+        .context("failed running clawform apply")?;
     Ok(output)
 }
 
@@ -69,7 +69,7 @@ fn run_apply(dir: &Path, file: &str) -> Result<std::process::Output> {
 #[serial]
 fn codex_smoke_apply_creates_output() -> Result<()> {
     if !should_run_e2e() {
-        eprintln!("skipping codex e2e: set CLAUDEFORM_E2E_CODEX=1 to run");
+        eprintln!("skipping codex e2e: set CLAWFORM_E2E_CODEX=1 to run");
         return Ok(());
     }
 
@@ -89,7 +89,7 @@ Write exactly one file `./example-data/output-smoke.txt` with content `SMOKE_OK`
     let out = run_apply(ws.path(), "smoke.md")?;
     if !out.status.success() {
         bail!(
-            "claudeform apply failed:\nstdout:\n{}\nstderr:\n{}",
+            "clawform apply failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
@@ -104,7 +104,7 @@ Write exactly one file `./example-data/output-smoke.txt` with content `SMOKE_OK`
 #[serial]
 fn codex_second_apply_runs_and_prints_files_summary() -> Result<()> {
     if !should_run_e2e() {
-        eprintln!("skipping codex e2e: set CLAUDEFORM_E2E_CODEX=1 to run");
+        eprintln!("skipping codex e2e: set CLAWFORM_E2E_CODEX=1 to run");
         return Ok(());
     }
 
@@ -142,7 +142,7 @@ Write exactly one file `./example-data/output-smoke.txt` with content `SMOKE_OK`
 #[serial]
 fn codex_apply_can_create_multiple_files() -> Result<()> {
     if !should_run_e2e() {
-        eprintln!("skipping codex e2e: set CLAUDEFORM_E2E_CODEX=1 to run");
+        eprintln!("skipping codex e2e: set CLAWFORM_E2E_CODEX=1 to run");
         return Ok(());
     }
 

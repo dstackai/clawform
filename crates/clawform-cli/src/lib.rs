@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
-use claudeform_core::{
+use clawform_core::{
     reset_history, run_apply, AgentResult, AgentStatus, ApplyRequest, CodexRunner, FileResult,
     HistoryResetTarget, ProviderRunner, ProviderUsage, SandboxMode,
 };
@@ -218,7 +218,7 @@ fn real_main() -> Result<()> {
                 Err(err) => {
                     if debug {
                         eprintln!(
-                            "debug hint: inspect .claudeform/programs/*/sessions/*/{{prompt.md,plan.json,events.ndjson,provider.stdout.log,provider.stderr.log}}"
+                            "debug hint: inspect .clawform/programs/*/sessions/*/{{prompt.md,plan.json,events.ndjson,provider.stdout.log,provider.stderr.log}}"
                         );
                     }
                     return Err(err);
@@ -689,7 +689,7 @@ fn supports_terminal_hyperlinks() -> bool {
     if !std::io::stdout().is_terminal() {
         return false;
     }
-    if env::var("CLAUDEFORM_NO_HYPERLINKS")
+    if env::var("CLAWFORM_NO_HYPERLINKS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {

@@ -18,6 +18,6 @@ This program is for sandbox behavior verification.
 
 Rules:
 
-- write only `./example-data/output-sandbox-check.txt` (plus required `.claudeform` report files)
+- write only `./example-data/output-sandbox-check.txt` (plus required `.clawform` report files)
 - do not write `NETWORK_OK` unless the fetch command succeeded
 - output file must be exactly one line with trailing newline

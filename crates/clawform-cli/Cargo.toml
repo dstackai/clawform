@@ -1,16 +1,16 @@
 [package]
-name = "claudeform"
+name = "clawform"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-default-run = "claudeform"
+default-run = "clawform"
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
-claudeform-core = { path = "../claudeform-core" }
+clawform-core = { path = "../clawform-core" }
 
 [dev-dependencies]
 anyhow.workspace = true

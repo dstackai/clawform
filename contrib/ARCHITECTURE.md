@@ -1,11 +1,11 @@
-# Claudeform Architecture
+# Clawform Architecture
 
 Last updated: 2026-04-06  
 Status: v0 (implemented baseline)
 
 ## 1) Product Goal
 
-Claudeform runs agent work from markdown files instead of chat windows.
+Clawform runs agent work from markdown files instead of chat windows.
 
 A **program** is one markdown file (`*.md`) representing one task.
 
@@ -14,13 +14,13 @@ A **program** is one markdown file (`*.md`) representing one task.
 
 ## 2) Implemented v0 Scope
 
-1. Public command: `claudeform apply -f <program.md>` (alias: `cf apply -f <program.md>`)
+1. Public command: `clawform apply -f <program.md>` (alias: `cf apply -f <program.md>`)
 2. Confirmation prompt is default in interactive shell; use `--yes` to skip
 3. One program file = one session execution
-4. Config path is fixed: `<cwd>/.claudeform/config.json`
+4. Config path is fixed: `<cwd>/.clawform/config.json`
 5. Provider support in v0: Codex only
 6. Live progress events are on by default (`--no-progress` disables)
-7. Session artifacts and run history are stored under `.claudeform/`
+7. Session artifacts and run history are stored under `.clawform/`
 
 ## 3) Config and Program
 
@@ -28,7 +28,7 @@ A **program** is one markdown file (`*.md`) representing one task.
 
 Path:
 
-- `<cwd>/.claudeform/config.json`
+- `<cwd>/.clawform/config.json`
 
 Rules:
 
@@ -39,7 +39,7 @@ Example:
 
 ```json
 {
-  "claudeform": {
+  "clawform": {
     "providers": {
       "codex": {
         "type": "codex",
@@ -87,10 +87,10 @@ Variable rules:
    - program diff vs last session snapshot (if available)
    - variable diff vs last session variable snapshot (if available)
 5. Ask for confirmation (interactive default; skipped by `--yes`).
-6. Write runtime variables file (`.claudeform/agent_variables.json`) when variables are present.
+6. Write runtime variables file (`.clawform/agent_variables.json`) when variables are present.
 7. Run provider in the current workspace (no temp workspace copy).
 8. Stream provider events to terminal and persist artifacts.
-9. Read agent status from `.claudeform/agent_result.json` (required).
+9. Read agent status from `.clawform/agent_result.json` (required).
 10. Collect reported changed files (events-first, manifest fallback).
 11. Persist session artifacts + history record.
 12. Persist program snapshot (`program.md`) and variable snapshot (`variables.json`) on success.
@@ -101,32 +101,32 @@ Variable rules:
 
 Per program/session:
 
-- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/prompt.md`
-- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/plan.json`
-- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/events.ndjson`
-- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/provider.stdout.log`
-- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/provider.stderr.log`
-- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/outcome.json`
-- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/output.md` (Claudeform summary)
-- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/program.md` (success snapshot)
-- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/variables.json` (success snapshot)
-- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/commands/*` (captured command outputs)
-- `<cwd>/.claudeform/programs/<program_id>/sessions/<session_id>/messages/*` (captured message outputs)
+- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/prompt.md`
+- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/plan.json`
+- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/events.ndjson`
+- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/provider.stdout.log`
+- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/provider.stderr.log`
+- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/outcome.json`
+- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/output.md` (Clawform summary)
+- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/program.md` (success snapshot)
+- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/variables.json` (success snapshot)
+- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/commands/*` (captured command outputs)
+- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/messages/*` (captured message outputs)
 
 ## 5.2 Run History Index
 
-- `<cwd>/.claudeform/history/index.jsonl`
+- `<cwd>/.clawform/history/index.jsonl`
 
-This is Claudeform-owned history, independent from provider-side memory.
+This is Clawform-owned history, independent from provider-side memory.
 
 ## 5.3 Agent Report Files in Workspace Root
 
 Agent may write:
 
-- `<cwd>/.claudeform/agent_result.json` (required)
-- `<cwd>/.claudeform/agent_output.md` (optional human summary)
-- `<cwd>/.claudeform/agent_outputs.json` (optional fallback list of changed files)
-- `<cwd>/.claudeform/agent_variables.json` (runtime resolved variable values provided by Claudeform)
+- `<cwd>/.clawform/agent_result.json` (required)
+- `<cwd>/.clawform/agent_output.md` (optional human summary)
+- `<cwd>/.clawform/agent_outputs.json` (optional fallback list of changed files)
+- `<cwd>/.clawform/agent_variables.json` (runtime resolved variable values provided by Clawform)
 
 These files are execution protocol files, not user deliverables.
 

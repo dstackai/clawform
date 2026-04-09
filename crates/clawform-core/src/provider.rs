@@ -351,7 +351,7 @@ fn canonical_event_type_name(event: &ProviderEvent) -> String {
 fn session_base_dir(root: &Path, program_id: Option<&str>, session_id: &str) -> PathBuf {
     let program = sanitize_program_id(program_id.unwrap_or("program"));
     let session = sanitize_session_id(session_id);
-    root.join(".claudeform")
+    root.join(".clawform")
         .join("programs")
         .join(program)
         .join("sessions")
@@ -1496,7 +1496,7 @@ fn supports_terminal_hyperlinks() -> bool {
     if !std::io::stdout().is_terminal() {
         return false;
     }
-    if env::var("CLAUDEFORM_NO_HYPERLINKS")
+    if env::var("CLAWFORM_NO_HYPERLINKS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
@@ -1983,7 +1983,7 @@ fn format_item_event(
     let _ = phase;
     let _ = item_id;
     let summary = summary?.trim();
-    if kind == "cmd" && is_claudeform_housekeeping_command(summary) {
+    if kind == "cmd" && is_clawform_housekeeping_command(summary) {
         return None;
     }
     if kind == "cmd" {
@@ -2020,20 +2020,20 @@ fn is_low_signal_command(summary: &str) -> bool {
         || s.starts_with("git status")
 }
 
-fn is_claudeform_housekeeping_command(summary: &str) -> bool {
+fn is_clawform_housekeeping_command(summary: &str) -> bool {
     let s = summary.trim().to_ascii_lowercase();
-    s.starts_with("write .claudeform/agent_output.md")
-        || s.starts_with("write .claudeform/agent_summary.md")
-        || s.starts_with("write .claudeform/agent_outputs.json")
-        || s.starts_with("write .claudeform/agent_result.json")
-        || s.starts_with("cat .claudeform/agent_output.md")
-        || s.starts_with("cat .claudeform/agent_summary.md")
-        || s.starts_with("cat .claudeform/agent_outputs.json")
-        || s.starts_with("cat .claudeform/agent_result.json")
+    s.starts_with("write .clawform/agent_output.md")
+        || s.starts_with("write .clawform/agent_summary.md")
+        || s.starts_with("write .clawform/agent_outputs.json")
+        || s.starts_with("write .clawform/agent_result.json")
+        || s.starts_with("cat .clawform/agent_output.md")
+        || s.starts_with("cat .clawform/agent_summary.md")
+        || s.starts_with("cat .clawform/agent_outputs.json")
+        || s.starts_with("cat .clawform/agent_result.json")
         || {
             let is_read_write = s.starts_with("write ") || s.starts_with("cat ");
             is_read_write
-                && s.contains(".claudeform/programs/")
+                && s.contains(".clawform/programs/")
                 && (s.contains("/reports/agent_output")
                     || s.contains("/reports/agent_outputs")
                     || s.contains("/reports/agent_result"))
@@ -2129,7 +2129,7 @@ fn should_count_item_progress(
         return true;
     }
     if let Some(s) = summary {
-        if is_claudeform_housekeeping_command(s) {
+        if is_clawform_housekeeping_command(s) {
             return false;
         }
     }
@@ -2468,7 +2468,7 @@ fn looks_like_path(core: &str) -> bool {
 
     core.contains('/')
         || core.starts_with("./")
-        || core.starts_with(".claudeform/")
+        || core.starts_with(".clawform/")
         || core.starts_with("src/")
         || core.starts_with("crates/")
         || core.ends_with(".md")
@@ -2711,7 +2711,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir
             .path()
-            .join(".claudeform/programs/release-notes/reports/agent_result.json");
+            .join(".clawform/programs/release-notes/reports/agent_result.json");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("create reports dir");
         }
@@ -2725,7 +2725,7 @@ mod tests {
 
         assert!(agent_result_reports_blocked_network(
             dir.path(),
-            ".claudeform/programs/release-notes/reports/agent_result.json",
+            ".clawform/programs/release-notes/reports/agent_result.json",
             started
         ));
     }
@@ -2735,7 +2735,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir
             .path()
-            .join(".claudeform/programs/release-notes/reports/agent_result.json");
+            .join(".clawform/programs/release-notes/reports/agent_result.json");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("create reports dir");
         }
@@ -2749,7 +2749,7 @@ mod tests {
 
         assert!(agent_result_reports_blocked_network(
             dir.path(),
-            ".claudeform/programs/release-notes/reports/agent_result.json",
+            ".clawform/programs/release-notes/reports/agent_result.json",
             started
         ));
     }
@@ -2759,7 +2759,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir
             .path()
-            .join(".claudeform/programs/release-notes/reports/agent_result.json");
+            .join(".clawform/programs/release-notes/reports/agent_result.json");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("create reports dir");
         }
@@ -2773,7 +2773,7 @@ mod tests {
 
         assert!(agent_result_reports_blocked_network(
             dir.path(),
-            ".claudeform/programs/release-notes/reports/agent_result.json",
+            ".clawform/programs/release-notes/reports/agent_result.json",
             started
         ));
     }
@@ -2783,7 +2783,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir
             .path()
-            .join(".claudeform/programs/release-notes/reports/agent_result.json");
+            .join(".clawform/programs/release-notes/reports/agent_result.json");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("create reports dir");
         }
@@ -2797,7 +2797,7 @@ mod tests {
 
         assert!(!agent_result_reports_blocked_network(
             dir.path(),
-            ".claudeform/programs/release-notes/reports/agent_result.json",
+            ".clawform/programs/release-notes/reports/agent_result.json",
             started
         ));
     }
@@ -2807,7 +2807,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir
             .path()
-            .join(".claudeform/programs/release-notes/reports/agent_result.json");
+            .join(".clawform/programs/release-notes/reports/agent_result.json");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("create reports dir");
         }
@@ -2834,7 +2834,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir
             .path()
-            .join(".claudeform/programs/release-notes/reports/agent_result.json");
+            .join(".clawform/programs/release-notes/reports/agent_result.json");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("create reports dir");
         }
@@ -2858,7 +2858,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace_root = dir.path().to_path_buf();
         let result_path =
-            workspace_root.join(".claudeform/programs/release-notes/reports/agent_result.json");
+            workspace_root.join(".clawform/programs/release-notes/reports/agent_result.json");
         if let Some(parent) = result_path.parent() {
             std::fs::create_dir_all(parent).expect("create reports dir");
         }
@@ -2875,7 +2875,7 @@ mod tests {
             artifacts_root: None,
             program_id: Some("release-notes".to_string()),
             model: None,
-            agent_result_rel: ".claudeform/programs/release-notes/reports/agent_result.json"
+            agent_result_rel: ".clawform/programs/release-notes/reports/agent_result.json"
                 .to_string(),
             sandbox_mode: SandboxMode::Auto,
             prompt: "x".to_string(),
@@ -2902,7 +2902,7 @@ mod tests {
     fn success_path_retries_when_agent_result_reports_network_restriction() {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace_root = dir.path().to_path_buf();
-        let result_rel = ".claudeform/programs/release-notes/reports/agent_result.json";
+        let result_rel = ".clawform/programs/release-notes/reports/agent_result.json";
         let result_path = workspace_root.join(result_rel);
         if let Some(parent) = result_path.parent() {
             std::fs::create_dir_all(parent).expect("create reports dir");
@@ -3009,7 +3009,7 @@ mod tests {
             &ProviderEvent::ItemCompleted {
                 item_type: "command_execution".to_string(),
                 item_id: Some("x".to_string()),
-                summary: Some("ls .claudeform".to_string()),
+                summary: Some("ls .clawform".to_string()),
             },
             true,
             false,
@@ -3065,7 +3065,7 @@ mod tests {
                 item_type: "command_execution".to_string(),
                 item_id: Some("x".to_string()),
                 summary: Some(
-                    "write .claudeform/programs/release-notes/reports/agent_result.json"
+                    "write .clawform/programs/release-notes/reports/agent_result.json"
                         .to_string(),
                 ),
             },
@@ -3079,12 +3079,12 @@ mod tests {
     fn housekeeping_commands_do_not_count_as_progress_activity() {
         assert!(!should_count_item_progress(
             "command_execution",
-            Some("write .claudeform/programs/release-notes/reports/agent_outputs.json"),
+            Some("write .clawform/programs/release-notes/reports/agent_outputs.json"),
             true
         ));
         assert!(!should_count_item_progress(
             "command_execution",
-            Some("cat .claudeform/programs/release-notes/reports/agent_result.json"),
+            Some("cat .clawform/programs/release-notes/reports/agent_result.json"),
             false
         ));
     }
@@ -3129,11 +3129,11 @@ mod tests {
         let mut links = HashMap::new();
         links.insert(
             "item_9".to_string(),
-            PathBuf::from("/tmp/claudeform/programs/smoke/sessions/session/commands/item_9.txt"),
+            PathBuf::from("/tmp/clawform/programs/smoke/sessions/session/commands/item_9.txt"),
         );
         let rendered = add_command_output_link_suffix(&event, "✔ ls", &links, false);
         assert!(rendered.contains(
-            "✔ ls | out=/tmp/claudeform/programs/smoke/sessions/session/commands/item_9.txt"
+            "✔ ls | out=/tmp/clawform/programs/smoke/sessions/session/commands/item_9.txt"
         ));
     }
 
@@ -3156,11 +3156,11 @@ mod tests {
         let mut links = HashMap::new();
         links.insert(
             "item_4".to_string(),
-            PathBuf::from("/tmp/claudeform/programs/smoke/sessions/session/messages/item_4.md"),
+            PathBuf::from("/tmp/clawform/programs/smoke/sessions/session/messages/item_4.md"),
         );
         let rendered = add_message_output_link_suffix(&event, "💬 Some summary", &links, false);
         assert!(rendered.contains(
-            "💬 Some summary | msg=/tmp/claudeform/programs/smoke/sessions/session/messages/item_4.md"
+            "💬 Some summary | msg=/tmp/clawform/programs/smoke/sessions/session/messages/item_4.md"
         ));
     }
 
@@ -3174,11 +3174,11 @@ mod tests {
         let mut links = HashMap::new();
         links.insert(
             "item_5".to_string(),
-            PathBuf::from("/tmp/claudeform/src/main.rs"),
+            PathBuf::from("/tmp/clawform/src/main.rs"),
         );
         let rendered =
             add_file_change_link_suffix(&event, "✔ file update src/main.rs", &links, false);
-        assert!(rendered.contains("✔ file update src/main.rs | file=/tmp/claudeform/src/main.rs"));
+        assert!(rendered.contains("✔ file update src/main.rs | file=/tmp/clawform/src/main.rs"));
     }
 
     #[test]
@@ -3201,11 +3201,11 @@ mod tests {
 
     #[test]
     fn colorize_link_segment_highlights_hyperlink_label_text() {
-        let segment = "\x1b]8;;file:///tmp/claudeform/commands/item_9.txt\x1b\\out\x1b]8;;\x1b\\";
+        let segment = "\x1b]8;;file:///tmp/clawform/commands/item_9.txt\x1b\\out\x1b]8;;\x1b\\";
         let rendered = colorize_link_segment(segment).expect("expected colored hyperlink segment");
         assert_eq!(
             rendered,
-            "\x1b]8;;file:///tmp/claudeform/commands/item_9.txt\x1b\\\x1b[95mout\x1b[0m\x1b]8;;\x1b\\"
+            "\x1b]8;;file:///tmp/clawform/commands/item_9.txt\x1b\\\x1b[95mout\x1b[0m\x1b]8;;\x1b\\"
         );
     }
 }

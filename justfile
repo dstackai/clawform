@@ -1,7 +1,7 @@
 # Rebuild and reinstall the local CLI.
 build:
-    cargo build -p claudeform
-    cargo install --path crates/claudeform-cli --force
+    cargo build -p clawform
+    cargo install --path crates/clawform-cli --force
 
 # Run the test suite.
 test:

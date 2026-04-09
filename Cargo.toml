@@ -1,7 +1,7 @@
 [workspace]
 members = [
-  "crates/claudeform-core",
-  "crates/claudeform-cli",
+  "crates/clawform-core",
+  "crates/clawform-cli",
 ]
 resolver = "2"
 
@@ -9,7 +9,7 @@ resolver = "2"
 version = "0.0.5"
 edition = "2021"
 license = "MIT"
-authors = ["Claudeform Contributors"]
+authors = ["Clawform Contributors"]
 
 [workspace.dependencies]
 anyhow = "1.0"

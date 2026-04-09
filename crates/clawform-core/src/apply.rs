@@ -23,11 +23,11 @@ use crate::provider::ensure_interrupt_handler;
 use crate::provider::interrupt_requested;
 use crate::provider::{ProviderRequest, ProviderRunResult, ProviderRunner, SandboxMode};
 
-const AGENT_OUTPUT_MANIFEST_REL: &str = ".claudeform/agent_outputs.json";
-const AGENT_HUMAN_OUTPUT_REL: &str = ".claudeform/agent_output.md";
-const AGENT_HUMAN_OUTPUT_LEGACY_REL: &str = ".claudeform/agent_summary.md";
-const AGENT_RESULT_REL: &str = ".claudeform/agent_result.json";
-const RUNTIME_VARIABLES_INPUT_REL: &str = ".claudeform/agent_variables.json";
+const AGENT_OUTPUT_MANIFEST_REL: &str = ".clawform/agent_outputs.json";
+const AGENT_HUMAN_OUTPUT_REL: &str = ".clawform/agent_output.md";
+const AGENT_HUMAN_OUTPUT_LEGACY_REL: &str = ".clawform/agent_summary.md";
+const AGENT_RESULT_REL: &str = ".clawform/agent_result.json";
+const RUNTIME_VARIABLES_INPUT_REL: &str = ".clawform/agent_variables.json";
 const SESSION_PROMPT_ARTIFACT_FILE: &str = "prompt.md";
 const SESSION_PLAN_ARTIFACT_FILE: &str = "plan.json";
 const SESSION_STDOUT_ARTIFACT_FILE: &str = "provider.stdout.log";
@@ -1118,10 +1118,10 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
         let session_id = sanitize_storage_token(session_id_raw.as_str(), "session");
-        let session_root = format!(".claudeform/programs/{program_dir}/sessions/{session_id}");
+        let session_root = format!(".clawform/programs/{program_dir}/sessions/{session_id}");
         let last_program_file = format!("{session_root}/program.md");
         let last_output_file = format!("{session_root}/output.md");
-        let history_path = format!(".claudeform/programs/{program_dir}/sessions/");
+        let history_path = format!(".clawform/programs/{program_dir}/sessions/");
         let change_summary = match plan_data.program_diff_vs_last_session.status.as_str() {
             "unavailable" => "unavailable".to_string(),
             _ => format_program_diff_totals(
@@ -1136,7 +1136,7 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
             last_program_file.clone()
         };
 
-        block.push_str("Claudeform apply session contract\n\n");
+        block.push_str("Clawform apply session contract\n\n");
         block.push_str("You are running the \"current session\".\n\n");
         block.push_str("Fixed terms used in this prompt:\n");
         block.push_str("- \"program\": the new program version for this session, stored at `");
@@ -1294,7 +1294,7 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
         block.push_str("Rules:\n");
         block.push_str("- Include files created/modified/deleted in this \"current session\".\n");
         block.push_str("- Use repo-relative paths.\n");
-        block.push_str("- Exclude `.claudeform/*` bookkeeping files.\n");
+        block.push_str("- Exclude `.clawform/*` bookkeeping files.\n");
         block.push_str("- Deduplicate entries.\n\n");
         block.push_str("2) `./");
         block.push_str(AGENT_RESULT_REL);
@@ -1313,11 +1313,11 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
         block.push_str("User-facing message rule for this \"current session\"\n\n");
         block.push_str("- In user-facing text, describe program results only.\n");
         block.push_str(
-            "- Do not mention `.claudeform/*` bookkeeping files unless user explicitly asks.\n",
+            "- Do not mention `.clawform/*` bookkeeping files unless user explicitly asks.\n",
         );
         return Ok(block);
     } else {
-        block.push_str("Claudeform apply session contract\n\n");
+        block.push_str("Clawform apply session contract\n\n");
         block.push_str("Current session\n");
         block.push_str("- Program ID: `");
         block.push_str(program_id);
@@ -1376,7 +1376,7 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
     block.push_str("Rules:\n");
     block.push_str("- Include files created/modified/deleted in this session.\n");
     block.push_str("- Use repo-relative paths.\n");
-    block.push_str("- Exclude `.claudeform/*` bookkeeping files.\n");
+    block.push_str("- Exclude `.clawform/*` bookkeeping files.\n");
     block.push_str("- Deduplicate entries.\n\n");
     block.push_str("2) `./");
     block.push_str(AGENT_RESULT_REL);
@@ -1394,7 +1394,7 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
     block.push_str("- `message`: one short sentence about this session result.\n\n");
     block.push_str("User-facing message rule\n");
     block.push_str("- In user-facing text, describe program results only.\n");
-    block.push_str("- Do not mention `.claudeform/*` bookkeeping files unless explicitly asked.\n");
+    block.push_str("- Do not mention `.clawform/*` bookkeeping files unless explicitly asked.\n");
 
     Ok(block)
 }
@@ -1906,7 +1906,7 @@ fn derive_session_key(session_id: Option<&str>) -> String {
 
 fn program_session_dir(workspace_root: &Path, program_id: &str, session_id: &str) -> PathBuf {
     workspace_root
-        .join(".claudeform")
+        .join(".clawform")
         .join("programs")
         .join(sanitize_storage_token(program_id, "program"))
         .join("sessions")
@@ -2642,7 +2642,7 @@ fn supports_terminal_hyperlinks() -> bool {
     if !io::stdout().is_terminal() {
         return false;
     }
-    if std::env::var("CLAUDEFORM_NO_HYPERLINKS")
+    if std::env::var("CLAWFORM_NO_HYPERLINKS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
@@ -2713,12 +2713,12 @@ fn should_skip_path(rel: &Path) -> bool {
         || rel_str == AGENT_HUMAN_OUTPUT_LEGACY_REL
         || rel_str == AGENT_RESULT_REL
         || rel_str == RUNTIME_VARIABLES_INPUT_REL
-        || rel_str == ".claudeform/history"
-        || rel_str.starts_with(".claudeform/history/")
-        || rel_str == ".claudeform/programs"
-        || rel_str.starts_with(".claudeform/programs/")
-        || rel_str == ".claudeform/sessions"
-        || rel_str.starts_with(".claudeform/sessions/")
+        || rel_str == ".clawform/history"
+        || rel_str.starts_with(".clawform/history/")
+        || rel_str == ".clawform/programs"
+        || rel_str.starts_with(".clawform/programs/")
+        || rel_str == ".clawform/sessions"
+        || rel_str.starts_with(".clawform/sessions/")
 }
 
 #[cfg(test)]
@@ -2844,7 +2844,7 @@ mod tests {
                 values_total: 1,
                 current_session_file: RUNTIME_VARIABLES_INPUT_REL.to_string(),
                 last_session_file: Some(
-                    ".claudeform/programs/calculator/sessions/s-1/variables.json".to_string(),
+                    ".clawform/programs/calculator/sessions/s-1/variables.json".to_string(),
                 ),
             }),
             program_variables_diff_vs_last_session: Some(PlanProgramVariablesDiff {
@@ -2943,7 +2943,7 @@ mod tests {
             r#"[
   {"path":"out.txt","change":"modified"},
   {"path":"./nested/new.txt","change":"created"},
-  {"path":".claudeform/agent_result.json","change":"modified"}
+  {"path":".clawform/agent_result.json","change":"modified"}
 ]"#,
         )?;
 
@@ -3014,7 +3014,7 @@ mod tests {
             "item": {
                 "id": "item_2",
                 "type": "command_execution",
-                "command": "/bin/zsh -lc \"cat <<'EOF' > .claudeform/agent_result.json {\\\"status\\\":\\\"success\\\"} EOF\""
+                "command": "/bin/zsh -lc \"cat <<'EOF' > .clawform/agent_result.json {\\\"status\\\":\\\"success\\\"} EOF\""
             }
         })
         .to_string();

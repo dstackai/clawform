@@ -59,15 +59,15 @@ pub fn now_unix_secs() -> u64 {
 }
 
 pub fn history_dir(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".claudeform/history")
+    workspace_root.join(".clawform/history")
 }
 
 fn legacy_sessions_dir(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".claudeform/sessions")
+    workspace_root.join(".clawform/sessions")
 }
 
 fn legacy_runs_dir(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".claudeform/runs")
+    workspace_root.join(".clawform/runs")
 }
 
 pub fn history_index_path(workspace_root: &Path) -> PathBuf {

@@ -8,7 +8,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
-    claudeform: ToolConfig,
+    clawform: ToolConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,20 +36,20 @@ pub struct ResolvedProvider {
 }
 
 pub fn load_config(workspace_root: &Path) -> Result<ToolConfig> {
-    let path = workspace_root.join(".claudeform/config.json");
+    let path = workspace_root.join(".clawform/config.json");
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("failed reading config file {}", path.display()))?;
     let parsed: ConfigFile = serde_json::from_str(&raw)
         .with_context(|| format!("invalid JSON in {}", path.display()))?;
 
-    parsed.claudeform.validate()?;
-    Ok(parsed.claudeform)
+    parsed.clawform.validate()?;
+    Ok(parsed.clawform)
 }
 
 impl ToolConfig {
     pub fn validate(&self) -> Result<()> {
         if self.providers.is_empty() {
-            bail!(".claudeform/config.json must define at least one provider");
+            bail!(".clawform/config.json must define at least one provider");
         }
 
         let defaults: Vec<_> = self
@@ -105,14 +105,14 @@ mod tests {
 
     fn parse_tool_config(s: &str) -> anyhow::Result<ToolConfig> {
         let parsed: ConfigFile = serde_json::from_str(s)?;
-        Ok(parsed.claudeform)
+        Ok(parsed.clawform)
     }
 
     #[test]
     fn validates_single_default_provider() {
         let cfg = parse_tool_config(
             r#"{
-              "claudeform": {
+              "clawform": {
                 "providers": {
                   "codex": {"type":"codex", "default": true}
                 }
@@ -128,7 +128,7 @@ mod tests {
     fn fails_when_multiple_defaults() {
         let cfg = parse_tool_config(
             r#"{
-              "claudeform": {
+              "clawform": {
                 "providers": {
                   "a": {"type":"codex", "default": true},
                   "b": {"type":"codex", "default": true}
@@ -145,7 +145,7 @@ mod tests {
     fn fails_on_non_codex_provider_type() {
         let cfg = parse_tool_config(
             r#"{
-              "claudeform": {
+              "clawform": {
                 "providers": {
                   "x": {"type":"other", "default": true}
                 }

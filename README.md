@@ -1,10 +1,10 @@
-# Claudeform
+# Clawform
 
-Claudeform executes agentic programs from markdown files.
+Clawform executes agentic programs from markdown files.
 
-You keep instructions in repo files, run `cf apply -f <program.md>`, and Claudeform executes the program with an agent while preserving session context in local state. This gives you a file-based workflow outside chat UI and reduces dependence on proprietary interfaces.
+You keep instructions in repo files, run `cf apply -f <program.md>`, and Clawform executes the program with an agent while preserving session context in local state. This gives you a file-based workflow outside chat UI and reduces dependence on proprietary interfaces.
 
-Yes, it is called Claudeform. Yes, Codex is the first supported provider. Claude support is on the way.
+Yes, it is called Clawform. Yes, Codex is the first supported provider. Claude support is on the way.
 
 ## Why It Exists
 
@@ -17,7 +17,7 @@ Yes, it is called Claudeform. Yes, Codex is the first supported provider. Claude
 
 A **program** is one markdown file that describes desired outcomes, constraints, and execution context for an agent.
 
-This follows the `program.md` style used in agentic programming workflows: the markdown body is intentionally flexible and expressive, while Claudeform keeps only tool-critical fields strict.
+This follows the `program.md` style used in agentic programming workflows: the markdown body is intentionally flexible and expressive, while Clawform keeps only tool-critical fields strict.
 
 Program frontmatter:
 
@@ -28,7 +28,7 @@ Program frontmatter:
 
 `cf apply -f <program.md>` runs one **session** for one program.
 
-Before execution, Claudeform previews:
+Before execution, Clawform previews:
 
 - last session status and summary (if available)
 - last session changed files
@@ -36,9 +36,9 @@ Before execution, Claudeform previews:
 
 Then it asks for confirmation and executes the program with the configured provider.
 
-During execution, Claudeform streams agent progress events to the terminal and records the full event stream and outputs for later inspection.
+During execution, Clawform streams agent progress events to the terminal and records the full event stream and outputs for later inspection.
 
-After execution, Claudeform stores:
+After execution, Clawform stores:
 
 - agent/session outcome
 - changed files reported for this session
@@ -49,22 +49,22 @@ After execution, Claudeform stores:
 Install latest stable:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dstackai/claudeform/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/dstackai/clawform/main/install.sh | sh
 ```
 
 Install a specific version:
 
 ```bash
-CLAUDEFORM_VERSION=v0.0.5 curl -fsSL https://raw.githubusercontent.com/dstackai/claudeform/main/install.sh | sh
+CLAWFORM_VERSION=v0.0.5 curl -fsSL https://raw.githubusercontent.com/dstackai/clawform/main/install.sh | sh
 ```
 
 ## Quick Start
 
-1. Create `.claudeform/config.json`:
+1. Create `.clawform/config.json`:
 
 ```json
 {
-  "claudeform": {
+  "clawform": {
     "providers": {
       "codex": {
         "type": "codex",
@@ -110,11 +110,11 @@ changes: 0 files
 
 ## State Layout
 
-Claudeform keeps local state under `.claudeform/`:
+Clawform keeps local state under `.clawform/`:
 
-- config: `.claudeform/config.json`
-- history index: `.claudeform/history/index.jsonl`
-- per-program sessions: `.claudeform/programs/<program_id>/sessions/<session_id>/`
+- config: `.clawform/config.json`
+- history index: `.clawform/history/index.jsonl`
+- per-program sessions: `.clawform/programs/<program_id>/sessions/<session_id>/`
 
 Session folders include prompt, plan metadata, streamed events, provider stdout/stderr, outcome, and session output summary.
 
@@ -126,7 +126,7 @@ cf apply -f <program.md>
 
 ## Status
 
-Claudeform is a work in progress. Issues and feedback are very welcome.
+Clawform is a work in progress. Issues and feedback are very welcome.
 
 Additional links:
 
