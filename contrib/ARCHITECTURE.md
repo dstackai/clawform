@@ -14,7 +14,7 @@ A **program** is one markdown file (`*.md`) representing one task.
 
 ## 2) Implemented v0 Scope
 
-1. Public command: `clawform apply -f <program.md>` (alias: `cf apply -f <program.md>`)
+1. Public command: `cf -f <program.md>` (explicit equivalent: `cf apply -f <program.md>`, full binary form: `clawform apply -f <program.md>`)
 2. Confirmation prompt is default in interactive shell; use `--yes` to skip
 3. One program file = one session execution
 4. Config path is fixed: `<cwd>/.clawform/config.json`
@@ -136,7 +136,7 @@ These files are execution protocol files, not user deliverables.
 
 Steps to reproduce:
 
-1. Start `cf apply -f <program.md>` in interactive mode.
+1. Start `cf -f <program.md>` in interactive mode.
 2. Interrupt with `Ctrl+C`.
 3. Run apply again and inspect the last-session preview/history.
 

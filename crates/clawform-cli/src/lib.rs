@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 
 use clawform_core::{
     reset_history, run_apply, AgentResult, AgentStatus, ApplyRequest, CodexRunner, FileResult,
@@ -138,7 +139,7 @@ pub fn main_entry() {
 }
 
 fn real_main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = parse_cli();
 
     match cli.command {
         Commands::Apply {
@@ -268,6 +269,79 @@ fn real_main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_cli() -> Cli {
+    let mut args: Vec<OsString> = env::args_os().collect();
+    if should_show_combined_help(&args) {
+        print_combined_help_and_exit();
+    }
+    if should_infer_apply_subcommand(&args) {
+        args.insert(1, OsString::from("apply"));
+    }
+    Cli::parse_from(args)
+}
+
+fn should_show_combined_help(args: &[OsString]) -> bool {
+    matches!(
+        args.get(1).map(|s| s.to_string_lossy()),
+        Some(flag) if flag.as_ref() == "-h" || flag.as_ref() == "--help"
+    )
+}
+
+fn print_combined_help_and_exit() -> ! {
+    let bin = env::args_os()
+        .next()
+        .and_then(|p| PathBuf::from(p).file_name().map(|n| n.to_owned()))
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "cf".to_string());
+
+    let mut top = Cli::command()
+        .subcommand_required(false)
+        .override_usage(format!(
+            "{bin} [GLOBAL_OPTIONS] <COMMAND>\n       {bin} -f <program.md> [APPLY_OPTIONS]"
+        ));
+    top = top.after_help(
+        "Mode guide:\n  GLOBAL_OPTIONS: -h, --help, -V, --version\n  APPLY_OPTIONS: shown in the 'Default apply mode' section below",
+    );
+
+    if let Err(err) = top.print_long_help() {
+        eprintln!("error: failed rendering help: {err}");
+        std::process::exit(2);
+    }
+
+    if let Some(mut apply) = Cli::command().find_subcommand("apply").cloned() {
+        println!();
+        println!();
+        println!("Default apply mode (used by `cf -f ...` and by explicit `cf apply ...`):");
+        apply = apply.override_usage(format!(
+            "{bin} -f <program.md> [APPLY_OPTIONS]\n       {bin} apply -f <program.md> [APPLY_OPTIONS]"
+        ));
+        if let Err(err) = apply.print_long_help() {
+            eprintln!("error: failed rendering apply help: {err}");
+            std::process::exit(2);
+        }
+    }
+
+    println!();
+    std::process::exit(0);
+}
+
+fn should_infer_apply_subcommand(args: &[OsString]) -> bool {
+    let Some(first) = args.get(1).map(|s| s.to_string_lossy()) else {
+        return false;
+    };
+
+    // Keep explicit top-level command/help/version behavior unchanged.
+    if matches!(
+        first.as_ref(),
+        "apply" | "reset" | "help" | "-h" | "--help" | "-V" | "--version"
+    ) {
+        return false;
+    }
+
+    // Treat no-subcommand flag-based invocations like `cf -f ...` as `cf apply -f ...`.
+    first.starts_with('-')
 }
 
 fn run_history_reset(program: Option<String>, all: bool, yes: bool) -> Result<()> {
@@ -796,5 +870,55 @@ mod tests {
     fn parse_apply_variables_rejects_invalid_name() {
         let err = parse_apply_variables(&["BAD-NAME=x".to_string()]).expect_err("must fail");
         assert!(format!("{:#}", err).contains("NAME must match"));
+    }
+
+    #[test]
+    fn infer_apply_subcommand_for_flag_first_invocation() {
+        let args = vec![
+            OsString::from("cf"),
+            OsString::from("-f"),
+            OsString::from("examples/smoke.md"),
+        ];
+        assert!(should_infer_apply_subcommand(&args));
+    }
+
+    #[test]
+    fn does_not_infer_apply_for_explicit_subcommand() {
+        let args = vec![
+            OsString::from("cf"),
+            OsString::from("reset"),
+            OsString::from("--all"),
+        ];
+        assert!(!should_infer_apply_subcommand(&args));
+    }
+
+    #[test]
+    fn does_not_infer_apply_for_help_flags() {
+        for flag in ["-h", "--help"] {
+            let args = vec![OsString::from("cf"), OsString::from(flag)];
+            assert!(!should_infer_apply_subcommand(&args));
+        }
+    }
+
+    #[test]
+    fn does_not_infer_apply_for_version_flags() {
+        for flag in ["-V", "--version"] {
+            let args = vec![OsString::from("cf"), OsString::from(flag)];
+            assert!(!should_infer_apply_subcommand(&args));
+        }
+    }
+
+    #[test]
+    fn show_combined_help_for_help_flags() {
+        for flag in ["-h", "--help"] {
+            let args = vec![OsString::from("cf"), OsString::from(flag)];
+            assert!(should_show_combined_help(&args));
+        }
+    }
+
+    #[test]
+    fn do_not_show_combined_help_for_help_subcommand() {
+        let args = vec![OsString::from("cf"), OsString::from("help")];
+        assert!(!should_show_combined_help(&args));
     }
 }
