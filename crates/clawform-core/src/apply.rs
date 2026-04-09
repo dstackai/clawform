@@ -2396,12 +2396,7 @@ fn print_plan_preview(plan: &SharedPlanData, debug: bool, workspace_root: &Path)
                     "💬"
                 };
                 let msg_link = format_msg_link(workspace_root, &output_hint, use_color);
-                println!(
-                    "  {} {} | {}",
-                    icon,
-                    summary_line,
-                    msg_link
-                );
+                println!("  {} {} | {}", icon, summary_line, msg_link);
             }
         }
 

@@ -88,6 +88,8 @@ Installed binary equivalents:
 
 ```bash
 clawform apply -f examples/smoke.md
+cf -f examples/smoke.md
+# explicit equivalent
 cf apply -f examples/smoke.md
 ```
 

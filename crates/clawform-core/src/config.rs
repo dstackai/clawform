@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -8,7 +9,10 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
-    clawform: ToolConfig,
+    #[serde(default)]
+    clawform: Option<ToolConfig>,
+    #[serde(default)]
+    claudeform: Option<ToolConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,14 +40,51 @@ pub struct ResolvedProvider {
 }
 
 pub fn load_config(workspace_root: &Path) -> Result<ToolConfig> {
-    let path = workspace_root.join(".clawform/config.json");
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed reading config file {}", path.display()))?;
+    let primary_path = workspace_root.join(".clawform/config.json");
+    let legacy_path = workspace_root.join(".claudeform/config.json");
+    let (path, raw) = match fs::read_to_string(&primary_path) {
+        Ok(raw) => (primary_path, raw),
+        Err(primary_err) if primary_err.kind() == ErrorKind::NotFound => {
+            match fs::read_to_string(&legacy_path) {
+                Ok(raw) => (legacy_path, raw),
+                Err(legacy_err) if legacy_err.kind() == ErrorKind::NotFound => {
+                    return Err(primary_err).with_context(|| {
+                        format!("failed reading config file {}", primary_path.display())
+                    });
+                }
+                Err(legacy_err) => {
+                    return Err(legacy_err).with_context(|| {
+                        format!("failed reading config file {}", legacy_path.display())
+                    });
+                }
+            }
+        }
+        Err(primary_err) => {
+            return Err(primary_err)
+                .with_context(|| format!("failed reading config file {}", primary_path.display()));
+        }
+    };
     let parsed: ConfigFile = serde_json::from_str(&raw)
         .with_context(|| format!("invalid JSON in {}", path.display()))?;
+    let config = parsed.into_tool_config()?;
 
-    parsed.clawform.validate()?;
-    Ok(parsed.clawform)
+    config.validate()?;
+    Ok(config)
+}
+
+impl ConfigFile {
+    fn into_tool_config(self) -> Result<ToolConfig> {
+        match (self.clawform, self.claudeform) {
+            (Some(cfg), None) => Ok(cfg),
+            (None, Some(cfg)) => Ok(cfg),
+            (Some(_), Some(_)) => bail!(
+                ".clawform/config.json cannot define both 'clawform' and legacy 'claudeform' keys"
+            ),
+            (None, None) => {
+                bail!(".clawform/config.json must define 'clawform' (or legacy 'claudeform')")
+            }
+        }
+    }
 }
 
 impl ToolConfig {
@@ -105,7 +146,7 @@ mod tests {
 
     fn parse_tool_config(s: &str) -> anyhow::Result<ToolConfig> {
         let parsed: ConfigFile = serde_json::from_str(s)?;
-        Ok(parsed.clawform)
+        parsed.into_tool_config()
     }
 
     #[test]
@@ -155,5 +196,63 @@ mod tests {
         .unwrap();
 
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_legacy_claudeform_key() {
+        let cfg = parse_tool_config(
+            r#"{
+              "claudeform": {
+                "providers": {
+                  "codex": {"type":"codex", "default": true}
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn fails_when_both_current_and_legacy_keys_present() {
+        let err = parse_tool_config(
+            r#"{
+              "clawform": {
+                "providers": {
+                  "codex_a": {"type":"codex", "default": true}
+                }
+              },
+              "claudeform": {
+                "providers": {
+                  "codex_b": {"type":"codex", "default": true}
+                }
+              }
+            }"#,
+        )
+        .expect_err("must fail");
+
+        assert!(format!("{:#}", err).contains("cannot define both"));
+    }
+
+    #[test]
+    fn loads_legacy_config_path_when_new_path_is_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let legacy_dir = tmp.path().join(".claudeform");
+        std::fs::create_dir_all(&legacy_dir).expect("create legacy dir");
+        std::fs::write(
+            legacy_dir.join("config.json"),
+            r#"{
+              "claudeform": {
+                "providers": {
+                  "codex": {"type":"codex", "default": true}
+                }
+              }
+            }"#,
+        )
+        .expect("write legacy config");
+
+        let cfg = load_config(tmp.path()).expect("load legacy config");
+        assert!(cfg.providers.contains_key("codex"));
     }
 }

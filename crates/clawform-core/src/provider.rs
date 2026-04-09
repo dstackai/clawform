@@ -3065,8 +3065,7 @@ mod tests {
                 item_type: "command_execution".to_string(),
                 item_id: Some("x".to_string()),
                 summary: Some(
-                    "write .clawform/programs/release-notes/reports/agent_result.json"
-                        .to_string(),
+                    "write .clawform/programs/release-notes/reports/agent_result.json".to_string(),
                 ),
             },
             true,

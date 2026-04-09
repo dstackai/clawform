@@ -2,9 +2,7 @@
 
 Clawform executes agentic programs from markdown files.
 
-You keep instructions in repo files, run `cf apply -f <program.md>`, and Clawform executes the program with an agent while preserving session context in local state. This gives you a file-based workflow outside chat UI and reduces dependence on proprietary interfaces.
-
-Yes, it is called Clawform. Yes, Codex is the first supported provider. Claude support is on the way.
+You keep instructions in repo files, run `cf -f <program.md>` (equivalent to `cf apply -f <program.md>`), and Clawform executes the program with an agent while preserving session context in local state. This gives you a file-based workflow outside chat UI and reduces dependence on proprietary interfaces.
 
 ## Why It Exists
 
@@ -26,7 +24,7 @@ Program frontmatter:
 
 ## How `apply` Works
 
-`cf apply -f <program.md>` runs one **session** for one program.
+`cf -f <program.md>` runs one **session** for one program.
 
 Before execution, Clawform previews:
 
@@ -79,13 +77,13 @@ CLAWFORM_VERSION=v0.0.5 curl -fsSL https://raw.githubusercontent.com/dstackai/cl
 2. Run:
 
 ```bash
-cf apply -f examples/smoke.md
+cf -f examples/smoke.md
 ```
 
 Override a program variable for one run:
 
 ```bash
-cf apply -f examples/smoke.md --var SMOKE_VALUE=YU
+cf -f examples/smoke.md --var SMOKE_VALUE=YU
 ```
 
 The confirmation preview includes a variables summary, for example: `variables: 1 value changed, 0 added, 0 removed`.
@@ -95,7 +93,7 @@ Program variables are defined in frontmatter under `variables` (`NAME: {}` for r
 Example output (will vary by session/model):
 
 ```text
-cf apply -f examples/smoke.md
+cf -f examples/smoke.md
 Last session: 019d5843-eb2d-70b1-b49a-343033117944 (success, 43m ago)
   program: examples/smoke.md unchanged
   changes: 0 files
@@ -121,6 +119,7 @@ Session folders include prompt, plan metadata, streamed events, provider stdout/
 ## Commands
 
 ```bash
+cf -f <program.md>
 cf apply -f <program.md>
 ```
 
