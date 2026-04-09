@@ -6,7 +6,7 @@ INSTALL_DIR="${CLAWFORM_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${CLAWFORM_VERSION:-latest}"
 
 usage() {
-  cat <<'EOF'
+  cat <<'EOUSAGE'
 Clawform installer
 
 Usage:
@@ -20,7 +20,7 @@ Environment overrides:
 Examples:
   curl -fsSL https://raw.githubusercontent.com/dstackai/clawform/main/install.sh | sh
   CLAWFORM_VERSION=v0.2.0-rc.1 curl -fsSL https://raw.githubusercontent.com/dstackai/clawform/main/install.sh | sh
-EOF
+EOUSAGE
 }
 
 while [ "$#" -gt 0 ]; do
@@ -132,8 +132,10 @@ else
 fi
 
 asset="clawform_${os}_${arch}.tar.gz"
+legacy_asset="claudeform_${os}_${arch}.tar.gz"
 base_url="https://github.com/${REPO}/releases/download/${tag}"
 asset_url="${base_url}/${asset}"
+legacy_asset_url="${base_url}/${legacy_asset}"
 checksums_url="${base_url}/SHA256SUMS"
 
 tmp_dir="$(mktemp -d)"
@@ -143,27 +145,42 @@ echo "Installing Clawform ${tag} from ${REPO}"
 echo "Detected target: ${os}/${arch}"
 echo "Downloading: ${asset}"
 
-curl -fL "$asset_url" -o "${tmp_dir}/${asset}"
+downloaded_asset="$asset"
+if ! curl -fL "$asset_url" -o "${tmp_dir}/${asset}"; then
+  echo "Primary asset not found; trying legacy artifact name: ${legacy_asset}"
+  curl -fL "$legacy_asset_url" -o "${tmp_dir}/${legacy_asset}"
+  downloaded_asset="$legacy_asset"
+fi
 curl -fL "$checksums_url" -o "${tmp_dir}/SHA256SUMS"
 
-expected="$(awk -v n="$asset" '$2 == n {print $1}' "${tmp_dir}/SHA256SUMS" | head -n 1)"
+expected="$(awk -v n="$downloaded_asset" '$2 == n {print $1}' "${tmp_dir}/SHA256SUMS" | head -n 1)"
 if [ -z "$expected" ]; then
-  echo "error: checksum for ${asset} not found in SHA256SUMS" >&2
+  echo "error: checksum for ${downloaded_asset} not found in SHA256SUMS" >&2
   exit 1
 fi
 
-actual="$(sha256_file "${tmp_dir}/${asset}")"
+actual="$(sha256_file "${tmp_dir}/${downloaded_asset}")"
 if [ "$expected" != "$actual" ]; then
-  echo "error: checksum mismatch for ${asset}" >&2
+  echo "error: checksum mismatch for ${downloaded_asset}" >&2
   echo "expected: $expected" >&2
   echo "actual:   $actual" >&2
   exit 1
 fi
 
 mkdir -p "$INSTALL_DIR"
-tar -xzf "${tmp_dir}/${asset}" -C "$tmp_dir"
+tar -xzf "${tmp_dir}/${downloaded_asset}" -C "$tmp_dir"
 
-install -m 0755 "${tmp_dir}/clawform" "${INSTALL_DIR}/clawform"
+binary_src="${tmp_dir}/clawform"
+if [ ! -f "$binary_src" ]; then
+  binary_src="${tmp_dir}/claudeform"
+fi
+
+if [ ! -f "$binary_src" ]; then
+  echo "error: archive did not contain a clawform or claudeform binary" >&2
+  exit 1
+fi
+
+install -m 0755 "$binary_src" "${INSTALL_DIR}/clawform"
 install -m 0755 "${tmp_dir}/cf" "${INSTALL_DIR}/cf"
 
 echo "Installed:"
