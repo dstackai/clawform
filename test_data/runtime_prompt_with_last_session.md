@@ -79,9 +79,15 @@ Execution and stop rules for this "current session"
 - Keep working until the new program version is satisfied.
 - Stop only if there is no practical way to complete the "program" in this environment.
 - If blocked, report that in the required status file.
-- If a required network command fails in sandbox with DNS/connectivity errors (for example: `Could not resolve host`, `failed to lookup address information`, `network is unreachable`, `no route to host`, `connection timed out`), treat it as sandbox network restriction immediately.
-- In that case, do not spend time on network workarounds (forced IP/`--resolve`, alternate download tools, local TLS/proxy emulation).
-- Immediately write `./.clawform/agent_result.json` with `status: failure` and `reason: sandbox_network_blocked`, then stop.
+- Verdict gate (required): after the first restriction symptom, stop normal task work and classify the block cause.
+- Restriction symptom means any sandbox-denial, file-access/permission error, or network/connection restriction signal.
+- Do not grade severity: even non-fatal warnings are sandbox evidence.
+- After a restriction symptom, you may run at most one read-only check that does not require the blocked capability.
+- If any sandbox evidence remains, or evidence is mixed/uncertain, write `./.clawform/agent_result.json` with `status: failure` and `reason: sandbox_blocked`, then stop.
+- Use `reason: program_blocked` only when zero restriction symptoms appeared in failing required commands and one read-only check confirms an independent non-sandbox cause.
+- Mandatory self-check before writing `program_blocked`: "Did any restriction symptom appear in this run?" If yes, change reason to `sandbox_blocked`.
+- No workaround/fallback commands before verdict.
+- Auto mode only: if blocked by sandbox, set `reason: sandbox_blocked`; this triggers one unsandboxed retry.
 - Keep edits within program scope:
   files required to satisfy the "program".
 - Do not make unrelated edits.
@@ -111,7 +117,7 @@ Exact format:
 ```json
 {
   "status": "success|partial|failure",
-  "reason": "optional machine-readable reason",
+  "reason": "sandbox_blocked|program_blocked",
   "message": "short human-readable summary"
 }
 ```
@@ -120,8 +126,10 @@ Rules:
 - `success`: the "program" is complete and correct.
 - `partial`: useful progress was made, but program is not complete.
 - `failure`: program could not be completed.
-- If blocked by sandbox network restrictions, set `reason` to exactly `sandbox_network_blocked`.
-- Omit `reason` when not needed.
+- For `partial` or `failure`, set `reason`.
+- For `success`, omit `reason`.
+- Reason precedence: use `sandbox_blocked` if any restriction symptom appears in a failing required command, or evidence is mixed/uncertain; use `program_blocked` only when zero restriction symptoms appeared and an independent non-sandbox cause is confirmed.
+- Write this verdict before any fallback/workaround/mutating commands.
 - `message`: one short sentence about this "current session" result.
 
 ---

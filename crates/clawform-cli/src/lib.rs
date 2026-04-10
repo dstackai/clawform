@@ -1,18 +1,23 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
+use serde_json::Value;
 
+#[cfg(test)]
+use clawform_core::AgentReason;
 use clawform_core::{
     reset_history, run_apply, AgentResult, AgentStatus, ApplyRequest, CodexRunner, FileResult,
     HistoryResetTarget, ProviderRunner, ProviderUsage, SandboxMode,
 };
 
 const MAX_REPORTED_FILES_DISPLAY: usize = 20;
+const AGENT_RESULT_REL: &str = ".clawform/agent_result.json";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliSandboxMode {
@@ -206,7 +211,7 @@ fn real_main() -> Result<()> {
 
             let result = match run_apply(
                 &ApplyRequest {
-                    workspace_root,
+                    workspace_root: workspace_root.clone(),
                     program_path: file,
                     program_variables,
                     confirm,
@@ -222,7 +227,10 @@ fn real_main() -> Result<()> {
                 &runner,
             ) {
                 Ok(result) => result,
-                Err(err) => return Err(err),
+                Err(err) => {
+                    maybe_print_agent_status_from_result_file(&workspace_root);
+                    return Err(err);
+                }
             };
 
             match result.provider_result {
@@ -520,46 +528,44 @@ fn print_agent_status_line(agent_result: Option<&AgentResult>, use_color: bool) 
         return;
     };
 
-    if agent_result.status == AgentStatus::Success {
-        return;
-    }
+    let result_suffix = render_result_suffix(Path::new(AGENT_RESULT_REL), use_color);
+    println!(
+        "{}",
+        format_agent_status_line(agent_result, use_color, &result_suffix)
+    );
+}
 
-    let (label, icon) = match agent_result.status {
-        AgentStatus::Success => {
-            if use_color {
-                ("\x1b[32msuccess\x1b[0m", "\x1b[32m◎\x1b[0m")
-            } else {
-                ("success", "◎")
-            }
+fn format_agent_status_line(
+    agent_result: &AgentResult,
+    use_color: bool,
+    result_suffix: &str,
+) -> String {
+    let badge = format_agent_status_badge(agent_result.status.clone(), use_color);
+    let reason_suffix = agent_result
+        .reason
+        .map(|reason| reason.as_str().to_string());
+    let message_suffix = agent_result.message.as_deref().and_then(|message| {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(truncate_one_line(trimmed, 120))
         }
-        AgentStatus::Partial => {
-            if use_color {
-                ("\x1b[33mpartial\x1b[0m", "\x1b[33m◐\x1b[0m")
-            } else {
-                ("partial", "◐")
-            }
-        }
-        AgentStatus::Failure => {
-            if use_color {
-                ("\x1b[31mfailure\x1b[0m", "\x1b[31m✖\x1b[0m")
-            } else {
-                ("failure", "✖")
-            }
-        }
-    };
-    match agent_result.message.as_deref() {
-        Some(message) if !message.trim().is_empty() => {
-            println!(
-                "{} agent {} | {}",
-                icon,
-                label,
-                truncate_one_line(message, 120)
-            );
-        }
-        _ => {
-            println!("{} agent {}", icon, label);
-        }
+    });
+
+    let mut parts = vec![badge.to_string()];
+    if let Some(reason) = reason_suffix {
+        parts.push(reason);
     }
+    if let Some(message) = message_suffix {
+        parts.push(message);
+    }
+    let mut line = parts.join(" ");
+    if !result_suffix.trim().is_empty() {
+        line.push_str(status_file_separator(use_color));
+        line.push_str(result_suffix);
+    }
+    line
 }
 
 fn print_agent_summary_line(summary: Option<&str>, artifact_rel: Option<&str>, use_color: bool) {
@@ -573,20 +579,89 @@ fn print_agent_summary_line(summary: Option<&str>, artifact_rel: Option<&str>, u
         "💬"
     };
 
+    let sep = if use_color {
+        " \x1b[2m|\x1b[0m "
+    } else {
+        " | "
+    };
     let suffix = artifact_rel.map(|rel| {
         if supports_terminal_hyperlinks() {
             match terminal_link(Path::new(rel), "msg") {
-                Some(link) => format!(" | {}", link),
-                None => " | msg".to_string(),
+                Some(link) => format!("{}{}", sep, style_short_link_token(&link, use_color)),
+                None => format!("{}{}", sep, style_short_link_token("msg", use_color)),
             }
         } else {
-            format!(" | msg={}", rel)
+            if use_color {
+                format!("{}\x1b[95mmsg\x1b[0m={}", sep, rel)
+            } else {
+                format!("{}msg={}", sep, rel)
+            }
         }
     });
 
     match suffix {
         Some(s) => println!("{} {}{}", icon, one_line, s),
         None => println!("{} {}", icon, one_line),
+    }
+}
+
+fn maybe_print_agent_status_from_result_file(workspace_root: &Path) {
+    let path = workspace_root.join(AGENT_RESULT_REL);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(_) => return,
+    };
+    let parsed: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let status = parsed
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(status) = status else {
+        return;
+    };
+
+    let reason = parsed
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let message = parsed
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let use_color = std::io::stderr().is_terminal() && std::io::stdout().is_terminal();
+    let mut parts = vec![if let Some(status) = parse_agent_status(status) {
+        format_agent_status_badge(status, use_color)
+    } else {
+        format!("• {}", status)
+    }];
+    if let Some(reason) = reason {
+        parts.push(reason.to_string());
+    }
+    if let Some(message) = message {
+        parts.push(truncate_one_line(message, 120));
+    }
+    let mut line = parts.join(" ");
+    let result_suffix = render_result_suffix(&path, use_color);
+    if !result_suffix.trim().is_empty() {
+        line.push_str(status_file_separator(use_color));
+        line.push_str(&result_suffix);
+    }
+    eprintln!("{}", line);
+}
+
+fn status_file_separator(use_color: bool) -> &'static str {
+    if use_color {
+        " \x1b[2m|\x1b[0m "
+    } else {
+        " | "
     }
 }
 
@@ -744,6 +819,76 @@ fn terminal_link(path: &Path, label: &str) -> Option<String> {
     Some(format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", file_url, label))
 }
 
+fn render_result_suffix(path: &Path, use_color: bool) -> String {
+    render_result_suffix_with_hyperlinks(path, use_color, supports_terminal_hyperlinks())
+}
+
+fn render_result_suffix_with_hyperlinks(
+    path: &Path,
+    use_color: bool,
+    supports_hyperlinks: bool,
+) -> String {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .ok()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|| path.to_path_buf())
+    };
+    let label = if supports_hyperlinks {
+        match terminal_link(&abs, "file") {
+            Some(link) => link,
+            None => "file".to_string(),
+        }
+    } else {
+        "file".to_string()
+    };
+
+    style_short_link_token(&label, use_color)
+}
+
+fn style_short_link_token(token: &str, use_color: bool) -> String {
+    if use_color {
+        format!("\x1b[95m{}\x1b[0m", token)
+    } else {
+        token.to_string()
+    }
+}
+
+fn format_agent_status_badge(status: AgentStatus, use_color: bool) -> String {
+    let (icon, label, color_code) = match status {
+        AgentStatus::Success => ("✅", None, "32"),
+        AgentStatus::Partial => ("🟡", Some("partial"), "33"),
+        AgentStatus::Failure => ("❌", Some("failed"), "31"),
+    };
+    let styled_icon = if use_color {
+        format!("\x1b[{}m{}\x1b[0m", color_code, icon)
+    } else {
+        icon.to_string()
+    };
+    match label {
+        Some(label) => {
+            let styled_label = if use_color {
+                format!("\x1b[{}m{}\x1b[0m", color_code, label)
+            } else {
+                label.to_string()
+            };
+            format!("{} {}", styled_icon, styled_label)
+        }
+        None => styled_icon,
+    }
+}
+
+fn parse_agent_status(value: &str) -> Option<AgentStatus> {
+    match value {
+        "success" => Some(AgentStatus::Success),
+        "partial" => Some(AgentStatus::Partial),
+        "failure" => Some(AgentStatus::Failure),
+        _ => None,
+    }
+}
+
 fn percent_encode_path(path: &Path) -> String {
     let raw = path.to_string_lossy();
     let mut out = String::with_capacity(raw.len() + 8);
@@ -879,5 +1024,50 @@ mod tests {
     fn do_not_show_combined_help_for_help_subcommand() {
         let args = vec![OsString::from("cf"), OsString::from("help")];
         assert!(!should_show_combined_help(&args));
+    }
+
+    #[test]
+    fn print_agent_status_line_includes_reason_and_result_path() {
+        let result = AgentResult {
+            status: AgentStatus::Failure,
+            reason: Some(AgentReason::ProgramBlocked),
+            message: Some("failed to connect".to_string()),
+        };
+
+        let line = format_agent_status_line(&result, false, "file");
+        assert!(line.contains("❌ failed"));
+        assert!(line.contains("program_blocked"));
+        assert!(line.contains(" | file"));
+        assert!(line.contains("failed to connect"));
+    }
+
+    #[test]
+    fn print_agent_status_line_includes_success_status() {
+        let result = AgentResult {
+            status: AgentStatus::Success,
+            reason: None,
+            message: Some("ok".to_string()),
+        };
+
+        let line = format_agent_status_line(&result, false, "file");
+        assert!(line.contains("✅"));
+        assert!(!line.contains("done"));
+        assert!(line.ends_with(" | file"));
+    }
+
+    #[test]
+    fn render_result_suffix_colors_file_label_without_hyperlink() {
+        let suffix = render_result_suffix_with_hyperlinks(
+            Path::new(".clawform/agent_result.json"),
+            true,
+            false,
+        );
+        assert_eq!(suffix, "\x1b[95mfile\x1b[0m");
+    }
+
+    #[test]
+    fn style_short_link_token_uses_pink() {
+        assert_eq!(style_short_link_token("msg", true), "\x1b[95mmsg\x1b[0m");
+        assert_eq!(style_short_link_token("file", true), "\x1b[95mfile\x1b[0m");
     }
 }

@@ -87,13 +87,15 @@ Variable rules:
    - program diff vs last session snapshot (if available)
    - variable diff vs last session variable snapshot (if available)
 5. Ask for confirmation (interactive default; skipped by `--yes`).
-6. Write runtime variables file (`.clawform/agent_variables.json`) when variables are present.
-7. Run provider in the current workspace (no temp workspace copy).
-8. Stream provider events to terminal; during the run write session `commands/*` and `messages/*` for clickable `out`/`msg` links.
-9. Read agent status from `.clawform/agent_result.json` (required).
-10. Collect reported changed files from `.clawform/agent_outputs.json` when that file exists and was updated in this run.
-11. Persist run-end records (`output.md`, `outcome.json`) and append `.clawform/history/index.jsonl`.
-12. Persist program snapshot (`program.md`) and variable snapshot (`variables.json`) on success.
+6. Clear prior run protocol files in `.clawform/` and write runtime variables file (`.clawform/agent_variables.json`) when variables are present.
+7. Build runtime prompt; in sandboxed modes (`sandboxed`/`auto`) include explicit verdict-gate rules for sandbox-vs-program blocking.
+8. Run provider in the current workspace (no temp workspace copy).
+9. Stream provider events to terminal; during the run write session `commands/*` and `messages/*`.
+10. In `auto` sandbox mode, allow at most one unsandboxed retry only when current-run `.clawform/agent_result.json` reports `status=partial|failure` and `reason=sandbox_blocked` (no stdout/stderr heuristic fallback).
+11. Read agent status from `.clawform/agent_result.json` (required) and validate strict status/reason schema.
+12. Collect reported changed files from `.clawform/agent_outputs.json` when that file exists and was updated in this run.
+13. Persist run-end records (`output.md`, `outcome.json`) and append `.clawform/history/index.jsonl`.
+14. Persist program snapshot (`program.md`) and variable snapshot (`variables.json`) on success.
 
 ## 5) State and Storage Layout
 
@@ -119,7 +121,7 @@ Path aliases used in this section:
 During the current run:
 
 - Write `<protocol_root>/agent_variables.json` (when variables exist); the agent reads this file for resolved `${{ var.NAME }}` values.
-- Write `<session_root>/commands/*` and `<session_root>/messages/*` for clickable `out`/`msg` links in live progress output.
+- Write `<session_root>/commands/*` and `<session_root>/messages/*` as per-session execution artifacts.
 - Read `<protocol_root>/agent_result.json`, `<protocol_root>/agent_outputs.json`, and optional `<protocol_root>/agent_output.md` at run end to determine status, changed files, and summary.
 
 On the next run of the same program:
@@ -138,11 +140,11 @@ For audit/debug visibility:
 | Data path | Scope | Why we store it | When it is used |
 |---|---|---|---|
 | `<protocol_root>/agent_variables.json` | Workspace-global scratch file for the currently running apply (overwritten on each apply) | Provide resolved runtime variables to the agent | Read by the agent during that same apply run |
-| `<protocol_root>/agent_result.json` | Workspace-global scratch file for the currently running apply (overwritten on each apply) | Receive final structured run status (`success/partial/failure`) and short reason/message from the agent | Read by Clawform at run end (and sandbox-retry logic), only if file mtime is from this run |
+| `<protocol_root>/agent_result.json` | Workspace-global scratch file for the currently running apply (overwritten on each apply) | Receive final structured run verdict (`status`, optional `reason`, `message`) where `reason` is strict enum (`sandbox_blocked` or `program_blocked`) | Read by Clawform at run end; in sandbox auto mode also used as the only retry signal source, only if file mtime is from this run |
 | `<protocol_root>/agent_outputs.json` | Workspace-global scratch file for the currently running apply (overwritten on each apply) | Receive changed-file list from the agent | Read by Clawform at run end for file summary/history, only if file mtime is from this run |
 | `<protocol_root>/agent_output.md` | Workspace-global scratch file for the currently running apply (optional; overwritten on each apply) | Receive agent-written summary text | Read by Clawform at run end; then copied into session `output.md` |
-| `<session_root>/commands/*.txt` | Per-session (`<program_id>/<session_id>`) | Preserve command output behind clickable `out` links | Used immediately in terminal progress output |
-| `<session_root>/messages/*.md` | Per-session (`<program_id>/<session_id>`) | Preserve assistant/message output behind clickable `msg` links | Used immediately in terminal progress output; also fallback summary source |
+| `<session_root>/commands/*.txt` | Per-session (`<program_id>/<session_id>`) | Preserve command output artifacts for this session | Used for progress drilldown and debugging |
+| `<session_root>/messages/*.md` | Per-session (`<program_id>/<session_id>`) | Preserve assistant/message artifacts for this session | Used for progress drilldown and fallback summary source |
 | `<session_root>/output.md` | Per-session (`<program_id>/<session_id>`) | Store stable summary artifact for this session | Used on next run of same `program_id` for preview/prompt reference |
 | `<session_root>/program.md` | Per-session (`<program_id>/<session_id>`) | Snapshot program text that produced this session | Used on next run of same `program_id` to compute program diff |
 | `<session_root>/variables.json` | Per-session (`<program_id>/<session_id>`) | Snapshot resolved variables for this session | Used on next run of same `program_id` to compute variables diff |
@@ -153,6 +155,7 @@ Compatibility behavior:
 
 - No read fallback is used for `agent_summary.md` or `events.ndjson`.
 - Current apply reads only the current protocol files documented in this section.
+- Sandbox auto-retry does not parse provider stdout/stderr for sandbox heuristics; it only trusts current-run `agent_result.json`.
 
 Current limitation:
 
@@ -168,6 +171,43 @@ Current apply does not persist:
 - `plan.json`
 - provider stdout/stderr artifact logs
 - canonical `events.ndjson` for new sessions
+
+## 5.4 Agent Result Protocol Rules
+
+Protocol file: `<protocol_root>/agent_result.json`
+
+Expected shape:
+
+```json
+{
+  "status": "success|partial|failure",
+  "reason": "sandbox_blocked|program_blocked",
+  "message": "short human-readable summary"
+}
+```
+
+Rules:
+
+1. `status` is required and strict enum: `success | partial | failure`.
+2. `reason` is strict enum: `sandbox_blocked | program_blocked`.
+3. `reason` is required for `partial` and `failure`; omitted for `success`.
+4. Unknown `reason` values are rejected when Clawform parses `agent_result.json`.
+5. In sandboxed modes (`sandboxed`/`auto`), runtime prompt enforces verdict gate semantics:
+   - first restriction symptom triggers block-cause classification
+   - any sandbox evidence (including non-fatal permission/network warnings), mixed evidence, or uncertainty => `reason: sandbox_blocked`
+   - `reason: program_blocked` only when zero restriction symptoms appeared and one read-only check confirms an independent non-sandbox cause
+   - no workaround/fallback commands before writing the verdict
+
+## 5.5 Auto Sandbox Retry and Progress Output
+
+Applies only when sandbox mode is `auto`:
+
+1. First pass runs sandboxed.
+2. One unsandboxed retry is allowed only when current-run `agent_result.json` reports:
+   - `status` in `partial|failure`
+   - `reason: sandbox_blocked`
+3. No retry is triggered from command-output text heuristics.
+4. When retry is triggered, Clawform emits a retry-decision progress line and then launches one unsandboxed attempt.
 
 ## 6) Known Bugs
 

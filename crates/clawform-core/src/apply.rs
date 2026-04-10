@@ -70,7 +70,6 @@ pub struct ApplyResult {
 pub enum AgentStatus {
     Success,
     Partial,
-    #[serde(alias = "failed", alias = "blocked")]
     Failure,
 }
 
@@ -84,10 +83,26 @@ impl AgentStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentReason {
+    SandboxBlocked,
+    ProgramBlocked,
+}
+
+impl AgentReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SandboxBlocked => "sandbox_blocked",
+            Self::ProgramBlocked => "program_blocked",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentResult {
     pub status: AgentStatus,
-    pub reason: Option<String>,
+    pub reason: Option<AgentReason>,
     pub message: Option<String>,
 }
 
@@ -95,7 +110,7 @@ pub struct AgentResult {
 struct AgentResultFile {
     status: AgentStatus,
     #[serde(default)]
-    reason: Option<String>,
+    reason: Option<AgentReason>,
     #[serde(default)]
     message: Option<String>,
 }
@@ -296,7 +311,7 @@ fn execute_apply<R: ProviderRunner>(
     let history_injected_failure = history_context.last_failure.is_some();
 
     sync_runtime_variables_input(&request.workspace_root, &context.program_variables)?;
-    let prompt = build_runtime_prompt(&context.program_raw, &plan_data)?;
+    let prompt = build_runtime_prompt(&context.program_raw, &plan_data, request.sandbox_mode)?;
 
     let run_result = match runner.run(&ProviderRequest {
         workspace_root: request.workspace_root.clone(),
@@ -667,25 +682,50 @@ fn validate_agent_completion(agent_result: &Option<AgentResult>) -> Result<()> {
         .ok_or_else(|| anyhow!("missing required '{}'", AGENT_RESULT_REL))?;
 
     match result.status {
-        AgentStatus::Success => Ok(()),
+        AgentStatus::Success => {
+            if result.reason.is_some() {
+                return Err(anyhow!(
+                    "invalid '{}' content: status=success must omit reason",
+                    AGENT_RESULT_REL
+                ));
+            }
+            return Ok(());
+        }
+        AgentStatus::Partial | AgentStatus::Failure => {}
+    }
+
+    let reason = result.reason.ok_or_else(|| {
+        anyhow!(
+            "invalid '{}' content: status={} requires reason",
+            AGENT_RESULT_REL,
+            result.status.as_str()
+        )
+    })?;
+    let mut details = String::new();
+    details.push_str("reason=");
+    details.push_str(reason.as_str());
+    details.push_str("; ");
+    details.push_str(
+        result
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .unwrap_or("no message provided"),
+    );
+
+    match result.status {
         AgentStatus::Partial => Err(anyhow!(
             "agent reported partial completion in '{}': {}",
             AGENT_RESULT_REL,
-            result
-                .message
-                .as_deref()
-                .filter(|m| !m.trim().is_empty())
-                .unwrap_or("no message provided")
+            details
         )),
         AgentStatus::Failure => Err(anyhow!(
             "agent reported failure in '{}': {}",
             AGENT_RESULT_REL,
-            result
-                .message
-                .as_deref()
-                .filter(|m| !m.trim().is_empty())
-                .unwrap_or("no message provided")
+            details
         )),
+        AgentStatus::Success => Ok(()),
     }
 }
 
@@ -1027,12 +1067,19 @@ fn truncate_chars(raw: &str, max: usize) -> String {
     out
 }
 
-fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Result<String> {
+fn build_runtime_prompt(
+    _program_raw: &str,
+    plan_data: &SharedPlanData,
+    sandbox_mode: SandboxMode,
+) -> Result<String> {
     let mut block = String::new();
     let program_file = plan_data.program_file.as_str();
     let program_id = plan_data.program_id.as_str();
     let program_dir = sanitize_storage_token(program_id, "program");
     let program_variables = plan_data.program_variables.as_ref();
+    let sandbox_verdict_guidance_enabled =
+        matches!(sandbox_mode, SandboxMode::Sandboxed | SandboxMode::Auto);
+    let sandbox_auto_retry_enabled = matches!(sandbox_mode, SandboxMode::Auto);
 
     if let Some(last) = &plan_data.last_session {
         let session_id_raw = last
@@ -1197,13 +1244,31 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
             "- Stop only if there is no practical way to complete the \"program\" in this environment.\n",
         );
         block.push_str("- If blocked, report that in the required status file.\n");
-        block.push_str("- If a required network command fails in sandbox with DNS/connectivity errors (for example: `Could not resolve host`, `failed to lookup address information`, `network is unreachable`, `no route to host`, `connection timed out`), treat it as sandbox network restriction immediately.\n");
-        block.push_str("- In that case, do not spend time on network workarounds (forced IP/`--resolve`, alternate download tools, local TLS/proxy emulation).\n");
-        block.push_str("- Immediately write `./");
-        block.push_str(AGENT_RESULT_REL);
-        block.push_str(
-            "` with `status: failure` and `reason: sandbox_network_blocked`, then stop.\n",
-        );
+        if sandbox_verdict_guidance_enabled {
+            block.push_str(
+                "- Verdict gate (required): after the first restriction symptom, stop normal task work and classify the block cause.\n",
+            );
+            block.push_str(
+                "- Restriction symptom means any sandbox-denial, file-access/permission error, or network/connection restriction signal.\n",
+            );
+            block.push_str(
+                "- Do not grade severity: even non-fatal warnings are sandbox evidence.\n",
+            );
+            block.push_str(
+                "- After a restriction symptom, you may run at most one read-only check that does not require the blocked capability.\n",
+            );
+            block.push_str(
+                "- If any sandbox evidence remains, or evidence is mixed/uncertain, write `./",
+            );
+            block.push_str(AGENT_RESULT_REL);
+            block.push_str("` with `status: failure` and `reason: sandbox_blocked`, then stop.\n");
+            block.push_str("- Use `reason: program_blocked` only when zero restriction symptoms appeared in failing required commands and one read-only check confirms an independent non-sandbox cause.\n");
+            block.push_str("- Mandatory self-check before writing `program_blocked`: \"Did any restriction symptom appear in this run?\" If yes, change reason to `sandbox_blocked`.\n");
+            block.push_str("- No workaround/fallback commands before verdict.\n");
+            if sandbox_auto_retry_enabled {
+                block.push_str("- Auto mode only: if blocked by sandbox, set `reason: sandbox_blocked`; this triggers one unsandboxed retry.\n");
+            }
+        }
         block.push_str("- Keep edits within program scope:\n");
         block.push_str("  files required to satisfy the \"program\".\n");
         block.push_str("- Do not make unrelated edits.\n\n---\n\n");
@@ -1222,13 +1287,19 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
         block.push_str(AGENT_RESULT_REL);
         block.push_str("`\n\n");
         block.push_str("Exact format:\n");
-        block.push_str("```json\n{\n  \"status\": \"success|partial|failure\",\n  \"reason\": \"optional machine-readable reason\",\n  \"message\": \"short human-readable summary\"\n}\n```\n\n");
+        block.push_str("```json\n{\n  \"status\": \"success|partial|failure\",\n  \"reason\": \"sandbox_blocked|program_blocked\",\n  \"message\": \"short human-readable summary\"\n}\n```\n\n");
         block.push_str("Rules:\n");
         block.push_str("- `success`: the \"program\" is complete and correct.\n");
         block.push_str("- `partial`: useful progress was made, but program is not complete.\n");
         block.push_str("- `failure`: program could not be completed.\n");
-        block.push_str("- If blocked by sandbox network restrictions, set `reason` to exactly `sandbox_network_blocked`.\n");
-        block.push_str("- Omit `reason` when not needed.\n");
+        block.push_str("- For `partial` or `failure`, set `reason`.\n");
+        block.push_str("- For `success`, omit `reason`.\n");
+        block.push_str("- Reason precedence: use `sandbox_blocked` if any restriction symptom appears in a failing required command, or evidence is mixed/uncertain; use `program_blocked` only when zero restriction symptoms appeared and an independent non-sandbox cause is confirmed.\n");
+        if sandbox_verdict_guidance_enabled {
+            block.push_str(
+                "- Write this verdict before any fallback/workaround/mutating commands.\n",
+            );
+        }
         block.push_str(
             "- `message`: one short sentence about this \"current session\" result.\n\n---\n\n",
         );
@@ -1260,13 +1331,31 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
         }
         block.push_str("- Use workspace files and tools as needed.\n");
         block.push_str("- Continue until the program result is correct, or stop only when there is no practical way forward.\n");
-        block.push_str("- If a required network command fails in sandbox with DNS/connectivity errors (for example: `Could not resolve host`, `failed to lookup address information`, `network is unreachable`, `no route to host`, `connection timed out`), treat it as sandbox network restriction immediately.\n");
-        block.push_str("- In that case, do not spend time on network workarounds (forced IP/`--resolve`, alternate download tools, local TLS/proxy emulation).\n");
-        block.push_str("- Immediately write `./");
-        block.push_str(AGENT_RESULT_REL);
-        block.push_str(
-            "` with `status: failure` and `reason: sandbox_network_blocked`, then stop.\n",
-        );
+        if sandbox_verdict_guidance_enabled {
+            block.push_str(
+                "- Verdict gate (required): after the first restriction symptom, stop normal task work and classify the block cause.\n",
+            );
+            block.push_str(
+                "- Restriction symptom means any sandbox-denial, file-access/permission error, or network/connection restriction signal.\n",
+            );
+            block.push_str(
+                "- Do not grade severity: even non-fatal warnings are sandbox evidence.\n",
+            );
+            block.push_str(
+                "- After a restriction symptom, you may run at most one read-only check that does not require the blocked capability.\n",
+            );
+            block.push_str(
+                "- If any sandbox evidence remains, or evidence is mixed/uncertain, write `./",
+            );
+            block.push_str(AGENT_RESULT_REL);
+            block.push_str("` with `status: failure` and `reason: sandbox_blocked`, then stop.\n");
+            block.push_str("- Use `reason: program_blocked` only when zero restriction symptoms appeared in failing required commands and one read-only check confirms an independent non-sandbox cause.\n");
+            block.push_str("- Mandatory self-check before writing `program_blocked`: \"Did any restriction symptom appear in this run?\" If yes, change reason to `sandbox_blocked`.\n");
+            block.push_str("- No workaround/fallback commands before verdict.\n");
+            if sandbox_auto_retry_enabled {
+                block.push_str("- Auto mode only: if blocked by sandbox, set `reason: sandbox_blocked`; this triggers one unsandboxed retry.\n");
+            }
+        }
         block.push_str("- Keep edits scoped to files needed for this program.\n");
         block.push_str("- Do not make unrelated edits.\n\n");
         if let Some(vars) = program_variables {
@@ -1304,15 +1393,17 @@ fn build_runtime_prompt(_program_raw: &str, plan_data: &SharedPlanData) -> Resul
     block.push_str(AGENT_RESULT_REL);
     block.push_str("`\n\n");
     block.push_str("Exact format:\n");
-    block.push_str("```json\n{\n  \"status\": \"success|partial|failure\",\n  \"reason\": \"optional machine-readable reason\",\n  \"message\": \"short human-readable summary\"\n}\n```\n\n");
+    block.push_str("```json\n{\n  \"status\": \"success|partial|failure\",\n  \"reason\": \"sandbox_blocked|program_blocked\",\n  \"message\": \"short human-readable summary\"\n}\n```\n\n");
     block.push_str("Rules:\n");
     block.push_str("- `success`: program is complete and correct.\n");
     block.push_str("- `partial`: useful progress was made, but program is not complete.\n");
     block.push_str("- `failure`: program could not be completed.\n");
-    block.push_str(
-        "- If blocked by sandbox network restrictions, set `reason` to exactly `sandbox_network_blocked`.\n",
-    );
-    block.push_str("- Omit `reason` when not needed.\n");
+    block.push_str("- For `partial` or `failure`, set `reason`.\n");
+    block.push_str("- For `success`, omit `reason`.\n");
+    block.push_str("- Reason precedence: use `sandbox_blocked` if any restriction symptom appears in a failing required command, or evidence is mixed/uncertain; use `program_blocked` only when zero restriction symptoms appeared and an independent non-sandbox cause is confirmed.\n");
+    if sandbox_verdict_guidance_enabled {
+        block.push_str("- Write this verdict before any fallback/workaround/mutating commands.\n");
+    }
     block.push_str("- `message`: one short sentence about this session result.\n\n");
     block.push_str("User-facing message rule\n");
     block.push_str("- In user-facing text, describe program results only.\n");
@@ -1395,14 +1486,6 @@ fn read_agent_result(workspace_root: &Path) -> Result<Option<AgentResult>> {
         .with_context(|| format!("failed reading agent result '{}'", path.display()))?;
     let parsed: AgentResultFile = serde_json::from_str(&raw)
         .with_context(|| format!("invalid JSON in agent result '{}'", path.display()))?;
-    let reason = parsed.reason.and_then(|r| {
-        let trimmed = r.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    });
     let message = parsed.message.and_then(|m| {
         let trimmed = m.trim();
         if trimmed.is_empty() {
@@ -1414,7 +1497,7 @@ fn read_agent_result(workspace_root: &Path) -> Result<Option<AgentResult>> {
 
     Ok(Some(AgentResult {
         status: parsed.status,
-        reason,
+        reason: parsed.reason,
         message,
     }))
 }
@@ -2326,7 +2409,8 @@ mod tests {
             last_session: None,
         };
 
-        let prompt = build_runtime_prompt("# test\n", &plan).expect("prompt should build");
+        let prompt = build_runtime_prompt("# test\n", &plan, SandboxMode::Auto)
+            .expect("prompt should build");
         assert_eq!(prompt, PROMPT_EXAMPLE_NO_LAST);
     }
 
@@ -2362,7 +2446,8 @@ mod tests {
             }),
         };
 
-        let prompt = build_runtime_prompt("# test\n", &plan).expect("prompt should build");
+        let prompt = build_runtime_prompt("# test\n", &plan, SandboxMode::Auto)
+            .expect("prompt should build");
         assert_eq!(prompt, PROMPT_EXAMPLE_WITH_LAST);
     }
 
@@ -2393,7 +2478,8 @@ mod tests {
             last_session: None,
         };
 
-        let prompt = build_runtime_prompt("# test\n", &plan).expect("prompt should build");
+        let prompt = build_runtime_prompt("# test\n", &plan, SandboxMode::Auto)
+            .expect("prompt should build");
         assert!(prompt.contains("Resolved program variables for this session"));
         assert!(prompt.contains(RUNTIME_VARIABLES_INPUT_REL));
     }
@@ -2441,10 +2527,105 @@ mod tests {
             }),
         };
 
-        let prompt = build_runtime_prompt("# test\n", &plan).expect("prompt should build");
+        let prompt = build_runtime_prompt("# test\n", &plan, SandboxMode::Auto)
+            .expect("prompt should build");
         assert!(prompt.contains("Resolved program variables for this \"current session\""));
         assert!(prompt.contains("last_session_variables_file"));
         assert!(prompt.contains("variables.json"));
+    }
+
+    #[test]
+    fn runtime_prompt_unsandboxed_omits_sandbox_guidance_for_first_session() {
+        let plan = SharedPlanData {
+            program_id: "calculator".to_string(),
+            program_file: "examples/calc.md".to_string(),
+            model: None,
+            program_variables: None,
+            program_variables_diff_vs_last_session: None,
+            program_diff_vs_last_session: PlanProgramDiff {
+                status: "first_apply".to_string(),
+                file: "examples/calc.md".to_string(),
+                lines_changed: 0,
+                lines_added: 0,
+                lines_deleted: 0,
+            },
+            last_session: None,
+        };
+
+        let prompt = build_runtime_prompt("# test\n", &plan, SandboxMode::Unsandboxed)
+            .expect("prompt should build");
+        assert!(!prompt.contains(
+            "Verdict gate (required): after the first restriction symptom, stop normal task work and classify the block cause."
+        ));
+        assert!(!prompt.contains("sandbox limits"));
+    }
+
+    #[test]
+    fn runtime_prompt_unsandboxed_omits_sandbox_guidance_for_last_session() {
+        let plan = SharedPlanData {
+            program_id: "calculator".to_string(),
+            program_file: "examples/calc.md".to_string(),
+            model: None,
+            program_variables: None,
+            program_variables_diff_vs_last_session: None,
+            program_diff_vs_last_session: PlanProgramDiff {
+                status: "changed".to_string(),
+                file: "examples/calc.md".to_string(),
+                lines_changed: 6,
+                lines_added: 0,
+                lines_deleted: 24,
+            },
+            last_session: Some(PlanLastSession {
+                session_id: Some("019d55f0-fd15-7041-bca3-979c467b67eb".to_string()),
+                ts_unix: 1775263601,
+                status: RunStatus::Success,
+                model: None,
+                summary_short: None,
+                files_total: 0,
+                files_sample: Vec::new(),
+                insertions: 0,
+                deletions: 0,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                error_short: None,
+            }),
+        };
+
+        let prompt = build_runtime_prompt("# test\n", &plan, SandboxMode::Unsandboxed)
+            .expect("prompt should build");
+        assert!(!prompt.contains(
+            "Verdict gate (required): after the first restriction symptom, stop normal task work and classify the block cause."
+        ));
+        assert!(!prompt.contains("sandbox limits"));
+    }
+
+    #[test]
+    fn runtime_prompt_auto_includes_mixed_evidence_precedence_rule() {
+        let plan = SharedPlanData {
+            program_id: "calculator".to_string(),
+            program_file: "examples/calc.md".to_string(),
+            model: None,
+            program_variables: None,
+            program_variables_diff_vs_last_session: None,
+            program_diff_vs_last_session: PlanProgramDiff {
+                status: "first_apply".to_string(),
+                file: "examples/calc.md".to_string(),
+                lines_changed: 0,
+                lines_added: 0,
+                lines_deleted: 0,
+            },
+            last_session: None,
+        };
+
+        let prompt = build_runtime_prompt("# test\n", &plan, SandboxMode::Auto)
+            .expect("prompt should build");
+        assert!(prompt.contains(
+            "use `sandbox_blocked` if any restriction symptom appears in a failing required command"
+        ));
+        assert!(prompt.contains(
+            "Use `reason: program_blocked` only when zero restriction symptoms appeared in failing required commands"
+        ));
     }
 
     #[test]
@@ -2456,7 +2637,7 @@ mod tests {
         }
         fs::write(
             path,
-            r#"{"status":"partial","message":"could not run integration tests"}"#,
+            r#"{"status":"partial","reason":"program_blocked","message":"could not run integration tests"}"#,
         )?;
 
         let result = read_agent_result(dir.path())?;
@@ -2464,7 +2645,7 @@ mod tests {
             result,
             Some(AgentResult {
                 status: AgentStatus::Partial,
-                reason: None,
+                reason: Some(AgentReason::ProgramBlocked),
                 message: Some("could not run integration tests".to_string()),
             })
         );
@@ -2480,7 +2661,7 @@ mod tests {
         }
         fs::write(
             path,
-            r#"{"status":"failure","reason":"sandbox_network_blocked","message":"curl failed"}"#,
+            r#"{"status":"failure","reason":"sandbox_blocked","message":"curl failed"}"#,
         )?;
 
         let result = read_agent_result(dir.path())?;
@@ -2488,10 +2669,68 @@ mod tests {
             result,
             Some(AgentResult {
                 status: AgentStatus::Failure,
-                reason: Some("sandbox_network_blocked".to_string()),
+                reason: Some(AgentReason::SandboxBlocked),
                 message: Some("curl failed".to_string()),
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_agent_result_with_program_blocked_reason() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(AGENT_RESULT_REL);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            path,
+            r#"{"status":"failure","reason":"program_blocked","message":"server unreachable"}"#,
+        )?;
+
+        let result = read_agent_result(dir.path())?;
+        assert_eq!(
+            result,
+            Some(AgentResult {
+                status: AgentStatus::Failure,
+                reason: Some(AgentReason::ProgramBlocked),
+                message: Some("server unreachable".to_string()),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_agent_result_with_unknown_reason() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(AGENT_RESULT_REL);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            path,
+            r#"{"status":"failure","reason":"server_unreachable","message":"permission denied and connection failed"}"#,
+        )?;
+
+        let err = read_agent_result(dir.path()).expect_err("must reject unknown reason");
+        assert!(format!("{:#}", err).contains("invalid JSON in agent result"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_agent_result_with_legacy_reason_value() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(AGENT_RESULT_REL);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            path,
+            r#"{"status":"failure","reason":"service_unreachable","message":"legacy reason"}"#,
+        )?;
+
+        let err = read_agent_result(dir.path()).expect_err("must reject legacy reason");
+        assert!(format!("{:#}", err).contains("invalid JSON in agent result"));
         Ok(())
     }
 
@@ -2617,7 +2856,7 @@ mod tests {
     fn validation_rejects_partial_agent_result() {
         let result = AgentResult {
             status: AgentStatus::Partial,
-            reason: None,
+            reason: Some(AgentReason::ProgramBlocked),
             message: Some("network was unavailable".to_string()),
         };
         let err = validate_agent_completion(&Some(result)).expect_err("partial must fail");
@@ -2628,11 +2867,24 @@ mod tests {
     fn validation_rejects_failure_agent_result() {
         let result = AgentResult {
             status: AgentStatus::Failure,
-            reason: None,
+            reason: Some(AgentReason::ProgramBlocked),
             message: Some("blocked".to_string()),
         };
         let err = validate_agent_completion(&Some(result)).expect_err("failure must fail");
         assert!(format!("{:#}", err).contains("reported failure"));
+    }
+
+    #[test]
+    fn validation_failure_error_includes_reason_when_present() {
+        let result = AgentResult {
+            status: AgentStatus::Failure,
+            reason: Some(AgentReason::ProgramBlocked),
+            message: Some("failed to connect".to_string()),
+        };
+        let err = validate_agent_completion(&Some(result)).expect_err("failure must fail");
+        let text = format!("{:#}", err);
+        assert!(text.contains("reason=program_blocked"));
+        assert!(text.contains("failed to connect"));
     }
 
     #[test]
@@ -2643,5 +2895,38 @@ mod tests {
             message: Some("done".to_string()),
         };
         validate_agent_completion(&Some(result)).expect("minimal result should pass");
+    }
+
+    #[test]
+    fn validation_rejects_failure_without_reason() {
+        let result = AgentResult {
+            status: AgentStatus::Failure,
+            reason: None,
+            message: Some("failed".to_string()),
+        };
+        let err = validate_agent_completion(&Some(result)).expect_err("must fail");
+        assert!(format!("{:#}", err).contains("requires reason"));
+    }
+
+    #[test]
+    fn validation_failure_with_reason_reports_failure() {
+        let result = AgentResult {
+            status: AgentStatus::Failure,
+            reason: Some(AgentReason::ProgramBlocked),
+            message: Some("failed".to_string()),
+        };
+        let err = validate_agent_completion(&Some(result)).expect_err("failure must fail");
+        assert!(format!("{:#}", err).contains("reported failure"));
+    }
+
+    #[test]
+    fn validation_rejects_success_with_reason() {
+        let result = AgentResult {
+            status: AgentStatus::Success,
+            reason: Some(AgentReason::ProgramBlocked),
+            message: Some("done".to_string()),
+        };
+        let err = validate_agent_completion(&Some(result)).expect_err("must fail");
+        assert!(format!("{:#}", err).contains("must omit reason"));
     }
 }

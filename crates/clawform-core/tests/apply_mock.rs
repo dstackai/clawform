@@ -11,8 +11,7 @@ use clawform_core::provider::{ProviderRequest, ProviderRunResult, ProviderRunner
 use clawform_core::{run_apply, ApplyRequest, RunHistoryRecord, RunStatus, SandboxMode};
 
 const AGENT_RESULT_SUCCESS_JSON: &str = r#"{"status":"success","message":"done"}"#;
-const AGENT_RESULT_PARTIAL_JSON: &str =
-    r#"{"status":"partial","message":"could not run tests in this environment"}"#;
+const AGENT_RESULT_PARTIAL_JSON: &str = r#"{"status":"partial","reason":"program_blocked","message":"could not run tests in this environment"}"#;
 
 #[derive(Clone)]
 struct MockRunner {
@@ -37,6 +36,7 @@ impl ProviderRunner for MockRunner {
                 stdout: String::new(),
                 stderr: "forced failure".to_string(),
                 usage: Default::default(),
+                turn_count: 0,
             });
         }
 
@@ -54,6 +54,7 @@ impl ProviderRunner for MockRunner {
             stdout: "mock ok".to_string(),
             stderr: String::new(),
             usage: Default::default(),
+            turn_count: 0,
         })
     }
 }
