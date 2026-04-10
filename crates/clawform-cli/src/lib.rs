@@ -67,6 +67,10 @@ enum Commands {
         #[arg(short = 'd', long)]
         debug: bool,
 
+        /// Print full command and message outputs in the live stream.
+        #[arg(short = 'v', long)]
+        verbose: bool,
+
         /// Progress rendering mode.
         #[arg(
             short = 'p',
@@ -147,6 +151,7 @@ fn real_main() -> Result<()> {
             vars,
             yes,
             debug,
+            verbose,
             progress_mode,
             no_progress_legacy,
             no_interactive_legacy,
@@ -206,6 +211,7 @@ fn real_main() -> Result<()> {
                     program_variables,
                     confirm,
                     debug,
+                    verbose_output: verbose,
                     progress: true,
                     render_progress,
                     interactive_ui,

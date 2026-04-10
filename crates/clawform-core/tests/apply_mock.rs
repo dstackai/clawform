@@ -123,6 +123,7 @@ fn run_with_variables(
             program_variables,
             confirm: false,
             debug: false,
+            verbose_output: false,
             progress: false,
             render_progress: false,
             interactive_ui: false,

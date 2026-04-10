@@ -28,6 +28,7 @@ pub struct ProviderRequest {
     pub prompt: String,
     pub progress: bool,
     pub render_progress: bool,
+    pub verbose_output: bool,
     pub verbose_events: bool,
     pub interactive_ui: bool,
     pub show_intermediate_steps: bool,
@@ -481,6 +482,7 @@ fn run_codex_once(
         return collect_with_progress(
             child,
             request.render_progress,
+            request.verbose_output,
             request.verbose_events,
             request.interactive_ui,
             request.show_intermediate_steps,
@@ -781,6 +783,7 @@ fn maybe_build_early_auto_retry_monitor(
 fn collect_with_progress(
     mut child: std::process::Child,
     render_progress: bool,
+    verbose_output: bool,
     verbose_events: bool,
     interactive_ui: bool,
     show_intermediate_steps: bool,
@@ -863,6 +866,9 @@ fn collect_with_progress(
                 // Stderr can contain banners or transport noise, but we still surface useful startup hints.
                 if is_stdout {
                     if let Some(normalized) = normalized {
+                        let command_payload = extract_command_output_payload(&line);
+                        let message_payload = extract_message_output_payload(&line);
+
                         match normalized {
                             ProviderEvent::RunStarted { ref run_id } => {
                                 if let Some(id) = run_id.as_ref() {
@@ -925,18 +931,18 @@ fn collect_with_progress(
                         if !matches!(normalized, ProviderEvent::RawText { .. }) {
                             emitted_progress_events += 1;
                         }
-                        if let Some(payload) = extract_command_output_payload(&line) {
+                        if let Some(payload) = command_payload.as_ref() {
                             if let Ok(Some(path)) =
-                                sink.persist(program_id, session_id.as_deref(), &payload)
+                                sink.persist(program_id, session_id.as_deref(), payload)
                             {
-                                command_output_links.insert(payload.item_id, path);
+                                command_output_links.insert(payload.item_id.clone(), path);
                             }
                         }
-                        if let Some(payload) = extract_message_output_payload(&line) {
+                        if let Some(payload) = message_payload.as_ref() {
                             if let Ok(Some(path)) =
-                                sink.persist_message(program_id, session_id.as_deref(), &payload)
+                                sink.persist_message(program_id, session_id.as_deref(), payload)
                             {
-                                message_output_links.insert(payload.item_id, path);
+                                message_output_links.insert(payload.item_id.clone(), path);
                             }
                         }
                         if let Some(payload) = extract_file_change_payload(&line) {
@@ -960,18 +966,27 @@ fn collect_with_progress(
                         if let Some(progress_line) = progress_line {
                             let progress_line =
                                 add_completion_duration_suffix(&progress_line, completion_duration);
-                            let progress_line = add_command_output_link_suffix(
-                                &normalized,
-                                &progress_line,
-                                &command_output_links,
-                                supports_hyperlinks,
-                            );
-                            let progress_line = add_message_output_link_suffix(
-                                &normalized,
-                                &progress_line,
-                                &message_output_links,
-                                supports_hyperlinks,
-                            );
+                            let progress_line = if verbose_output {
+                                expand_verbose_progress_line(
+                                    &normalized,
+                                    &progress_line,
+                                    command_payload.as_ref(),
+                                    message_payload.as_ref(),
+                                )
+                            } else {
+                                let progress_line = add_command_output_link_suffix(
+                                    &normalized,
+                                    &progress_line,
+                                    &command_output_links,
+                                    supports_hyperlinks,
+                                );
+                                add_message_output_link_suffix(
+                                    &normalized,
+                                    &progress_line,
+                                    &message_output_links,
+                                    supports_hyperlinks,
+                                )
+                            };
                             let progress_line = add_file_change_link_suffix(
                                 &normalized,
                                 &progress_line,
@@ -1063,6 +1078,47 @@ fn collect_with_progress(
         stderr: raw_stderr,
         usage: usage_totals,
     })
+}
+
+fn expand_verbose_progress_line(
+    event: &ProviderEvent,
+    line: &str,
+    command_payload: Option<&CommandOutputPayload>,
+    message_payload: Option<&MessageOutputPayload>,
+) -> String {
+    if let Some(payload) = command_payload {
+        if matches!(
+            event,
+            ProviderEvent::ItemCompleted { item_type, .. } if item_type == "command_execution"
+        ) {
+            let output = payload.output.trim_end();
+            if output.is_empty() {
+                return line.to_string();
+            }
+            return format!("{}\n{}", line, output);
+        }
+    }
+
+    if let Some(payload) = message_payload {
+        if matches!(
+            event,
+            ProviderEvent::ItemCompleted { item_type, .. }
+                if is_reasoning_item_type(item_type) || is_agent_text_item_type(item_type)
+        ) {
+            let text = payload.text.trim_end();
+            if text.is_empty() {
+                return line.to_string();
+            }
+            let prefix = if is_reasoning_item_type(payload.item_type.as_str()) {
+                "💭"
+            } else {
+                "💬"
+            };
+            return format!("{} {}", prefix, text);
+        }
+    }
+
+    line.to_string()
 }
 
 fn merge_usage(totals: &mut ProviderUsage, usage: &ProviderUsage) {
@@ -2775,6 +2831,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
             show_intermediate_steps: false,
@@ -2812,6 +2869,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
             show_intermediate_steps: false,
