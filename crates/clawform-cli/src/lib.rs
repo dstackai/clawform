@@ -216,14 +216,7 @@ fn real_main() -> Result<()> {
                 &runner,
             ) {
                 Ok(result) => result,
-                Err(err) => {
-                    if debug {
-                        eprintln!(
-                            "debug hint: inspect .clawform/programs/*/sessions/*/{{prompt.md,plan.json,events.ndjson,provider.stdout.log,provider.stderr.log}}"
-                        );
-                    }
-                    return Err(err);
-                }
+                Err(err) => return Err(err),
             };
 
             match result.provider_result {
@@ -236,13 +229,6 @@ fn real_main() -> Result<()> {
                             "history: injected success={} failure={}",
                             yes_no(result.history_injected_success),
                             yes_no(result.history_injected_failure),
-                        );
-                        print_debug_artifacts(
-                            result.prompt_artifact.as_deref(),
-                            result.plan_artifact.as_deref(),
-                            result.events_artifact.as_deref(),
-                            result.provider_stdout_artifact.as_deref(),
-                            result.provider_stderr_artifact.as_deref(),
                         );
                     }
                     print_file_summary(
@@ -455,30 +441,6 @@ fn yes_no(v: bool) -> &'static str {
         "yes"
     } else {
         "no"
-    }
-}
-
-fn print_debug_artifacts(
-    prompt: Option<&str>,
-    plan: Option<&str>,
-    events: Option<&str>,
-    stdout_log: Option<&str>,
-    stderr_log: Option<&str>,
-) {
-    if let Some(path) = prompt {
-        println!("artifact: prompt={}", path);
-    }
-    if let Some(path) = plan {
-        println!("artifact: plan={}", path);
-    }
-    if let Some(path) = events {
-        println!("artifact: events={}", path);
-    }
-    if let Some(path) = stdout_log {
-        println!("artifact: stdout={}", path);
-    }
-    if let Some(path) = stderr_log {
-        println!("artifact: stderr={}", path);
     }
 }
 

@@ -2,12 +2,12 @@
 
 Clawform executes agentic programs from markdown files.
 
-You keep instructions in repo files, run `cf -f <program.md>` (equivalent to `cf apply -f <program.md>`), and Clawform executes the program with an agent while preserving session context in local state. This gives you a file-based workflow outside chat UI and reduces dependence on proprietary interfaces.
+You keep instructions in repo files and run `cf -f program.md` (equivalent to `cf apply -f program.md`). Each run uses `.clawform/agent_*.json|md` protocol files, writes session data under `.clawform/programs/<program_id>/sessions/<session_id>/`, and appends `.clawform/history/index.jsonl`.
 
 ## Why It Exists
 
 - move agent workflows from chat windows into versioned files
-- run the same program repeatedly with session context and diff-aware previews
+- run the same program repeatedly with last-session diffs (`program.md`/`variables.json`) and history-based previews
 - keep execution history in your workspace, not only in a provider UI
 - keep the control surface simple: markdown programs + CLI apply
 
@@ -24,7 +24,7 @@ Program frontmatter:
 
 ## How `apply` Works
 
-`cf -f <program.md>` runs one **session** for one program.
+`cf -f program.md` runs one **session** for one program.
 
 Before execution, Clawform previews:
 
@@ -34,13 +34,13 @@ Before execution, Clawform previews:
 
 Then it asks for confirmation and executes the program with the configured provider.
 
-During execution, Clawform streams agent progress events to the terminal and records the full event stream and outputs for later inspection.
+During execution, Clawform streams agent progress events to the terminal and writes per-session `commands/*` and `messages/*` files for clickable `out`/`msg` links.
 
 After execution, Clawform stores:
 
-- agent/session outcome
-- changed files reported for this session
-- prompt, events, logs, and snapshots
+- run outcome and summary (`outcome.json`, `output.md`)
+- per-session snapshots for next-run diff (`program.md`, `variables.json`)
+- changed files reported for this session (from `agent_outputs.json`)
 
 ## Install
 
@@ -114,13 +114,13 @@ Clawform keeps local state under `.clawform/`:
 - history index: `.clawform/history/index.jsonl`
 - per-program sessions: `.clawform/programs/<program_id>/sessions/<session_id>/`
 
-Session folders include prompt, plan metadata, streamed events, provider stdout/stderr, outcome, and session output summary.
+Session folders keep `program.md`, `variables.json`, `output.md`, `outcome.json`, plus `commands/*` and `messages/*` used by interactive `out`/`msg` links.
 
 ## Commands
 
 ```bash
-cf -f <program.md>
-cf apply -f <program.md>
+cf -f program.md
+cf apply -f program.md
 ```
 
 ## Status

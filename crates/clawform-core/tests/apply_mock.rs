@@ -161,31 +161,11 @@ Write ./out.txt.
     assert_eq!(fs::read_to_string(ws.path().join("out.txt"))?, "OK\n");
     assert!(!result.history_injected_success);
     assert!(!result.history_injected_failure);
-    assert!(result.prompt_artifact.is_some());
-    assert!(result.plan_artifact.is_some());
-    assert!(result.provider_stdout_artifact.is_some());
-    assert!(result.provider_stderr_artifact.is_some());
+    assert!(result.prompt_artifact.is_none());
+    assert!(result.plan_artifact.is_none());
+    assert!(result.provider_stdout_artifact.is_none());
+    assert!(result.provider_stderr_artifact.is_none());
     assert!(result.events_artifact.is_none());
-    let prompt_artifact = result
-        .prompt_artifact
-        .as_deref()
-        .context("missing prompt artifact")?;
-    let plan_artifact = result
-        .plan_artifact
-        .as_deref()
-        .context("missing plan artifact")?;
-    let stdout_artifact = result
-        .provider_stdout_artifact
-        .as_deref()
-        .context("missing provider stdout artifact")?;
-    let stderr_artifact = result
-        .provider_stderr_artifact
-        .as_deref()
-        .context("missing provider stderr artifact")?;
-    assert!(ws.path().join(prompt_artifact).exists());
-    assert!(ws.path().join(plan_artifact).exists());
-    assert!(ws.path().join(stdout_artifact).exists());
-    assert!(ws.path().join(stderr_artifact).exists());
 
     let history = read_history(ws.path())?;
     assert_eq!(history.len(), 1);
@@ -371,40 +351,7 @@ Write ./out.txt.
     assert!(!result
         .file_results
         .iter()
-        .any(|f| f.path == ".clawform/agent_summary.md"));
-    Ok(())
-}
-
-#[test]
-fn reads_legacy_agent_summary_path_for_backward_compatibility() -> Result<()> {
-    let ws = setup_workspace(
-        r#"---
-id: mock_program
----
-## Instruction
-Write ./out.txt.
-"#,
-    )?;
-    let (runner, _) = make_runner(
-        vec![
-            (PathBuf::from("out.txt"), "OK\n"),
-            (
-                PathBuf::from(".clawform/agent_summary.md"),
-                "Legacy summary path still works\n",
-            ),
-            (
-                PathBuf::from(".clawform/agent_result.json"),
-                AGENT_RESULT_SUCCESS_JSON,
-            ),
-        ],
-        false,
-    );
-
-    let result = run(&ws, &runner, false)?;
-    assert_eq!(
-        result.agent_human_summary.as_deref(),
-        Some("Legacy summary path still works")
-    );
+        .any(|f| f.path == ".clawform/agent_result.json"));
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
@@ -15,7 +15,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::path_utils::to_slash_path;
 use anyhow::{anyhow, Context, Result};
-use serde::Serialize;
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
@@ -219,15 +218,6 @@ struct EarlyAutoRetryMonitor {
     run_started_at: SystemTime,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct CanonicalEventRecord {
-    seq: u64,
-    ts_unix_ms: u64,
-    stream: String,
-    event_type: String,
-    raw: String,
-}
-
 #[derive(Debug)]
 struct CommandOutputSink {
     root: Option<PathBuf>,
@@ -330,24 +320,6 @@ fn now_unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn canonical_event_type_name(event: &ProviderEvent) -> String {
-    match event {
-        ProviderEvent::RunStarted { .. } => "thread.started".to_string(),
-        ProviderEvent::TurnStarted => "turn.started".to_string(),
-        ProviderEvent::TurnCompleted { .. } => "turn.completed".to_string(),
-        ProviderEvent::TurnFailed { .. } => "turn.failed".to_string(),
-        ProviderEvent::ItemStarted { .. } => "item.started".to_string(),
-        ProviderEvent::ItemUpdated { .. } => "item.updated".to_string(),
-        ProviderEvent::ItemCompleted { .. } => "item.completed".to_string(),
-        ProviderEvent::Error { .. } => "error".to_string(),
-        ProviderEvent::RawEvent {
-            provider_event_type,
-        } => provider_event_type.clone(),
-        ProviderEvent::RawText { .. } => "raw_text".to_string(),
-        ProviderEvent::Heartbeat { .. } => "heartbeat".to_string(),
-    }
-}
-
 fn session_base_dir(root: &Path, program_id: Option<&str>, session_id: &str) -> PathBuf {
     let program = sanitize_program_id(program_id.unwrap_or("program"));
     let session = sanitize_session_id(session_id);
@@ -356,51 +328,6 @@ fn session_base_dir(root: &Path, program_id: Option<&str>, session_id: &str) -> 
         .join(program)
         .join("sessions")
         .join(session)
-}
-
-fn persist_canonical_events(
-    root: Option<&Path>,
-    program_id: Option<&str>,
-    session_id: &str,
-    records: &[CanonicalEventRecord],
-) -> Result<Option<PathBuf>> {
-    let Some(root) = root else {
-        return Ok(None);
-    };
-    if records.is_empty() {
-        return Ok(None);
-    }
-
-    let out_path = session_base_dir(root, program_id, session_id).join("events.ndjson");
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed creating canonical events directory '{}'",
-                parent.display()
-            )
-        })?;
-    }
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&out_path)
-        .with_context(|| format!("failed opening canonical events '{}'", out_path.display()))?;
-    for record in records {
-        let line =
-            serde_json::to_string(record).context("failed serializing canonical event record")?;
-        file.write_all(line.as_bytes())
-            .with_context(|| format!("failed writing canonical events '{}'", out_path.display()))?;
-        file.write_all(b"\n").with_context(|| {
-            format!(
-                "failed finalizing canonical events '{}'",
-                out_path.display()
-            )
-        })?;
-    }
-
-    Ok(Some(out_path))
 }
 
 impl ProviderRunner for CodexRunner {
@@ -566,34 +493,6 @@ fn run_codex_once(
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let fallback_session_id = format!("local-{}", now_unix_millis());
-    let mut seq = 0u64;
-    let mut records = Vec::new();
-    for line in stdout.lines() {
-        records.push(CanonicalEventRecord {
-            seq,
-            ts_unix_ms: now_unix_millis(),
-            stream: "stdout".to_string(),
-            event_type: "stdout.line".to_string(),
-            raw: line.to_string(),
-        });
-        seq = seq.saturating_add(1);
-    }
-    for line in stderr.lines() {
-        records.push(CanonicalEventRecord {
-            seq,
-            ts_unix_ms: now_unix_millis(),
-            stream: "stderr".to_string(),
-            event_type: "stderr.line".to_string(),
-            raw: line.to_string(),
-        });
-        seq = seq.saturating_add(1);
-    }
-    let _ = persist_canonical_events(
-        request.artifacts_root.as_deref(),
-        request.program_id.as_deref(),
-        fallback_session_id.as_str(),
-        &records,
-    )?;
 
     return Ok(ProviderRunResult {
         session_id: Some(fallback_session_id),
@@ -881,8 +780,6 @@ fn collect_with_progress(
     let mut last_activity = String::new();
     let mut active_progress_items: Vec<(String, String)> = Vec::new();
     let mut last_agent_text_line: Option<String> = None;
-    let mut canonical_records: Vec<CanonicalEventRecord> = Vec::new();
-    let mut canonical_seq: u64 = 0;
     let mut item_started_at: HashMap<String, Instant> = HashMap::new();
     let mut usage_totals = ProviderUsage::default();
     let mut printer = ProgressPrinter::new(render_progress && interactive_ui);
@@ -934,28 +831,6 @@ fn collect_with_progress(
                 } else {
                     None
                 };
-                let event_type = match normalized.as_ref() {
-                    Some(ev) => canonical_event_type_name(ev),
-                    None => {
-                        if is_stdout {
-                            "stdout.line".to_string()
-                        } else {
-                            "stderr.line".to_string()
-                        }
-                    }
-                };
-                canonical_records.push(CanonicalEventRecord {
-                    seq: canonical_seq,
-                    ts_unix_ms: now_unix_millis(),
-                    stream: if is_stdout {
-                        "stdout".to_string()
-                    } else {
-                        "stderr".to_string()
-                    },
-                    event_type,
-                    raw: line.clone(),
-                });
-                canonical_seq = canonical_seq.saturating_add(1);
 
                 // Liveness/progress is driven only by Codex JSON stream on stdout.
                 // Stderr can contain banners or transport noise, but we still surface useful startup hints.
@@ -1153,12 +1028,6 @@ fn collect_with_progress(
         Some(id) if !id.trim().is_empty() => sanitize_session_id(id),
         _ => format!("local-{}", now_unix_millis()),
     };
-    let _ = persist_canonical_events(
-        artifacts_root,
-        program_id,
-        final_session_id.as_str(),
-        &canonical_records,
-    )?;
 
     Ok(ProviderRunResult {
         session_id: Some(final_session_id),
@@ -2023,11 +1892,9 @@ fn is_low_signal_command(summary: &str) -> bool {
 fn is_clawform_housekeeping_command(summary: &str) -> bool {
     let s = summary.trim().to_ascii_lowercase();
     s.starts_with("write .clawform/agent_output.md")
-        || s.starts_with("write .clawform/agent_summary.md")
         || s.starts_with("write .clawform/agent_outputs.json")
         || s.starts_with("write .clawform/agent_result.json")
         || s.starts_with("cat .clawform/agent_output.md")
-        || s.starts_with("cat .clawform/agent_summary.md")
         || s.starts_with("cat .clawform/agent_outputs.json")
         || s.starts_with("cat .clawform/agent_result.json")
         || {
