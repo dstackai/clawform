@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::path_utils::to_slash_path;
 use anyhow::{anyhow, Context, Result};
+use serde::Deserialize;
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,7 @@ pub struct ProviderRunResult {
     pub stdout: String,
     pub stderr: String,
     pub usage: ProviderUsage,
+    pub turn_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,9 +191,31 @@ const PROVIDER_INTERACTIVE_POLL_MS: u64 = 250;
 const PROVIDER_MAX_ATTEMPTS: usize = 2;
 const PROVIDER_RETRY_BACKOFF_MS: u64 = 1_500;
 const PROVIDER_CANCEL_POLL_MS: u64 = 100;
-const AGENT_REASON_SANDBOX_NETWORK_BLOCKED: &str = "sandbox_network_blocked";
+const EARLY_AUTO_RETRY_REASON_SANDBOX_BLOCKED: &str = "sandbox_blocked";
 static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CTRL_C_HANDLER_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AgentResultStatus {
+    Success,
+    Partial,
+    Failure,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AgentResultReason {
+    SandboxBlocked,
+    ProgramBlocked,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AgentResultProtocolFile {
+    status: AgentResultStatus,
+    #[serde(default)]
+    reason: Option<AgentResultReason>,
+}
 
 #[derive(Debug, Clone)]
 struct CommandOutputPayload {
@@ -349,21 +373,19 @@ impl ProviderRunner for CodexRunner {
         let sandboxed = run_codex_with_retries(request, CodexExecutionMode::Sandboxed)?;
         if sandboxed.exit_code == Some(0) {
             if should_retry_unsandboxed_after_success(request, sandbox_started_at) {
-                print_auto_sandbox_retry_notice();
+                print_auto_sandbox_retry_decision(request, sandbox_started_at, &sandboxed);
                 return run_codex_with_retries(request, CodexExecutionMode::Unsandboxed);
             }
+            print_auto_sandbox_turn_usage_line(&sandboxed);
             return Ok(sandboxed);
         }
 
-        if should_retry_unsandboxed_after_failure_with_agent_result(
-            request,
-            &sandboxed,
-            sandbox_started_at,
-        ) {
-            print_auto_sandbox_retry_notice();
+        if should_retry_unsandboxed_after_failure_with_agent_result(request, sandbox_started_at) {
+            print_auto_sandbox_retry_decision(request, sandbox_started_at, &sandboxed);
             return run_codex_with_retries(request, CodexExecutionMode::Unsandboxed);
         }
 
+        print_auto_sandbox_turn_usage_line(&sandboxed);
         Ok(sandboxed)
     }
 
@@ -372,12 +394,183 @@ impl ProviderRunner for CodexRunner {
     }
 }
 
-fn print_auto_sandbox_retry_notice() {
-    let line = "retry | sandbox: auto -> danger-full-access";
-    if std::io::stdout().is_terminal() {
-        println!("\x1b[2m{}\x1b[0m", line);
+fn print_auto_sandbox_turn_usage_line(run: &ProviderRunResult) {
+    let Some(line) = format_turn_usage_line(run.turn_count, &run.usage) else {
+        return;
+    };
+    let use_color = std::io::stdout().is_terminal();
+    if use_color {
+        println!("{}", format_turn_usage_event_line(&line, true));
     } else {
-        println!("{}", line);
+        println!("{}", format_turn_usage_event_line(&line, false));
+    }
+}
+
+fn print_auto_sandbox_retry_decision(
+    request: &ProviderRequest,
+    run_started_at: SystemTime,
+    run: &ProviderRunResult,
+) {
+    let result_path = agent_result_path(request);
+    let parsed = result_path
+        .as_ref()
+        .and_then(|path| read_recent_agent_result_value(path.as_path(), run_started_at));
+    let agent_result_suggests_sandbox_block = parsed
+        .as_ref()
+        .map(agent_result_reports_sandbox_block)
+        .unwrap_or(false);
+    let use_color = std::io::stdout().is_terminal();
+    let line = format_auto_sandbox_retry_decision_line(
+        run,
+        parsed.as_ref(),
+        agent_result_suggests_sandbox_block,
+        result_path.as_deref(),
+        supports_terminal_hyperlinks(),
+        use_color,
+    );
+    let Some(line) = line else {
+        return;
+    };
+    println!("{}", line);
+}
+
+fn format_auto_sandbox_retry_decision_line(
+    run: &ProviderRunResult,
+    agent_result: Option<&AgentResultProtocolFile>,
+    agent_result_suggests_sandbox_block: bool,
+    result_path: Option<&Path>,
+    supports_hyperlinks: bool,
+    use_color: bool,
+) -> Option<String> {
+    if let Some(parsed) = agent_result.filter(|_| agent_result_suggests_sandbox_block) {
+        let sep = if use_color {
+            " \x1b[2m|\x1b[0m "
+        } else {
+            " | "
+        };
+        let turn_line = format_turn_usage_line(run.turn_count, &run.usage)
+            .unwrap_or_else(|| format!("turn {}", if run.turn_count == 0 { 1 } else { run.turn_count }));
+        let turn_segment = if use_color {
+            format!("\x1b[2m{}\x1b[0m", turn_line)
+        } else {
+            turn_line
+        };
+        let status = style_retry_decision_value(
+            agent_result_status_label(parsed.status),
+            retry_status_color(parsed.status),
+            result_path,
+            supports_hyperlinks,
+            use_color,
+        );
+        let mut line = String::new();
+        line.push_str(&turn_segment);
+        match (parsed.status, parsed.reason) {
+            (AgentResultStatus::Failure, Some(reason)) => {
+                line.push_str(sep);
+                line.push_str(
+                    style_retry_decision_value(
+                        agent_result_reason_label(reason),
+                        retry_reason_color(reason),
+                        result_path,
+                        supports_hyperlinks,
+                        use_color,
+                    )
+                    .as_str(),
+                );
+            }
+            (_, maybe_reason) => {
+                line.push_str(sep);
+                line.push_str(&status);
+                if let Some(reason) = maybe_reason {
+                    line.push_str(sep);
+                    line.push_str(
+                        style_retry_decision_value(
+                            agent_result_reason_label(reason),
+                            retry_reason_color(reason),
+                            result_path,
+                            supports_hyperlinks,
+                            use_color,
+                        )
+                        .as_str(),
+                    );
+                }
+            }
+        }
+        if result_path.is_some() {
+            line.push_str(sep);
+            line.push_str(
+                style_retry_decision_value(
+                    "file",
+                    "95",
+                    result_path,
+                    supports_hyperlinks,
+                    use_color,
+                )
+                .as_str(),
+            );
+        }
+        return Some(line);
+    }
+
+    None
+}
+
+fn style_retry_decision_value(
+    raw: &str,
+    color_code: &'static str,
+    result_path: Option<&Path>,
+    supports_hyperlinks: bool,
+    use_color: bool,
+) -> String {
+    let linked = if supports_hyperlinks {
+        result_path
+            .and_then(|path| terminal_link(path, raw))
+            .unwrap_or_else(|| raw.to_string())
+    } else {
+        raw.to_string()
+    };
+    if use_color {
+        format!("\x1b[{}m{}\x1b[0m", color_code, linked)
+    } else {
+        linked
+    }
+}
+
+fn retry_status_color(status: AgentResultStatus) -> &'static str {
+    match status {
+        AgentResultStatus::Success => "32",
+        AgentResultStatus::Partial => "33",
+        AgentResultStatus::Failure => "31",
+    }
+}
+
+fn retry_reason_color(reason: AgentResultReason) -> &'static str {
+    match reason {
+        AgentResultReason::SandboxBlocked => "33",
+        AgentResultReason::ProgramBlocked => "31",
+    }
+}
+
+fn agent_result_path(request: &ProviderRequest) -> Option<PathBuf> {
+    let rel = request.agent_result_rel.trim();
+    if rel.is_empty() {
+        return None;
+    }
+    Some(request.workspace_root.join(rel))
+}
+
+fn agent_result_status_label(status: AgentResultStatus) -> &'static str {
+    match status {
+        AgentResultStatus::Success => "success",
+        AgentResultStatus::Partial => "partial",
+        AgentResultStatus::Failure => "failure",
+    }
+}
+
+fn agent_result_reason_label(reason: AgentResultReason) -> &'static str {
+    match reason {
+        AgentResultReason::SandboxBlocked => "sandbox_blocked",
+        AgentResultReason::ProgramBlocked => "program_blocked",
     }
 }
 
@@ -479,6 +672,8 @@ fn run_codex_once(
     }
 
     if request.progress {
+        let suppress_turn_usage_lines =
+            mode == CodexExecutionMode::Sandboxed && request.sandbox_mode == SandboxMode::Auto;
         return collect_with_progress(
             child,
             request.render_progress,
@@ -486,6 +681,8 @@ fn run_codex_once(
             request.verbose_events,
             request.interactive_ui,
             request.show_intermediate_steps,
+            suppress_turn_usage_lines,
+            mode,
             request.artifacts_root.as_deref(),
             request.program_id.as_deref(),
             early_auto_retry_monitor,
@@ -503,6 +700,7 @@ fn run_codex_once(
         stdout,
         stderr,
         usage: ProviderUsage::default(),
+        turn_count: 0,
     });
 }
 
@@ -531,78 +729,38 @@ fn is_transient_codex_failure(run: &ProviderRunResult) -> bool {
         .any(|needle| text.contains(needle))
 }
 
-fn is_sandbox_restriction_failure(run: &ProviderRunResult) -> bool {
-    if run.exit_code == Some(0) {
-        return false;
-    }
-
-    let text = format!("{}\n{}", run.stdout, run.stderr).to_ascii_lowercase();
-    let hard_markers = [
-        "sandbox-exec: sandbox_apply",
-        "not permitted by sandbox",
-        "outside sandbox",
-        "sandbox restriction",
-        "approval required to run",
-        "requires approval to run",
-    ];
-    if hard_markers.iter().any(|needle| text.contains(needle)) {
-        return true;
-    }
-
-    let has_permission_error =
-        text.contains("operation not permitted") || text.contains("permission denied");
-    let has_sandbox_context = text.contains("sandbox");
-    has_permission_error && has_sandbox_context
-}
-
-fn should_retry_unsandboxed_after_failure(run: &ProviderRunResult) -> bool {
-    is_sandbox_restriction_failure(run)
-        || is_network_restriction_failure(run)
-        || output_reports_blocked_network(run)
-}
-
 fn should_retry_unsandboxed_after_failure_with_agent_result(
     request: &ProviderRequest,
-    run: &ProviderRunResult,
     run_started_at: SystemTime,
 ) -> bool {
-    should_retry_unsandboxed_after_failure(run)
-        || agent_result_reports_blocked_network(
-            &request.workspace_root,
-            request.agent_result_rel.as_str(),
-            run_started_at,
-        )
-}
-
-fn should_retry_unsandboxed_after_success(
-    request: &ProviderRequest,
-    run_started_at: SystemTime,
-) -> bool {
-    // Success-path escalation should rely on structured agent_result status only.
-    // Free-form stdout reasoning can mention "network restrictions" as context and
-    // cause false positives (double-run behavior).
-    agent_result_reports_blocked_network(
+    agent_result_reports_blocked_sandbox(
         &request.workspace_root,
         request.agent_result_rel.as_str(),
         run_started_at,
     )
 }
 
-fn is_network_restriction_failure(run: &ProviderRunResult) -> bool {
-    if run.exit_code == Some(0) {
-        return false;
+fn should_retry_unsandboxed_after_success(
+    request: &ProviderRequest,
+    run_started_at: SystemTime,
+) -> bool {
+    let rel = request.agent_result_rel.trim();
+    if !rel.is_empty() {
+        let result_path = request.workspace_root.join(rel);
+        if let Some(parsed) = read_recent_agent_result_value(result_path.as_path(), run_started_at)
+        {
+            if agent_result_reports_sandbox_block(&parsed) {
+                return true;
+            }
+            if !agent_result_status_allows_retry(&parsed) {
+                return false;
+            }
+        }
     }
-
-    let text = format!("{}\n{}", run.stdout, run.stderr).to_ascii_lowercase();
-    output_has_network_restriction_markers(&text)
+    false
 }
 
-fn output_reports_blocked_network(run: &ProviderRunResult) -> bool {
-    let text = format!("{}\n{}", run.stdout, run.stderr).to_ascii_lowercase();
-    output_has_network_restriction_markers(&text) && output_has_blocked_markers(&text)
-}
-
-fn agent_result_reports_blocked_network(
+fn agent_result_reports_blocked_sandbox(
     workspace_root: &Path,
     result_rel: &str,
     run_started_at: SystemTime,
@@ -610,15 +768,15 @@ fn agent_result_reports_blocked_network(
     if result_rel.trim().is_empty() {
         return false;
     }
-    agent_result_path_reports_blocked_network(workspace_root.join(result_rel), run_started_at)
+    agent_result_path_reports_blocked_sandbox(workspace_root.join(result_rel), run_started_at)
 }
 
-fn agent_result_path_reports_blocked_network(path: PathBuf, run_started_at: SystemTime) -> bool {
+fn agent_result_path_reports_blocked_sandbox(path: PathBuf, run_started_at: SystemTime) -> bool {
     let parsed = match read_recent_agent_result_value(path.as_path(), run_started_at) {
         Some(v) => v,
         None => return false,
     };
-    agent_result_value_reports_blocked_network(&parsed)
+    agent_result_reports_sandbox_block(&parsed)
 }
 
 fn detect_early_auto_retry_reason(monitor: Option<&EarlyAutoRetryMonitor>) -> Option<String> {
@@ -630,9 +788,8 @@ fn detect_early_auto_retry_reason(monitor: Option<&EarlyAutoRetryMonitor>) -> Op
     if !agent_result_status_allows_retry(&parsed) {
         return None;
     }
-    let reason = agent_result_reason_value(&parsed)?;
-    if is_sandbox_network_blocked_reason(&reason) {
-        return Some(reason);
+    if agent_result_reports_sandbox_block(&parsed) {
+        return Some(EARLY_AUTO_RETRY_REASON_SANDBOX_BLOCKED.to_string());
     }
     None
 }
@@ -655,7 +812,10 @@ fn clear_agent_result_protocol_file(workspace_root: &Path, result_rel: &str) -> 
     }
 }
 
-fn read_recent_agent_result_value(path: &Path, run_started_at: SystemTime) -> Option<Value> {
+fn read_recent_agent_result_value(
+    path: &Path,
+    run_started_at: SystemTime,
+) -> Option<AgentResultProtocolFile> {
     let metadata = fs::metadata(path).ok()?;
     let modified = metadata.modified().ok()?;
     let run_started_sec = run_started_at
@@ -673,77 +833,18 @@ fn read_recent_agent_result_value(path: &Path, run_started_at: SystemTime) -> Op
     serde_json::from_str(&raw).ok()
 }
 
-fn agent_result_value_reports_blocked_network(parsed: &Value) -> bool {
+fn agent_result_reports_sandbox_block(parsed: &AgentResultProtocolFile) -> bool {
     if !agent_result_status_allows_retry(parsed) {
         return false;
     }
-    if let Some(reason) = agent_result_reason_value(parsed) {
-        if is_sandbox_network_blocked_reason(&reason) {
-            return true;
-        }
+    matches!(parsed.reason, Some(AgentResultReason::SandboxBlocked))
+}
+
+fn agent_result_status_allows_retry(parsed: &AgentResultProtocolFile) -> bool {
+    match parsed.status {
+        AgentResultStatus::Success => false,
+        AgentResultStatus::Partial | AgentResultStatus::Failure => parsed.reason.is_some(),
     }
-    let status = parsed
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let message = parsed
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let joined = format!("{} {}", status, message);
-    output_has_network_restriction_markers(&joined)
-}
-
-fn agent_result_status_allows_retry(parsed: &Value) -> bool {
-    let status = parsed
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    ["failure", "failed", "blocked", "partial"].contains(&status.as_str())
-}
-
-fn agent_result_reason_value(parsed: &Value) -> Option<String> {
-    let reason = parsed.get("reason").and_then(Value::as_str)?.trim();
-    if reason.is_empty() {
-        return None;
-    }
-    Some(reason.to_ascii_lowercase())
-}
-
-fn is_sandbox_network_blocked_reason(reason: &str) -> bool {
-    reason
-        .trim()
-        .eq_ignore_ascii_case(AGENT_REASON_SANDBOX_NETWORK_BLOCKED)
-}
-
-fn output_has_network_restriction_markers(text: &str) -> bool {
-    let markers = [
-        "blocked by network restrictions",
-        "could not resolve host",
-        "failed to lookup address information",
-        "nodename nor servname provided",
-        "dns error",
-        "temporary failure in name resolution",
-        "name or service not known",
-        "network is unreachable",
-        "no route to host",
-        "connection timed out",
-    ];
-    markers.iter().any(|needle| text.contains(needle))
-}
-
-fn output_has_blocked_markers(text: &str) -> bool {
-    let markers = [
-        "blocked by network restrictions",
-        "blocked",
-        "unable to execute",
-        "cannot download required",
-        "required release note downloads unavailable",
-    ];
-    markers.iter().any(|needle| text.contains(needle))
 }
 
 fn is_transient_codex_error(err: &anyhow::Error) -> bool {
@@ -787,6 +888,8 @@ fn collect_with_progress(
     verbose_events: bool,
     interactive_ui: bool,
     show_intermediate_steps: bool,
+    suppress_turn_usage_lines: bool,
+    execution_mode: CodexExecutionMode,
     artifacts_root: Option<&Path>,
     program_id: Option<&str>,
     early_auto_retry_monitor: Option<EarlyAutoRetryMonitor>,
@@ -958,12 +1061,20 @@ fn collect_with_progress(
                             verbose_events,
                             show_intermediate_steps,
                         );
-                        if show_intermediate_steps && progress_line.is_none() {
+                        if show_intermediate_steps
+                            && !suppress_turn_usage_lines
+                            && progress_line.is_none()
+                        {
                             if let ProviderEvent::TurnCompleted { ref usage } = normalized {
                                 progress_line = format_turn_usage_line(turn_index, usage);
                             }
                         }
                         if let Some(progress_line) = progress_line {
+                            let progress_line = if matches!(normalized, ProviderEvent::RunStarted { .. }) {
+                                format!("{} | {}", progress_line, execution_mode.label())
+                            } else {
+                                progress_line
+                            };
                             let progress_line =
                                 add_completion_duration_suffix(&progress_line, completion_duration);
                             let progress_line = if verbose_output {
@@ -1060,7 +1171,7 @@ fn collect_with_progress(
             raw_stderr.push('\n');
         }
         raw_stderr.push_str(
-            "blocked by network restrictions (auto sandbox retry requested from agent_result reason: ",
+            "blocked by sandbox restrictions (auto sandbox retry requested from agent_result reason: ",
         );
         raw_stderr.push_str(reason);
         raw_stderr.push_str(")\n");
@@ -1077,6 +1188,7 @@ fn collect_with_progress(
         stdout: raw_stdout,
         stderr: raw_stderr,
         usage: usage_totals,
+        turn_count: turn_index,
     })
 }
 
@@ -1845,8 +1957,8 @@ fn format_terminal_event(
                 return None;
             }
             Some(match run_id.as_deref() {
-                Some(id) => format!("session {}", id),
-                None => "session started".to_string(),
+                Some(id) => format!("🧵 {}", id),
+                None => "🧵 started".to_string(),
             })
         }
         ProviderEvent::TurnStarted => None,
@@ -2200,10 +2312,16 @@ impl ProgressPrinter {
             return format!("\x1b[34m💭\x1b[0m {}", colorize_paths(rest));
         }
         if line.starts_with("turn ") && line.contains(" | tokens: ") {
-            return format!("\x1b[2m{}\x1b[0m", line);
+            return format_turn_usage_event_line(line, true);
+        }
+        if let Some(rest) = line.strip_prefix("🧵 session ") {
+            return format!("\x1b[36m🧵\x1b[0m {}", colorize_session_payload(rest));
+        }
+        if let Some(rest) = line.strip_prefix("🧵 ") {
+            return format!("\x1b[36m🧵\x1b[0m {}", colorize_session_payload(rest));
         }
         if let Some(rest) = line.strip_prefix("session ") {
-            return format!("\x1b[2msession\x1b[0m {}", colorize_paths(rest));
+            return format!("\x1b[2msession\x1b[0m {}", colorize_session_payload(rest));
         }
         if line.starts_with("turn.failed") || line.starts_with("error |") {
             return format!("\x1b[31m{}\x1b[0m", line);
@@ -2242,7 +2360,7 @@ fn colorize_done_payload(payload: &str) -> String {
         for seg in segments.iter().skip(1) {
             out.push(colorize_done_segment(seg));
         }
-        return out.join(" | ");
+        return out.join(" \x1b[2m|\x1b[0m ");
     }
 
     if let Some((head, tail)) = trimmed.rsplit_once(' ') {
@@ -2251,6 +2369,50 @@ fn colorize_done_payload(payload: &str) -> String {
         }
     }
     colorize_command_summary(trimmed)
+}
+
+fn format_turn_usage_event_line(line: &str, use_color: bool) -> String {
+    if use_color {
+        format!("\x1b[2m{}\x1b[0m", line)
+    } else {
+        line.to_string()
+    }
+}
+
+fn colorize_session_payload(payload: &str) -> String {
+    let segments = payload.split(" | ").collect::<Vec<_>>();
+    if segments.len() <= 1 {
+        return colorize_paths(payload);
+    }
+
+    let mut out = String::new();
+    out.push_str(&colorize_paths(segments[0]));
+    for segment in segments.iter().skip(1) {
+        out.push_str(" \x1b[2m|\x1b[0m ");
+        out.push_str(&colorize_session_segment(segment));
+    }
+    out
+}
+
+fn colorize_session_segment(segment: &str) -> String {
+    let trimmed = segment.trim();
+    match trimmed {
+        "workspace-write" => return "\x1b[34mworkspace-write\x1b[0m".to_string(),
+        "danger-full-access" => return "\x1b[33mdanger-full-access\x1b[0m".to_string(),
+        _ => {}
+    }
+    if let Some((key, value)) = trimmed.split_once('=') {
+        let code = match (key, value) {
+            ("sandbox", "workspace-write") => Some("34"),
+            ("sandbox", "danger-full-access") => Some("33"),
+            _ => None,
+        };
+        if let Some(code) = code {
+            return format!("\x1b[2m{}=\x1b[0m\x1b[{}m{}\x1b[0m", key, code, value);
+        }
+    }
+
+    colorize_paths(segment)
 }
 
 fn colorize_done_segment(segment: &str) -> String {
@@ -2469,6 +2631,101 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retry_decision_line_uses_agent_result_fields() {
+        let parsed = AgentResultProtocolFile {
+            status: AgentResultStatus::Failure,
+            reason: Some(AgentResultReason::ProgramBlocked),
+        };
+        let run = ProviderRunResult {
+            session_id: Some("s1".to_string()),
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: String::new(),
+            usage: ProviderUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(3),
+                cached_input_tokens: Some(2),
+            },
+            turn_count: 1,
+        };
+        let line = format_auto_sandbox_retry_decision_line(
+            &run,
+            Some(&parsed),
+            true,
+            Some(Path::new("/tmp/clawform/.clawform/agent_result.json")),
+            false,
+            false,
+        )
+        .expect("expected retry decision line");
+        assert!(line.contains("turn 1 | tokens: in=10 out=3 cached=2"));
+        assert!(line.contains("program_blocked"));
+        assert!(!line.contains("failure"));
+        assert!(line.contains("file"));
+        assert!(!line.contains("source=agent_result"));
+        assert!(!line.contains("result="));
+    }
+
+    #[test]
+    fn retry_decision_line_absent_without_agent_result_signal() {
+        let run = ProviderRunResult {
+            session_id: Some("s1".to_string()),
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: String::new(),
+            usage: ProviderUsage::default(),
+            turn_count: 1,
+        };
+        let line = format_auto_sandbox_retry_decision_line(
+            &run,
+            None,
+            false,
+            Some(Path::new("/tmp/clawform/.clawform/agent_result.json")),
+            false,
+            false,
+        );
+        assert!(line.is_none());
+    }
+
+    #[test]
+    fn retry_decision_line_absent_when_no_sandbox_signal() {
+        let run = ProviderRunResult {
+            session_id: Some("s1".to_string()),
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: String::new(),
+            usage: ProviderUsage::default(),
+            turn_count: 1,
+        };
+        let line = format_auto_sandbox_retry_decision_line(&run, None, false, None, false, false);
+        assert!(line.is_none());
+    }
+
+    #[test]
+    fn retry_decision_line_absent_when_agent_result_is_non_blocking() {
+        let parsed = AgentResultProtocolFile {
+            status: AgentResultStatus::Failure,
+            reason: Some(AgentResultReason::ProgramBlocked),
+        };
+        let run = ProviderRunResult {
+            session_id: Some("s1".to_string()),
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: String::new(),
+            usage: ProviderUsage::default(),
+            turn_count: 1,
+        };
+        let line = format_auto_sandbox_retry_decision_line(
+            &run,
+            Some(&parsed),
+            false,
+            Some(Path::new("/tmp/clawform/.clawform/agent_result.json")),
+            false,
+            false,
+        );
+        assert!(line.is_none());
+    }
+
+    #[test]
     fn parses_thread_started_event() {
         let line = r#"{"type":"thread.started","thread_id":"abc"}"#;
         let ev = parse_codex_stream_line(line).expect("expected event");
@@ -2491,7 +2748,7 @@ mod tests {
             true,
         )
         .expect("expected session line");
-        assert_eq!(line, "session thread_123");
+        assert_eq!(line, "🧵 thread_123");
     }
 
     #[test]
@@ -2562,6 +2819,36 @@ mod tests {
     }
 
     #[test]
+    fn session_lines_include_execution_mode_values() {
+        let sandboxed = colorize_session_payload("019d-session | workspace-write");
+        assert!(sandboxed.contains("workspace-write"));
+
+        let unsandboxed = colorize_session_payload("019d-session | danger-full-access");
+        assert!(unsandboxed.contains("danger-full-access"));
+    }
+
+    #[test]
+    fn session_payload_uses_readable_sandbox_value() {
+        let rendered = colorize_session_payload("019d-session | workspace-write");
+        assert!(rendered.contains("019d-session"));
+        assert!(rendered.contains("\x1b[34mworkspace-write\x1b[0m"));
+    }
+
+    #[test]
+    fn session_event_line_uses_readable_sandbox_value() {
+        let printer = ProgressPrinter {
+            interactive: true,
+            status_line: None,
+            spinner_idx: 0,
+            cursor_hidden: false,
+        };
+        let rendered = printer.render_event_line("🧵 019d-session | danger-full-access");
+        assert!(rendered.contains("🧵"));
+        assert!(!rendered.contains("🧵 session "));
+        assert!(rendered.contains("\x1b[33mdanger-full-access\x1b[0m"));
+    }
+
+    #[test]
     fn non_json_line_maps_to_raw_text_without_progress_line() {
         let ev = parse_codex_stream_line("OpenAI Codex v0.118.0").expect("expected raw text");
         assert!(matches!(ev, ProviderEvent::RawText { .. }));
@@ -2584,6 +2871,7 @@ mod tests {
             stdout: String::new(),
             stderr: "HTTP error: 500 Internal Server Error".to_string(),
             usage: ProviderUsage::default(),
+            turn_count: 0,
         };
         assert!(is_transient_codex_failure(&run));
     }
@@ -2595,69 +2883,82 @@ mod tests {
     }
 
     #[test]
-    fn classifies_sandbox_restriction_failure_from_output() {
-        let run = ProviderRunResult {
-            session_id: None,
-            exit_code: Some(1),
-            stdout: String::new(),
-            stderr: "sandbox-exec: sandbox_apply: Operation not permitted".to_string(),
-            usage: ProviderUsage::default(),
-        };
-        assert!(is_sandbox_restriction_failure(&run));
-    }
-
-    #[test]
-    fn does_not_classify_generic_permission_denied_without_sandbox_context() {
-        let run = ProviderRunResult {
-            session_id: None,
-            exit_code: Some(1),
-            stdout: "Permission denied".to_string(),
-            stderr: String::new(),
-            usage: ProviderUsage::default(),
-        };
-        assert!(!is_sandbox_restriction_failure(&run));
-    }
-
-    #[test]
-    fn classifies_network_restriction_failure_from_output() {
-        let run = ProviderRunResult {
-            session_id: None,
-            exit_code: Some(1),
-            stdout: "curl: (6) Could not resolve host: api.github.com".to_string(),
-            stderr: String::new(),
-            usage: ProviderUsage::default(),
-        };
-        assert!(is_network_restriction_failure(&run));
-        assert!(should_retry_unsandboxed_after_failure(&run));
-    }
-
-    #[test]
-    fn detects_blocked_network_message_in_successful_run_output() {
-        let run = ProviderRunResult {
-            session_id: None,
-            exit_code: Some(0),
-            stdout: "Blocked by network restrictions; required release note downloads unavailable. could not resolve host".to_string(),
-            stderr: String::new(),
-            usage: ProviderUsage::default(),
-        };
-        assert!(output_reports_blocked_network(&run));
-    }
-
-    #[test]
-    fn does_not_detect_blocked_network_from_generic_restrictions_reasoning() {
-        let run = ProviderRunResult {
-            session_id: None,
-            exit_code: Some(0),
-            stdout: "I'm noticing network restrictions likely prevent direct Python or curl access to resources."
+    fn does_not_retry_without_agent_reason() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let request = ProviderRequest {
+            workspace_root: dir.path().to_path_buf(),
+            artifacts_root: None,
+            program_id: Some("release-notes".to_string()),
+            model: None,
+            agent_result_rel: ".clawform/programs/release-notes/reports/agent_result.json"
                 .to_string(),
-            stderr: String::new(),
-            usage: ProviderUsage::default(),
+            sandbox_mode: SandboxMode::Auto,
+            prompt: "x".to_string(),
+            progress: true,
+            render_progress: false,
+            verbose_output: false,
+            verbose_events: false,
+            interactive_ui: false,
+            show_intermediate_steps: false,
         };
-        assert!(!output_reports_blocked_network(&run));
+        assert!(!should_retry_unsandboxed_after_failure_with_agent_result(
+            &request,
+            std::time::SystemTime::now(),
+        ));
     }
 
     #[test]
-    fn reads_recent_agent_result_for_blocked_network_detection() {
+    fn does_not_retry_unsandboxed_from_output_heuristics_permission_or_connectivity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let request = ProviderRequest {
+            workspace_root: dir.path().to_path_buf(),
+            artifacts_root: None,
+            program_id: Some("hello-dstack".to_string()),
+            model: None,
+            agent_result_rel: ".clawform/programs/hello-dstack/reports/agent_result.json"
+                .to_string(),
+            sandbox_mode: SandboxMode::Auto,
+            prompt: "x".to_string(),
+            progress: true,
+            render_progress: false,
+            verbose_output: false,
+            verbose_events: false,
+            interactive_ui: false,
+            show_intermediate_steps: false,
+        };
+        assert!(!should_retry_unsandboxed_after_failure_with_agent_result(
+            &request,
+            std::time::SystemTime::now(),
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_unsandboxed_from_output_heuristics_dns_only() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let request = ProviderRequest {
+            workspace_root: dir.path().to_path_buf(),
+            artifacts_root: None,
+            program_id: Some("release-notes".to_string()),
+            model: None,
+            agent_result_rel: ".clawform/programs/release-notes/reports/agent_result.json"
+                .to_string(),
+            sandbox_mode: SandboxMode::Auto,
+            prompt: "x".to_string(),
+            progress: true,
+            render_progress: false,
+            verbose_output: false,
+            verbose_events: false,
+            interactive_ui: false,
+            show_intermediate_steps: false,
+        };
+        assert!(!should_retry_unsandboxed_after_failure_with_agent_result(
+            &request,
+            std::time::SystemTime::now(),
+        ));
+    }
+
+    #[test]
+    fn does_not_treat_message_only_agent_result_as_sandbox_blocked() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir
             .path()
@@ -2673,7 +2974,7 @@ mod tests {
         )
         .expect("write agent_result");
 
-        assert!(agent_result_reports_blocked_network(
+        assert!(!agent_result_reports_blocked_sandbox(
             dir.path(),
             ".clawform/programs/release-notes/reports/agent_result.json",
             started
@@ -2681,7 +2982,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_recent_agent_result_for_network_detection_without_blocked_keyword() {
+    fn does_not_treat_dns_message_without_reason_as_sandbox_blocked() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir
             .path()
@@ -2697,7 +2998,31 @@ mod tests {
         )
         .expect("write agent_result");
 
-        assert!(agent_result_reports_blocked_network(
+        assert!(!agent_result_reports_blocked_sandbox(
+            dir.path(),
+            ".clawform/programs/release-notes/reports/agent_result.json",
+            started
+        ));
+    }
+
+    #[test]
+    fn does_not_treat_legacy_reason_value_as_agent_result_signal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir
+            .path()
+            .join(".clawform/programs/release-notes/reports/agent_result.json");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create reports dir");
+        }
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(
+            &path,
+            r#"{"status":"failure","reason":"service_unreachable","message":"legacy reason"}"#,
+        )
+        .expect("write agent_result");
+
+        assert!(!agent_result_reports_blocked_sandbox(
             dir.path(),
             ".clawform/programs/release-notes/reports/agent_result.json",
             started
@@ -2717,11 +3042,107 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         std::fs::write(
             &path,
-            r#"{"status":"failure","reason":"sandbox_network_blocked","message":"blocked"}"#,
+            r#"{"status":"failure","reason":"sandbox_blocked","message":"blocked"}"#,
         )
         .expect("write agent_result");
 
-        assert!(agent_result_reports_blocked_network(
+        assert!(agent_result_reports_blocked_sandbox(
+            dir.path(),
+            ".clawform/programs/release-notes/reports/agent_result.json",
+            started
+        ));
+    }
+
+    #[test]
+    fn reads_recent_agent_result_for_generic_sandbox_reason_detection() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir
+            .path()
+            .join(".clawform/programs/release-notes/reports/agent_result.json");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create reports dir");
+        }
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(
+            &path,
+            r#"{"status":"failure","reason":"sandbox_blocked","message":"sandbox prevented required operation"}"#,
+        )
+        .expect("write agent_result");
+
+        assert!(agent_result_reports_blocked_sandbox(
+            dir.path(),
+            ".clawform/programs/release-notes/reports/agent_result.json",
+            started
+        ));
+    }
+
+    #[test]
+    fn does_not_treat_program_blocked_reason_as_sandbox_blocked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir
+            .path()
+            .join(".clawform/programs/release-notes/reports/agent_result.json");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create reports dir");
+        }
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(
+            &path,
+            r#"{"status":"failure","reason":"program_blocked","message":"permission denied on ~/.dstack/logs and server unreachable"}"#,
+        )
+        .expect("write agent_result");
+
+        assert!(!agent_result_reports_blocked_sandbox(
+            dir.path(),
+            ".clawform/programs/release-notes/reports/agent_result.json",
+            started
+        ));
+    }
+
+    #[test]
+    fn does_not_treat_program_blocked_reason_with_sandboxy_message_as_sandbox_blocked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir
+            .path()
+            .join(".clawform/programs/release-notes/reports/agent_result.json");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create reports dir");
+        }
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(
+            &path,
+            r#"{"status":"failure","reason":"program_blocked","message":"permission denied and failed to connect"}"#,
+        )
+        .expect("write agent_result");
+
+        assert!(!agent_result_reports_blocked_sandbox(
+            dir.path(),
+            ".clawform/programs/release-notes/reports/agent_result.json",
+            started
+        ));
+    }
+
+    #[test]
+    fn does_not_treat_unknown_sandbox_reason_as_blocked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir
+            .path()
+            .join(".clawform/programs/release-notes/reports/agent_result.json");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create reports dir");
+        }
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(
+            &path,
+            r#"{"status":"failure","reason":"sandbox_service_blocked","message":"sandbox prevented service bootstrap"}"#,
+        )
+        .expect("write agent_result");
+
+        assert!(!agent_result_reports_blocked_sandbox(
             dir.path(),
             ".clawform/programs/release-notes/reports/agent_result.json",
             started
@@ -2741,11 +3162,35 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         std::fs::write(
             &path,
-            r#"{"status":"success","reason":"sandbox_network_blocked","message":"done"}"#,
+            r#"{"status":"success","reason":"sandbox_blocked","message":"done"}"#,
         )
         .expect("write agent_result");
 
-        assert!(!agent_result_reports_blocked_network(
+        assert!(!agent_result_reports_blocked_sandbox(
+            dir.path(),
+            ".clawform/programs/release-notes/reports/agent_result.json",
+            started
+        ));
+    }
+
+    #[test]
+    fn ignores_sandbox_blocked_flag_when_status_is_success() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir
+            .path()
+            .join(".clawform/programs/release-notes/reports/agent_result.json");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create reports dir");
+        }
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(
+            &path,
+            r#"{"status":"success","reason":"program_blocked","message":"done"}"#,
+        )
+        .expect("write agent_result");
+
+        assert!(!agent_result_reports_blocked_sandbox(
             dir.path(),
             ".clawform/programs/release-notes/reports/agent_result.json",
             started
@@ -2765,7 +3210,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         std::fs::write(
             &path,
-            r#"{"status":"failure","reason":"sandbox_network_blocked","message":"curl failed"}"#,
+            r#"{"status":"failure","reason":"sandbox_blocked","message":"curl failed"}"#,
         )
         .expect("write agent_result");
 
@@ -2775,8 +3220,80 @@ mod tests {
         };
         assert_eq!(
             detect_early_auto_retry_reason(Some(&monitor)).as_deref(),
-            Some("sandbox_network_blocked")
+            Some("sandbox_blocked")
         );
+    }
+
+    #[test]
+    fn does_not_detect_early_auto_retry_reason_for_program_blocked_reason() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir
+            .path()
+            .join(".clawform/programs/release-notes/reports/agent_result.json");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create reports dir");
+        }
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(
+            &path,
+            r#"{"status":"failure","reason":"program_blocked","message":"permission denied and failed to connect"}"#,
+        )
+        .expect("write agent_result");
+
+        let monitor = EarlyAutoRetryMonitor {
+            agent_result_path: path,
+            run_started_at: started,
+        };
+        assert!(detect_early_auto_retry_reason(Some(&monitor)).is_none());
+    }
+
+    #[test]
+    fn does_not_detect_early_auto_retry_reason_for_program_blocked_reason_with_sandboxy_message() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir
+            .path()
+            .join(".clawform/programs/release-notes/reports/agent_result.json");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create reports dir");
+        }
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(
+            &path,
+            r#"{"status":"failure","reason":"program_blocked","message":"permission denied and failed to connect"}"#,
+        )
+        .expect("write agent_result");
+
+        let monitor = EarlyAutoRetryMonitor {
+            agent_result_path: path,
+            run_started_at: started,
+        };
+        assert!(detect_early_auto_retry_reason(Some(&monitor)).is_none());
+    }
+
+    #[test]
+    fn does_not_trigger_early_auto_retry_for_unknown_sandbox_reason() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir
+            .path()
+            .join(".clawform/programs/release-notes/reports/agent_result.json");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create reports dir");
+        }
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(
+            &path,
+            r#"{"status":"failure","reason":"sandbox_service_blocked","message":"sandbox blocked required service bootstrap"}"#,
+        )
+        .expect("write agent_result");
+
+        let monitor = EarlyAutoRetryMonitor {
+            agent_result_path: path,
+            run_started_at: started,
+        };
+        assert!(detect_early_auto_retry_reason(Some(&monitor)).is_none());
     }
 
     #[test]
@@ -2790,7 +3307,7 @@ mod tests {
         }
         std::fs::write(
             &path,
-            r#"{"status":"failure","reason":"sandbox_network_blocked","message":"curl failed"}"#,
+            r#"{"status":"failure","reason":"sandbox_blocked","message":"curl failed"}"#,
         )
         .expect("write agent_result");
         let started = std::time::SystemTime::now()
@@ -2804,7 +3321,7 @@ mod tests {
     }
 
     #[test]
-    fn retries_unsandboxed_when_failed_run_has_blocked_network_in_agent_result() {
+    fn retries_unsandboxed_when_failed_run_has_sandbox_blocked_reason() {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace_root = dir.path().to_path_buf();
         let result_path =
@@ -2816,7 +3333,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         std::fs::write(
             &result_path,
-            r#"{"status":"failure","message":"Blocked by network restrictions; required release note downloads unavailable"}"#,
+            r#"{"status":"failure","reason":"sandbox_blocked","message":"Blocked by network restrictions; required release note downloads unavailable"}"#,
         )
         .expect("write agent_result");
 
@@ -2836,21 +3353,13 @@ mod tests {
             interactive_ui: false,
             show_intermediate_steps: false,
         };
-        let run = ProviderRunResult {
-            session_id: None,
-            exit_code: Some(1),
-            stdout: String::new(),
-            stderr: String::new(),
-            usage: ProviderUsage::default(),
-        };
-
         assert!(should_retry_unsandboxed_after_failure_with_agent_result(
-            &request, &run, started
+            &request, started
         ));
     }
 
     #[test]
-    fn success_path_retries_when_agent_result_reports_network_restriction() {
+    fn success_path_retries_when_agent_result_reports_sandbox_blocked_reason() {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace_root = dir.path().to_path_buf();
         let result_rel = ".clawform/programs/release-notes/reports/agent_result.json";
@@ -2874,7 +3383,6 @@ mod tests {
             interactive_ui: false,
             show_intermediate_steps: false,
         };
-
         let started_no_file = std::time::SystemTime::now();
         assert!(!should_retry_unsandboxed_after_success(
             &request,
@@ -2885,7 +3393,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         std::fs::write(
             &result_path,
-            r#"{"status":"failure","message":"curl failed: Could not resolve host: example.com"}"#,
+            r#"{"status":"failure","reason":"sandbox_blocked","message":"curl failed: Could not resolve host: example.com"}"#,
         )
         .expect("write agent_result");
 
@@ -2893,6 +3401,77 @@ mod tests {
             &request,
             started_with_file
         ));
+    }
+
+    #[test]
+    fn success_path_does_not_retry_when_reason_is_program_blocked_even_if_output_looks_sandboxy() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace_root = dir.path().to_path_buf();
+        let result_rel = ".clawform/programs/hello-dstack/reports/agent_result.json";
+        let result_path = workspace_root.join(result_rel);
+        if let Some(parent) = result_path.parent() {
+            std::fs::create_dir_all(parent).expect("create reports dir");
+        }
+
+        let request = ProviderRequest {
+            workspace_root: workspace_root.clone(),
+            artifacts_root: None,
+            program_id: Some("hello-dstack".to_string()),
+            model: None,
+            agent_result_rel: result_rel.to_string(),
+            sandbox_mode: SandboxMode::Auto,
+            prompt: "x".to_string(),
+            progress: true,
+            render_progress: false,
+            verbose_output: false,
+            verbose_events: false,
+            interactive_ui: false,
+            show_intermediate_steps: false,
+        };
+
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(
+            &result_path,
+            r#"{"status":"failure","reason":"program_blocked","message":"failed to reach local dstack server"}"#,
+        )
+        .expect("write agent_result");
+
+        assert!(!should_retry_unsandboxed_after_success(&request, started));
+    }
+
+    #[test]
+    fn success_path_does_not_retry_when_agent_result_is_success() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace_root = dir.path().to_path_buf();
+        let result_rel = ".clawform/programs/hello-dstack/reports/agent_result.json";
+        let result_path = workspace_root.join(result_rel);
+        if let Some(parent) = result_path.parent() {
+            std::fs::create_dir_all(parent).expect("create reports dir");
+        }
+
+        let request = ProviderRequest {
+            workspace_root: workspace_root.clone(),
+            artifacts_root: None,
+            program_id: Some("hello-dstack".to_string()),
+            model: None,
+            agent_result_rel: result_rel.to_string(),
+            sandbox_mode: SandboxMode::Auto,
+            prompt: "x".to_string(),
+            progress: true,
+            render_progress: false,
+            verbose_output: false,
+            verbose_events: false,
+            interactive_ui: false,
+            show_intermediate_steps: false,
+        };
+
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(&result_path, r#"{"status":"success","message":"all good"}"#)
+            .expect("write agent_result");
+
+        assert!(!should_retry_unsandboxed_after_success(&request, started));
     }
 
     #[test]

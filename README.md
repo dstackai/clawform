@@ -2,7 +2,7 @@
 
 Clawform executes agentic programs from markdown files.
 
-You keep instructions in repo files and run `cf -f program.md` (equivalent to `cf apply -f program.md`). Each run uses `.clawform/agent_*.json|md` protocol files, writes session data under `.clawform/programs/<program_id>/sessions/<session_id>/`, and appends `.clawform/history/index.jsonl`.
+You keep instructions in repo files and run `cf -f program.md` (equivalent to `cf apply -f program.md`). Each run writes session data under `.clawform/programs/<program_id>/sessions/<session_id>/` and appends `.clawform/history/index.jsonl`.
 
 ## Why It Exists
 
@@ -34,13 +34,13 @@ Before execution, Clawform previews:
 
 Then it asks for confirmation and executes the program with the configured provider.
 
-During execution, Clawform streams agent progress events to the terminal and writes per-session `commands/*` and `messages/*` files for clickable `out`/`msg` links.
+During execution, Clawform streams progress events to the terminal.
 
 After execution, Clawform stores:
 
 - run outcome and summary (`outcome.json`, `output.md`)
 - per-session snapshots for next-run diff (`program.md`, `variables.json`)
-- changed files reported for this session (from `agent_outputs.json`)
+- changed files reported for this session
 
 ## Install
 
@@ -98,10 +98,11 @@ Last session: 019d5843-eb2d-70b1-b49a-343033117944 (success, 43m ago)
   program: examples/smoke.md unchanged
   changes: 0 files
 Proceed? [y/N] y
-session 019d586b-aa65-78b2-8a0d-27b5543c59bb
+🧵 019d586b-aa65-78b2-8a0d-27b5543c59bb | workspace-write
 ✔ cat examples/smoke.md | 1ms | out
 💬 Verified `example-data/output-smoke.txt:1` already contains the required `SMOKE_OK` line with trailing newline. | msg
 turn 1 | tokens: in=117k out=1.6k cached=107k
+✅ Verified `example-data/output-smoke.txt` already contains `SMOKE_OK`. | file
 total | tokens: in=117k out=1.6k cached=107k
 changes: 0 files
 ```
@@ -115,6 +116,8 @@ Clawform keeps local state under `.clawform/`:
 - per-program sessions: `.clawform/programs/<program_id>/sessions/<session_id>/`
 
 Session folders keep `program.md`, `variables.json`, `output.md`, `outcome.json`, plus `commands/*` and `messages/*` used by interactive `out`/`msg` links.
+
+For internal protocol details and strict agent result schema, see `contrib/ARCHITECTURE.md`.
 
 ## Commands
 
