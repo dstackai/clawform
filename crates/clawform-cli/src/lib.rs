@@ -63,7 +63,7 @@ enum Commands {
         #[arg(short = 'y', long)]
         yes: bool,
 
-        /// Print raw provider stdout/stderr (debug output).
+        /// Enable concise debug output.
         #[arg(short = 'd', long)]
         debug: bool,
 
@@ -239,15 +239,6 @@ fn real_main() -> Result<()> {
                         &run.usage,
                         progress_mode == CliProgressMode::Off || quiet,
                     );
-
-                    if debug {
-                        if !run.stdout.trim().is_empty() {
-                            println!("Provider stdout:\n{}", run.stdout);
-                        }
-                        if !run.stderr.trim().is_empty() {
-                            eprintln!("Provider stderr:\n{}", run.stderr);
-                        }
-                    }
                 }
             }
         }
