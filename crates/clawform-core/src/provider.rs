@@ -430,6 +430,7 @@ fn run_codex_once(
 ) -> Result<ProviderRunResult> {
     ensure_interrupt_handler()?;
     clear_interrupt_request();
+    clear_agent_result_protocol_file(&request.workspace_root, request.agent_result_rel.as_str())?;
     let run_started_at = SystemTime::now();
     let early_auto_retry_monitor =
         maybe_build_early_auto_retry_monitor(request, mode, run_started_at);
@@ -634,10 +635,36 @@ fn detect_early_auto_retry_reason(monitor: Option<&EarlyAutoRetryMonitor>) -> Op
     None
 }
 
+fn clear_agent_result_protocol_file(workspace_root: &Path, result_rel: &str) -> Result<()> {
+    let rel = result_rel.trim();
+    if rel.is_empty() {
+        return Ok(());
+    }
+    let path = workspace_root.join(rel);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed clearing previous agent result protocol file '{}'",
+                path.display()
+            )
+        }),
+    }
+}
+
 fn read_recent_agent_result_value(path: &Path, run_started_at: SystemTime) -> Option<Value> {
     let metadata = fs::metadata(path).ok()?;
     let modified = metadata.modified().ok()?;
-    if modified < run_started_at {
+    let run_started_sec = run_started_at
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())?;
+    let modified_sec = modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())?;
+    if modified_sec < run_started_sec {
         return None;
     }
     let raw = fs::read_to_string(path).ok()?;
@@ -2711,7 +2738,7 @@ mod tests {
         )
         .expect("write agent_result");
         let started = std::time::SystemTime::now()
-            .checked_add(std::time::Duration::from_millis(250))
+            .checked_add(std::time::Duration::from_secs(2))
             .expect("future ts");
         let monitor = EarlyAutoRetryMonitor {
             agent_result_path: path,

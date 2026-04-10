@@ -4,7 +4,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -284,7 +284,7 @@ fn execute_apply<R: ProviderRunner>(
     plan_data: SharedPlanData,
     runner: &R,
 ) -> Result<ApplyResult> {
-    let run_started_at = now_unix_millis();
+    clear_runtime_protocol_outputs(&request.workspace_root)?;
     let before_state = if request.debug {
         Some(snapshot_workspace_state(&request.workspace_root)?)
     } else {
@@ -396,13 +396,11 @@ fn execute_apply<R: ProviderRunner>(
     let provider_stderr_artifact = None;
     let events_artifact = None;
     let agent_reported_files =
-        read_agent_reported_files_since(&request.workspace_root, run_started_at)
-            .unwrap_or_default();
-    let agent_human_summary_explicit =
-        read_agent_human_summary_since(&request.workspace_root, run_started_at)
-            .ok()
-            .flatten();
-    let agent_result = read_agent_result_since(&request.workspace_root, run_started_at)?;
+        read_agent_reported_files(&request.workspace_root).unwrap_or_default();
+    let agent_human_summary_explicit = read_agent_human_summary(&request.workspace_root)
+        .ok()
+        .flatten();
+    let agent_result = read_agent_result(&request.workspace_root)?;
     let derived_summary = read_derived_agent_summary(
         &request.workspace_root,
         &context.program_key,
@@ -1362,18 +1360,6 @@ fn read_agent_reported_files(workspace_root: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn read_agent_reported_files_since(
-    workspace_root: &Path,
-    since_unix_ms: u64,
-) -> Result<Vec<String>> {
-    let path = workspace_root.join(AGENT_OUTPUT_MANIFEST_REL);
-    if path.exists() && file_modified_since(&path, since_unix_ms)? {
-        return read_agent_reported_files(workspace_root);
-    }
-
-    Ok(Vec::new())
-}
-
 fn is_internal_reported_path(path: &str) -> bool {
     path == AGENT_OUTPUT_MANIFEST_REL
         || path == AGENT_HUMAN_OUTPUT_REL
@@ -1395,20 +1381,6 @@ fn read_agent_human_summary(workspace_root: &Path) -> Result<Option<String>> {
     }
 
     Ok(Some(trimmed.to_string()))
-}
-
-fn read_agent_human_summary_since(
-    workspace_root: &Path,
-    since_unix_ms: u64,
-) -> Result<Option<String>> {
-    let path = workspace_root.join(AGENT_HUMAN_OUTPUT_REL);
-    if !path.exists() {
-        return Ok(None);
-    }
-    if !file_modified_since(&path, since_unix_ms)? {
-        return Ok(None);
-    }
-    read_agent_human_summary(workspace_root)
 }
 
 fn read_agent_result(workspace_root: &Path) -> Result<Option<AgentResult>> {
@@ -1445,15 +1417,24 @@ fn read_agent_result(workspace_root: &Path) -> Result<Option<AgentResult>> {
     }))
 }
 
-fn read_agent_result_since(
-    workspace_root: &Path,
-    since_unix_ms: u64,
-) -> Result<Option<AgentResult>> {
-    let path = workspace_root.join(AGENT_RESULT_REL);
-    if !path.exists() || !file_modified_since(&path, since_unix_ms)? {
-        return Ok(None);
+fn clear_runtime_protocol_outputs(workspace_root: &Path) -> Result<()> {
+    for rel in [
+        AGENT_OUTPUT_MANIFEST_REL,
+        AGENT_HUMAN_OUTPUT_REL,
+        AGENT_RESULT_REL,
+    ] {
+        let path = workspace_root.join(rel);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed clearing protocol output file '{}'", path.display())
+                });
+            }
+        }
     }
-    read_agent_result(workspace_root)
+    Ok(())
 }
 
 fn read_derived_agent_summary(
@@ -1740,25 +1721,6 @@ fn normalize_reported_rel_path(raw: &str) -> Option<String> {
     }
 
     Some(to_slash_path(&normalized))
-}
-
-fn now_unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn file_modified_since(path: &Path, since_unix_ms: u64) -> Result<bool> {
-    let modified = fs::metadata(path)
-        .with_context(|| format!("failed reading metadata '{}'", path.display()))?
-        .modified()
-        .with_context(|| format!("failed reading mtime '{}'", path.display()))?;
-    let modified_ms = modified
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    Ok(modified_ms >= since_unix_ms)
 }
 
 fn snapshot_workspace_state(
