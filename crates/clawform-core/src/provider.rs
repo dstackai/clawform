@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
@@ -15,7 +15,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::path_utils::to_slash_path;
 use anyhow::{anyhow, Context, Result};
-use serde::Serialize;
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
@@ -29,6 +28,7 @@ pub struct ProviderRequest {
     pub prompt: String,
     pub progress: bool,
     pub render_progress: bool,
+    pub verbose_output: bool,
     pub verbose_events: bool,
     pub interactive_ui: bool,
     pub show_intermediate_steps: bool,
@@ -219,15 +219,6 @@ struct EarlyAutoRetryMonitor {
     run_started_at: SystemTime,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct CanonicalEventRecord {
-    seq: u64,
-    ts_unix_ms: u64,
-    stream: String,
-    event_type: String,
-    raw: String,
-}
-
 #[derive(Debug)]
 struct CommandOutputSink {
     root: Option<PathBuf>,
@@ -330,24 +321,6 @@ fn now_unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn canonical_event_type_name(event: &ProviderEvent) -> String {
-    match event {
-        ProviderEvent::RunStarted { .. } => "thread.started".to_string(),
-        ProviderEvent::TurnStarted => "turn.started".to_string(),
-        ProviderEvent::TurnCompleted { .. } => "turn.completed".to_string(),
-        ProviderEvent::TurnFailed { .. } => "turn.failed".to_string(),
-        ProviderEvent::ItemStarted { .. } => "item.started".to_string(),
-        ProviderEvent::ItemUpdated { .. } => "item.updated".to_string(),
-        ProviderEvent::ItemCompleted { .. } => "item.completed".to_string(),
-        ProviderEvent::Error { .. } => "error".to_string(),
-        ProviderEvent::RawEvent {
-            provider_event_type,
-        } => provider_event_type.clone(),
-        ProviderEvent::RawText { .. } => "raw_text".to_string(),
-        ProviderEvent::Heartbeat { .. } => "heartbeat".to_string(),
-    }
-}
-
 fn session_base_dir(root: &Path, program_id: Option<&str>, session_id: &str) -> PathBuf {
     let program = sanitize_program_id(program_id.unwrap_or("program"));
     let session = sanitize_session_id(session_id);
@@ -356,51 +329,6 @@ fn session_base_dir(root: &Path, program_id: Option<&str>, session_id: &str) -> 
         .join(program)
         .join("sessions")
         .join(session)
-}
-
-fn persist_canonical_events(
-    root: Option<&Path>,
-    program_id: Option<&str>,
-    session_id: &str,
-    records: &[CanonicalEventRecord],
-) -> Result<Option<PathBuf>> {
-    let Some(root) = root else {
-        return Ok(None);
-    };
-    if records.is_empty() {
-        return Ok(None);
-    }
-
-    let out_path = session_base_dir(root, program_id, session_id).join("events.ndjson");
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed creating canonical events directory '{}'",
-                parent.display()
-            )
-        })?;
-    }
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&out_path)
-        .with_context(|| format!("failed opening canonical events '{}'", out_path.display()))?;
-    for record in records {
-        let line =
-            serde_json::to_string(record).context("failed serializing canonical event record")?;
-        file.write_all(line.as_bytes())
-            .with_context(|| format!("failed writing canonical events '{}'", out_path.display()))?;
-        file.write_all(b"\n").with_context(|| {
-            format!(
-                "failed finalizing canonical events '{}'",
-                out_path.display()
-            )
-        })?;
-    }
-
-    Ok(Some(out_path))
 }
 
 impl ProviderRunner for CodexRunner {
@@ -503,6 +431,7 @@ fn run_codex_once(
 ) -> Result<ProviderRunResult> {
     ensure_interrupt_handler()?;
     clear_interrupt_request();
+    clear_agent_result_protocol_file(&request.workspace_root, request.agent_result_rel.as_str())?;
     let run_started_at = SystemTime::now();
     let early_auto_retry_monitor =
         maybe_build_early_auto_retry_monitor(request, mode, run_started_at);
@@ -553,6 +482,7 @@ fn run_codex_once(
         return collect_with_progress(
             child,
             request.render_progress,
+            request.verbose_output,
             request.verbose_events,
             request.interactive_ui,
             request.show_intermediate_steps,
@@ -566,34 +496,6 @@ fn run_codex_once(
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let fallback_session_id = format!("local-{}", now_unix_millis());
-    let mut seq = 0u64;
-    let mut records = Vec::new();
-    for line in stdout.lines() {
-        records.push(CanonicalEventRecord {
-            seq,
-            ts_unix_ms: now_unix_millis(),
-            stream: "stdout".to_string(),
-            event_type: "stdout.line".to_string(),
-            raw: line.to_string(),
-        });
-        seq = seq.saturating_add(1);
-    }
-    for line in stderr.lines() {
-        records.push(CanonicalEventRecord {
-            seq,
-            ts_unix_ms: now_unix_millis(),
-            stream: "stderr".to_string(),
-            event_type: "stderr.line".to_string(),
-            raw: line.to_string(),
-        });
-        seq = seq.saturating_add(1);
-    }
-    let _ = persist_canonical_events(
-        request.artifacts_root.as_deref(),
-        request.program_id.as_deref(),
-        fallback_session_id.as_str(),
-        &records,
-    )?;
 
     return Ok(ProviderRunResult {
         session_id: Some(fallback_session_id),
@@ -735,10 +637,36 @@ fn detect_early_auto_retry_reason(monitor: Option<&EarlyAutoRetryMonitor>) -> Op
     None
 }
 
+fn clear_agent_result_protocol_file(workspace_root: &Path, result_rel: &str) -> Result<()> {
+    let rel = result_rel.trim();
+    if rel.is_empty() {
+        return Ok(());
+    }
+    let path = workspace_root.join(rel);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed clearing previous agent result protocol file '{}'",
+                path.display()
+            )
+        }),
+    }
+}
+
 fn read_recent_agent_result_value(path: &Path, run_started_at: SystemTime) -> Option<Value> {
     let metadata = fs::metadata(path).ok()?;
     let modified = metadata.modified().ok()?;
-    if modified < run_started_at {
+    let run_started_sec = run_started_at
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())?;
+    let modified_sec = modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())?;
+    if modified_sec < run_started_sec {
         return None;
     }
     let raw = fs::read_to_string(path).ok()?;
@@ -855,6 +783,7 @@ fn maybe_build_early_auto_retry_monitor(
 fn collect_with_progress(
     mut child: std::process::Child,
     render_progress: bool,
+    verbose_output: bool,
     verbose_events: bool,
     interactive_ui: bool,
     show_intermediate_steps: bool,
@@ -881,8 +810,6 @@ fn collect_with_progress(
     let mut last_activity = String::new();
     let mut active_progress_items: Vec<(String, String)> = Vec::new();
     let mut last_agent_text_line: Option<String> = None;
-    let mut canonical_records: Vec<CanonicalEventRecord> = Vec::new();
-    let mut canonical_seq: u64 = 0;
     let mut item_started_at: HashMap<String, Instant> = HashMap::new();
     let mut usage_totals = ProviderUsage::default();
     let mut printer = ProgressPrinter::new(render_progress && interactive_ui);
@@ -934,33 +861,14 @@ fn collect_with_progress(
                 } else {
                     None
                 };
-                let event_type = match normalized.as_ref() {
-                    Some(ev) => canonical_event_type_name(ev),
-                    None => {
-                        if is_stdout {
-                            "stdout.line".to_string()
-                        } else {
-                            "stderr.line".to_string()
-                        }
-                    }
-                };
-                canonical_records.push(CanonicalEventRecord {
-                    seq: canonical_seq,
-                    ts_unix_ms: now_unix_millis(),
-                    stream: if is_stdout {
-                        "stdout".to_string()
-                    } else {
-                        "stderr".to_string()
-                    },
-                    event_type,
-                    raw: line.clone(),
-                });
-                canonical_seq = canonical_seq.saturating_add(1);
 
                 // Liveness/progress is driven only by Codex JSON stream on stdout.
                 // Stderr can contain banners or transport noise, but we still surface useful startup hints.
                 if is_stdout {
                     if let Some(normalized) = normalized {
+                        let command_payload = extract_command_output_payload(&line);
+                        let message_payload = extract_message_output_payload(&line);
+
                         match normalized {
                             ProviderEvent::RunStarted { ref run_id } => {
                                 if let Some(id) = run_id.as_ref() {
@@ -1023,18 +931,18 @@ fn collect_with_progress(
                         if !matches!(normalized, ProviderEvent::RawText { .. }) {
                             emitted_progress_events += 1;
                         }
-                        if let Some(payload) = extract_command_output_payload(&line) {
+                        if let Some(payload) = command_payload.as_ref() {
                             if let Ok(Some(path)) =
-                                sink.persist(program_id, session_id.as_deref(), &payload)
+                                sink.persist(program_id, session_id.as_deref(), payload)
                             {
-                                command_output_links.insert(payload.item_id, path);
+                                command_output_links.insert(payload.item_id.clone(), path);
                             }
                         }
-                        if let Some(payload) = extract_message_output_payload(&line) {
+                        if let Some(payload) = message_payload.as_ref() {
                             if let Ok(Some(path)) =
-                                sink.persist_message(program_id, session_id.as_deref(), &payload)
+                                sink.persist_message(program_id, session_id.as_deref(), payload)
                             {
-                                message_output_links.insert(payload.item_id, path);
+                                message_output_links.insert(payload.item_id.clone(), path);
                             }
                         }
                         if let Some(payload) = extract_file_change_payload(&line) {
@@ -1058,18 +966,27 @@ fn collect_with_progress(
                         if let Some(progress_line) = progress_line {
                             let progress_line =
                                 add_completion_duration_suffix(&progress_line, completion_duration);
-                            let progress_line = add_command_output_link_suffix(
-                                &normalized,
-                                &progress_line,
-                                &command_output_links,
-                                supports_hyperlinks,
-                            );
-                            let progress_line = add_message_output_link_suffix(
-                                &normalized,
-                                &progress_line,
-                                &message_output_links,
-                                supports_hyperlinks,
-                            );
+                            let progress_line = if verbose_output {
+                                expand_verbose_progress_line(
+                                    &normalized,
+                                    &progress_line,
+                                    command_payload.as_ref(),
+                                    message_payload.as_ref(),
+                                )
+                            } else {
+                                let progress_line = add_command_output_link_suffix(
+                                    &normalized,
+                                    &progress_line,
+                                    &command_output_links,
+                                    supports_hyperlinks,
+                                );
+                                add_message_output_link_suffix(
+                                    &normalized,
+                                    &progress_line,
+                                    &message_output_links,
+                                    supports_hyperlinks,
+                                )
+                            };
                             let progress_line = add_file_change_link_suffix(
                                 &normalized,
                                 &progress_line,
@@ -1153,12 +1070,6 @@ fn collect_with_progress(
         Some(id) if !id.trim().is_empty() => sanitize_session_id(id),
         _ => format!("local-{}", now_unix_millis()),
     };
-    let _ = persist_canonical_events(
-        artifacts_root,
-        program_id,
-        final_session_id.as_str(),
-        &canonical_records,
-    )?;
 
     Ok(ProviderRunResult {
         session_id: Some(final_session_id),
@@ -1167,6 +1078,47 @@ fn collect_with_progress(
         stderr: raw_stderr,
         usage: usage_totals,
     })
+}
+
+fn expand_verbose_progress_line(
+    event: &ProviderEvent,
+    line: &str,
+    command_payload: Option<&CommandOutputPayload>,
+    message_payload: Option<&MessageOutputPayload>,
+) -> String {
+    if let Some(payload) = command_payload {
+        if matches!(
+            event,
+            ProviderEvent::ItemCompleted { item_type, .. } if item_type == "command_execution"
+        ) {
+            let output = payload.output.trim_end();
+            if output.is_empty() {
+                return line.to_string();
+            }
+            return format!("{}\n{}", line, output);
+        }
+    }
+
+    if let Some(payload) = message_payload {
+        if matches!(
+            event,
+            ProviderEvent::ItemCompleted { item_type, .. }
+                if is_reasoning_item_type(item_type) || is_agent_text_item_type(item_type)
+        ) {
+            let text = payload.text.trim_end();
+            if text.is_empty() {
+                return line.to_string();
+            }
+            let prefix = if is_reasoning_item_type(payload.item_type.as_str()) {
+                "💭"
+            } else {
+                "💬"
+            };
+            return format!("{} {}", prefix, text);
+        }
+    }
+
+    line.to_string()
 }
 
 fn merge_usage(totals: &mut ProviderUsage, usage: &ProviderUsage) {
@@ -2023,11 +1975,9 @@ fn is_low_signal_command(summary: &str) -> bool {
 fn is_clawform_housekeeping_command(summary: &str) -> bool {
     let s = summary.trim().to_ascii_lowercase();
     s.starts_with("write .clawform/agent_output.md")
-        || s.starts_with("write .clawform/agent_summary.md")
         || s.starts_with("write .clawform/agent_outputs.json")
         || s.starts_with("write .clawform/agent_result.json")
         || s.starts_with("cat .clawform/agent_output.md")
-        || s.starts_with("cat .clawform/agent_summary.md")
         || s.starts_with("cat .clawform/agent_outputs.json")
         || s.starts_with("cat .clawform/agent_result.json")
         || {
@@ -2844,7 +2794,7 @@ mod tests {
         )
         .expect("write agent_result");
         let started = std::time::SystemTime::now()
-            .checked_add(std::time::Duration::from_millis(250))
+            .checked_add(std::time::Duration::from_secs(2))
             .expect("future ts");
         let monitor = EarlyAutoRetryMonitor {
             agent_result_path: path,
@@ -2881,6 +2831,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
             show_intermediate_steps: false,
@@ -2918,6 +2869,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
             show_intermediate_steps: false,

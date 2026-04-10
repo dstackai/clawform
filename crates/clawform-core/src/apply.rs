@@ -4,7 +4,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -25,14 +25,8 @@ use crate::provider::{ProviderRequest, ProviderRunResult, ProviderRunner, Sandbo
 
 const AGENT_OUTPUT_MANIFEST_REL: &str = ".clawform/agent_outputs.json";
 const AGENT_HUMAN_OUTPUT_REL: &str = ".clawform/agent_output.md";
-const AGENT_HUMAN_OUTPUT_LEGACY_REL: &str = ".clawform/agent_summary.md";
 const AGENT_RESULT_REL: &str = ".clawform/agent_result.json";
 const RUNTIME_VARIABLES_INPUT_REL: &str = ".clawform/agent_variables.json";
-const SESSION_PROMPT_ARTIFACT_FILE: &str = "prompt.md";
-const SESSION_PLAN_ARTIFACT_FILE: &str = "plan.json";
-const SESSION_STDOUT_ARTIFACT_FILE: &str = "provider.stdout.log";
-const SESSION_STDERR_ARTIFACT_FILE: &str = "provider.stderr.log";
-const SESSION_EVENTS_ARTIFACT_FILE: &str = "events.ndjson";
 const MAX_HISTORY_TEXT_CHARS: usize = 180;
 const MAX_HISTORY_FILE_SAMPLE: usize = 3;
 const SNAPSHOT_TEXT_LIMIT_BYTES: usize = 256 * 1024;
@@ -44,6 +38,7 @@ pub struct ApplyRequest {
     pub program_variables: BTreeMap<String, String>,
     pub confirm: bool,
     pub debug: bool,
+    pub verbose_output: bool,
     pub progress: bool,
     pub render_progress: bool,
     pub interactive_ui: bool,
@@ -290,7 +285,7 @@ fn execute_apply<R: ProviderRunner>(
     plan_data: SharedPlanData,
     runner: &R,
 ) -> Result<ApplyResult> {
-    let run_started_at = now_unix_millis();
+    clear_runtime_protocol_outputs(&request.workspace_root)?;
     let before_state = if request.debug {
         Some(snapshot_workspace_state(&request.workspace_root)?)
     } else {
@@ -302,7 +297,6 @@ fn execute_apply<R: ProviderRunner>(
 
     sync_runtime_variables_input(&request.workspace_root, &context.program_variables)?;
     let prompt = build_runtime_prompt(&context.program_raw, &plan_data)?;
-    let prompt_for_debug = prompt.clone();
 
     let run_result = match runner.run(&ProviderRequest {
         workspace_root: request.workspace_root.clone(),
@@ -314,6 +308,7 @@ fn execute_apply<R: ProviderRunner>(
         prompt,
         progress: request.progress,
         render_progress: request.render_progress,
+        verbose_output: request.verbose_output,
         verbose_events: true,
         interactive_ui: request.interactive_ui,
         show_intermediate_steps: request.show_intermediate_steps,
@@ -321,18 +316,6 @@ fn execute_apply<R: ProviderRunner>(
         Ok(run) => run,
         Err(err) => {
             let failure_session_id = derive_session_key(None);
-            let _ = persist_session_prompt(
-                &request.workspace_root,
-                &context.program_key,
-                &failure_session_id,
-                &prompt_for_debug,
-            );
-            let _ = persist_session_plan(
-                &request.workspace_root,
-                &context.program_key,
-                &failure_session_id,
-                &plan_data,
-            );
             let _ = persist_session_outcome(
                 &request.workspace_root,
                 &context.program_key,
@@ -372,32 +355,6 @@ fn execute_apply<R: ProviderRunner>(
 
     if let Err(err) = run_result.ensure_success() {
         let failure_session_id = derive_session_key(run_result.session_id.as_deref());
-        let _ = persist_session_prompt(
-            &request.workspace_root,
-            &context.program_key,
-            &failure_session_id,
-            &prompt_for_debug,
-        );
-        let _ = persist_session_plan(
-            &request.workspace_root,
-            &context.program_key,
-            &failure_session_id,
-            &plan_data,
-        );
-        let _ = persist_provider_log(
-            &request.workspace_root,
-            &context.program_key,
-            &failure_session_id,
-            SESSION_STDOUT_ARTIFACT_FILE,
-            &run_result.stdout,
-        );
-        let _ = persist_provider_log(
-            &request.workspace_root,
-            &context.program_key,
-            &failure_session_id,
-            SESSION_STDERR_ARTIFACT_FILE,
-            &run_result.stderr,
-        );
         let _ = persist_session_outcome(
             &request.workspace_root,
             &context.program_key,
@@ -435,52 +392,17 @@ fn execute_apply<R: ProviderRunner>(
     }
 
     let success_session_id = derive_session_key(run_result.session_id.as_deref());
-    let prompt_artifact = persist_session_prompt(
-        &request.workspace_root,
-        &context.program_key,
-        &success_session_id,
-        &prompt_for_debug,
-    )
-    .ok();
-    let plan_artifact = persist_session_plan(
-        &request.workspace_root,
-        &context.program_key,
-        &success_session_id,
-        &plan_data,
-    )
-    .ok();
-    let provider_stdout_artifact = persist_provider_log(
-        &request.workspace_root,
-        &context.program_key,
-        &success_session_id,
-        SESSION_STDOUT_ARTIFACT_FILE,
-        &run_result.stdout,
-    )
-    .ok();
-    let provider_stderr_artifact = persist_provider_log(
-        &request.workspace_root,
-        &context.program_key,
-        &success_session_id,
-        SESSION_STDERR_ARTIFACT_FILE,
-        &run_result.stderr,
-    )
-    .ok();
-    let events_artifact = session_events_artifact_path(
-        &request.workspace_root,
-        &context.program_key,
-        &success_session_id,
-    );
-    let agent_reported_files = read_agent_reported_files_since(
-        &request.workspace_root,
-        &context.program_key,
-        &success_session_id,
-        run_started_at,
-    )
-    .unwrap_or_default();
-    let agent_human_summary_explicit =
-        read_agent_human_summary_since(&request.workspace_root, run_started_at)
-            .ok()
-            .flatten();
+    let prompt_artifact = None;
+    let plan_artifact = None;
+    let provider_stdout_artifact = None;
+    let provider_stderr_artifact = None;
+    let events_artifact = None;
+    let agent_reported_files =
+        read_agent_reported_files(&request.workspace_root).unwrap_or_default();
+    let agent_human_summary_explicit = read_agent_human_summary(&request.workspace_root)
+        .ok()
+        .flatten();
+    let agent_result = read_agent_result(&request.workspace_root)?;
     let derived_summary = read_derived_agent_summary(
         &request.workspace_root,
         &context.program_key,
@@ -490,8 +412,8 @@ fn execute_apply<R: ProviderRunner>(
     .flatten();
     let agent_human_summary = agent_human_summary_explicit
         .clone()
-        .or_else(|| derived_summary.as_ref().map(|d| d.text.clone()));
-    let agent_result = read_agent_result_since(&request.workspace_root, run_started_at)?;
+        .or_else(|| derived_summary.as_ref().map(|d| d.text.clone()))
+        .or_else(|| agent_result.as_ref().and_then(|r| r.message.clone()));
     let agent_human_summary_artifact = match agent_human_summary.as_deref() {
         Some(summary) => persist_agent_summary_artifact(
             &request.workspace_root,
@@ -1440,250 +1362,18 @@ fn read_agent_reported_files(workspace_root: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn read_agent_reported_files_since(
-    workspace_root: &Path,
-    program_key: &str,
-    session_id: &str,
-    since_unix_ms: u64,
-) -> Result<Vec<String>> {
-    let path = workspace_root.join(AGENT_OUTPUT_MANIFEST_REL);
-    if path.exists() && file_modified_since(&path, since_unix_ms)? {
-        return read_agent_reported_files(workspace_root);
-    }
-
-    read_agent_reported_files_from_session_events(workspace_root, program_key, session_id)
-}
-
-fn read_agent_reported_files_from_session_events(
-    workspace_root: &Path,
-    program_key: &str,
-    session_id: &str,
-) -> Result<Vec<String>> {
-    let events_path =
-        program_session_dir(workspace_root, program_key, session_id).join("events.ndjson");
-    if !events_path.exists() {
-        return Ok(Vec::new());
-    }
-
-    let raw = fs::read_to_string(&events_path)
-        .with_context(|| format!("failed reading provider events '{}'", events_path.display()))?;
-    let mut out = BTreeSet::new();
-
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        collect_reported_paths_from_event_record(line, workspace_root, &mut out);
-    }
-
-    Ok(out.into_iter().collect())
-}
-
-fn collect_reported_paths_from_event_record(
-    record_line: &str,
-    workspace_root: &Path,
-    out: &mut BTreeSet<String>,
-) {
-    let Ok(record) = serde_json::from_str::<serde_json::Value>(record_line) else {
-        return;
-    };
-    let Some(raw_event) = record.get("raw").and_then(serde_json::Value::as_str) else {
-        return;
-    };
-    if raw_event.trim().is_empty() {
-        return;
-    }
-
-    let Some(event) = parse_raw_provider_event(raw_event) else {
-        return;
-    };
-    let Some(event_type) = event.get("type").and_then(serde_json::Value::as_str) else {
-        return;
-    };
-    if !matches!(
-        event_type,
-        "item.started" | "item.updated" | "item.completed"
-    ) {
-        return;
-    }
-
-    let item = event.get("item").unwrap_or(&serde_json::Value::Null);
-    let item_type = item
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-
-    match item_type {
-        "file_change" => collect_reported_paths_from_file_change(item, workspace_root, out),
-        "command_execution" => collect_reported_paths_from_command(item, workspace_root, out),
-        _ => {}
-    }
-}
-
-fn parse_raw_provider_event(raw_event: &str) -> Option<serde_json::Value> {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw_event) {
-        return Some(v);
-    }
-
-    // Some providers embed control characters (for example literal newlines) in
-    // string fields after one unescape pass. Re-escape control chars and retry.
-    let mut sanitized = String::with_capacity(raw_event.len() + 16);
-    for ch in raw_event.chars() {
-        match ch {
-            '\n' => sanitized.push_str("\\n"),
-            '\r' => sanitized.push_str("\\r"),
-            '\t' => sanitized.push_str("\\t"),
-            c if c.is_control() => sanitized.push_str(format!("\\u{:04x}", c as u32).as_str()),
-            c => sanitized.push(c),
-        }
-    }
-    serde_json::from_str::<serde_json::Value>(&sanitized).ok()
-}
-
-fn collect_reported_paths_from_file_change(
-    item: &serde_json::Value,
-    workspace_root: &Path,
-    out: &mut BTreeSet<String>,
-) {
-    if let Some(path) = item.get("path").and_then(serde_json::Value::as_str) {
-        if let Some(normalized) = normalize_reported_path_candidate(path, workspace_root) {
-            out.insert(normalized);
-        }
-    }
-
-    if let Some(changes) = item.get("changes").and_then(serde_json::Value::as_array) {
-        for change in changes {
-            let Some(path) = change.get("path").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            if let Some(normalized) = normalize_reported_path_candidate(path, workspace_root) {
-                out.insert(normalized);
-            }
-        }
-    }
-}
-
-fn collect_reported_paths_from_command(
-    item: &serde_json::Value,
-    workspace_root: &Path,
-    out: &mut BTreeSet<String>,
-) {
-    let Some(command) = item.get("command").and_then(serde_json::Value::as_str) else {
-        return;
-    };
-    for candidate in extract_write_paths_from_command(command) {
-        if let Some(normalized) =
-            normalize_reported_path_candidate(candidate.as_str(), workspace_root)
-        {
-            out.insert(normalized);
-        }
-    }
-}
-
-fn extract_write_paths_from_command(command: &str) -> Vec<String> {
-    let normalized = normalize_shell_command(command);
-    let mut out = BTreeSet::new();
-
-    if let Some(path) = extract_heredoc_write_path(normalized.as_str()) {
-        out.insert(path);
-    }
-    if let Some(path) = extract_redirect_write_path(normalized.as_str()) {
-        out.insert(path);
-    }
-
-    out.into_iter().collect()
-}
-
-fn normalize_shell_command(command: &str) -> String {
-    let mut cmd = command.trim();
-    if let Some(rest) = cmd.strip_prefix("/bin/zsh -lc ") {
-        cmd = rest.trim();
-    }
-    cmd = cmd.trim_matches('"').trim_matches('\'');
-    if cmd.starts_with("cd ") && cmd.contains("&&") {
-        if let Some((_, rhs)) = cmd.rsplit_once("&&") {
-            cmd = rhs.trim();
-        }
-    }
-    cmd.to_string()
-}
-
-fn extract_heredoc_write_path(command: &str) -> Option<String> {
-    let marker = "cat <<'EOF' > ";
-    let idx = command.find(marker)?;
-    let rest = &command[idx + marker.len()..];
-    let path = rest
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_matches('"')
-        .trim_matches('\'');
-    if path.is_empty() {
-        return None;
-    }
-    Some(path.to_string())
-}
-
-fn extract_redirect_write_path(command: &str) -> Option<String> {
-    let redirect_idx = command.rfind('>')?;
-    let lhs = command[..redirect_idx].trim();
-    if !(lhs.starts_with("cat ")
-        || lhs.starts_with("printf ")
-        || lhs.starts_with("echo ")
-        || lhs.starts_with("tee "))
-    {
-        return None;
-    }
-
-    let mut rhs = command[redirect_idx + 1..].trim();
-    if let Some(stripped) = rhs.strip_prefix('>') {
-        rhs = stripped.trim();
-    }
-    let path = rhs
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .trim_matches('"')
-        .trim_matches('\'');
-    if path.is_empty() {
-        return None;
-    }
-    Some(path.to_string())
-}
-
-fn normalize_reported_path_candidate(raw: &str, workspace_root: &Path) -> Option<String> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-
-    let normalized = if Path::new(raw).is_absolute() {
-        let rel = Path::new(raw).strip_prefix(workspace_root).ok()?;
-        normalize_reported_rel_path(&to_slash_path(rel))?
-    } else {
-        normalize_reported_rel_path(raw)?
-    };
-
-    if is_internal_reported_path(normalized.as_str()) {
-        return None;
-    }
-    Some(normalized)
-}
-
 fn is_internal_reported_path(path: &str) -> bool {
     path == AGENT_OUTPUT_MANIFEST_REL
         || path == AGENT_HUMAN_OUTPUT_REL
-        || path == AGENT_HUMAN_OUTPUT_LEGACY_REL
         || path == AGENT_RESULT_REL
         || path == RUNTIME_VARIABLES_INPUT_REL
 }
 
 fn read_agent_human_summary(workspace_root: &Path) -> Result<Option<String>> {
-    let Some(path) = pick_agent_human_summary_path(workspace_root) else {
+    let path = workspace_root.join(AGENT_HUMAN_OUTPUT_REL);
+    if !path.exists() {
         return Ok(None);
-    };
+    }
     let raw = fs::read(&path)
         .with_context(|| format!("failed reading agent output note '{}'", path.display()))?;
     let text = String::from_utf8_lossy(&raw).replace("\r\n", "\n");
@@ -1693,31 +1383,6 @@ fn read_agent_human_summary(workspace_root: &Path) -> Result<Option<String>> {
     }
 
     Ok(Some(trimmed.to_string()))
-}
-
-fn read_agent_human_summary_since(
-    workspace_root: &Path,
-    since_unix_ms: u64,
-) -> Result<Option<String>> {
-    let Some(path) = pick_agent_human_summary_path(workspace_root) else {
-        return Ok(None);
-    };
-    if !file_modified_since(&path, since_unix_ms)? {
-        return Ok(None);
-    }
-    read_agent_human_summary(workspace_root)
-}
-
-fn pick_agent_human_summary_path(workspace_root: &Path) -> Option<PathBuf> {
-    let primary = workspace_root.join(AGENT_HUMAN_OUTPUT_REL);
-    let fallback = workspace_root.join(AGENT_HUMAN_OUTPUT_LEGACY_REL);
-    if primary.exists() {
-        Some(primary)
-    } else if fallback.exists() {
-        Some(fallback)
-    } else {
-        None
-    }
 }
 
 fn read_agent_result(workspace_root: &Path) -> Result<Option<AgentResult>> {
@@ -1754,15 +1419,24 @@ fn read_agent_result(workspace_root: &Path) -> Result<Option<AgentResult>> {
     }))
 }
 
-fn read_agent_result_since(
-    workspace_root: &Path,
-    since_unix_ms: u64,
-) -> Result<Option<AgentResult>> {
-    let path = workspace_root.join(AGENT_RESULT_REL);
-    if !path.exists() || !file_modified_since(&path, since_unix_ms)? {
-        return Ok(None);
+fn clear_runtime_protocol_outputs(workspace_root: &Path) -> Result<()> {
+    for rel in [
+        AGENT_OUTPUT_MANIFEST_REL,
+        AGENT_HUMAN_OUTPUT_REL,
+        AGENT_RESULT_REL,
+    ] {
+        let path = workspace_root.join(rel);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed clearing protocol output file '{}'", path.display())
+                });
+            }
+        }
     }
-    read_agent_result(workspace_root)
+    Ok(())
 }
 
 fn read_derived_agent_summary(
@@ -1983,90 +1657,6 @@ fn persist_program_variables_snapshot(
     Ok(rel)
 }
 
-fn persist_session_prompt(
-    workspace_root: &Path,
-    program_id: &str,
-    session_id: &str,
-    prompt: &str,
-) -> Result<String> {
-    persist_session_text_artifact(
-        workspace_root,
-        program_id,
-        session_id,
-        SESSION_PROMPT_ARTIFACT_FILE,
-        prompt,
-    )
-}
-
-fn persist_session_plan(
-    workspace_root: &Path,
-    program_id: &str,
-    session_id: &str,
-    plan: &SharedPlanData,
-) -> Result<String> {
-    let body = serde_json::to_string_pretty(plan).context("failed serializing plan artifact")?;
-    persist_session_text_artifact(
-        workspace_root,
-        program_id,
-        session_id,
-        SESSION_PLAN_ARTIFACT_FILE,
-        body.as_str(),
-    )
-}
-
-fn persist_provider_log(
-    workspace_root: &Path,
-    program_id: &str,
-    session_id: &str,
-    file_name: &str,
-    content: &str,
-) -> Result<String> {
-    persist_session_text_artifact(workspace_root, program_id, session_id, file_name, content)
-}
-
-fn persist_session_text_artifact(
-    workspace_root: &Path,
-    program_id: &str,
-    session_id: &str,
-    file_name: &str,
-    content: &str,
-) -> Result<String> {
-    let abs = program_session_dir(workspace_root, program_id, session_id).join(file_name);
-    if let Some(parent) = abs.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed creating artifact directory '{}'", parent.display())
-        })?;
-    }
-    let mut body = content.to_string();
-    if !body.ends_with('\n') {
-        body.push('\n');
-    }
-    fs::write(&abs, body)
-        .with_context(|| format!("failed writing artifact '{}'", abs.display()))?;
-    let rel = abs
-        .strip_prefix(workspace_root)
-        .map(to_slash_path)
-        .unwrap_or_else(|_| to_slash_path(&abs));
-    Ok(rel)
-}
-
-fn session_events_artifact_path(
-    workspace_root: &Path,
-    program_id: &str,
-    session_id: &str,
-) -> Option<String> {
-    let abs = program_session_dir(workspace_root, program_id, session_id)
-        .join(SESSION_EVENTS_ARTIFACT_FILE);
-    if !abs.exists() {
-        return None;
-    }
-    Some(
-        abs.strip_prefix(workspace_root)
-            .map(to_slash_path)
-            .unwrap_or_else(|_| to_slash_path(&abs)),
-    )
-}
-
 fn persist_session_outcome(
     workspace_root: &Path,
     program_id: &str,
@@ -2133,25 +1723,6 @@ fn normalize_reported_rel_path(raw: &str) -> Option<String> {
     }
 
     Some(to_slash_path(&normalized))
-}
-
-fn now_unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn file_modified_since(path: &Path, since_unix_ms: u64) -> Result<bool> {
-    let modified = fs::metadata(path)
-        .with_context(|| format!("failed reading metadata '{}'", path.display()))?
-        .modified()
-        .with_context(|| format!("failed reading mtime '{}'", path.display()))?;
-    let modified_ms = modified
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    Ok(modified_ms >= since_unix_ms)
 }
 
 fn snapshot_workspace_state(
@@ -2705,7 +2276,6 @@ fn should_skip_path(rel: &Path) -> bool {
         || rel_str.starts_with("target/")
         || rel_str == AGENT_OUTPUT_MANIFEST_REL
         || rel_str == AGENT_HUMAN_OUTPUT_REL
-        || rel_str == AGENT_HUMAN_OUTPUT_LEGACY_REL
         || rel_str == AGENT_RESULT_REL
         || rel_str == RUNTIME_VARIABLES_INPUT_REL
         || rel_str == ".clawform/history"
@@ -2719,7 +2289,6 @@ fn should_skip_path(rel: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     const PROMPT_EXAMPLE_WITH_LAST: &str =
         include_str!("../../../test_data/runtime_prompt_with_last_session.md");
@@ -2948,100 +2517,6 @@ mod tests {
             vec!["nested/new.txt".to_string(), "out.txt".to_string()]
         );
         Ok(())
-    }
-
-    #[test]
-    fn derives_reported_file_from_command_event_record() {
-        let raw_event = json!({
-            "type": "item.completed",
-            "item": {
-                "id": "item_1",
-                "type": "command_execution",
-                "command": "/bin/zsh -lc \"cd /repo && cat <<'EOF' > example-data/output-smoke.txt SMOKE_OK EOF\""
-            }
-        })
-        .to_string();
-        let record = json!({
-            "seq": 1,
-            "ts_unix_ms": 1,
-            "stream": "stdout",
-            "event_type": "item.completed",
-            "raw": raw_event
-        })
-        .to_string();
-
-        let mut out = BTreeSet::new();
-        collect_reported_paths_from_event_record(&record, Path::new("/repo"), &mut out);
-        assert!(out.contains("example-data/output-smoke.txt"));
-    }
-
-    #[test]
-    fn derives_reported_file_from_file_change_event_record() {
-        let raw_event = json!({
-            "type": "item.completed",
-            "item": {
-                "id": "item_9",
-                "type": "file_change",
-                "changes": [
-                    { "path": "/repo/src/main.rs", "kind": "update" }
-                ]
-            }
-        })
-        .to_string();
-        let record = json!({
-            "seq": 2,
-            "ts_unix_ms": 2,
-            "stream": "stdout",
-            "event_type": "item.completed",
-            "raw": raw_event
-        })
-        .to_string();
-
-        let mut out = BTreeSet::new();
-        collect_reported_paths_from_event_record(&record, Path::new("/repo"), &mut out);
-        assert!(out.contains("src/main.rs"));
-    }
-
-    #[test]
-    fn ignores_internal_bookkeeping_paths_in_event_derivation() {
-        let raw_event = json!({
-            "type": "item.completed",
-            "item": {
-                "id": "item_2",
-                "type": "command_execution",
-                "command": "/bin/zsh -lc \"cat <<'EOF' > .clawform/agent_result.json {\\\"status\\\":\\\"success\\\"} EOF\""
-            }
-        })
-        .to_string();
-        let record = json!({
-            "seq": 3,
-            "ts_unix_ms": 3,
-            "stream": "stdout",
-            "event_type": "item.completed",
-            "raw": raw_event
-        })
-        .to_string();
-
-        let mut out = BTreeSet::new();
-        collect_reported_paths_from_event_record(&record, Path::new("/repo"), &mut out);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn derives_reported_file_when_raw_event_contains_literal_newline() {
-        let raw_event = "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\",\"type\":\"command_execution\",\"command\":\"/bin/zsh -lc \\\"printf 'SMOKE_OK\n' > example-data/output-smoke.txt\\\"\"}}";
-        let record = json!({
-            "seq": 4,
-            "ts_unix_ms": 4,
-            "stream": "stdout",
-            "event_type": "item.completed",
-            "raw": raw_event
-        })
-        .to_string();
-
-        let mut out = BTreeSet::new();
-        collect_reported_paths_from_event_record(&record, Path::new("/repo"), &mut out);
-        assert!(out.contains("example-data/output-smoke.txt"));
     }
 
     #[test]

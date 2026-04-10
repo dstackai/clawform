@@ -1,6 +1,6 @@
 # Clawform Architecture
 
-Last updated: 2026-04-06  
+Last updated: 2026-04-10  
 Status: v0 (implemented baseline)
 
 ## 1) Product Goal
@@ -14,7 +14,7 @@ A **program** is one markdown file (`*.md`) representing one task.
 
 ## 2) Implemented v0 Scope
 
-1. Public command: `cf -f <program.md>` (explicit equivalent: `cf apply -f <program.md>`, full binary form: `clawform apply -f <program.md>`)
+1. Public command: `cf -f program.md` (explicit equivalent: `cf apply -f program.md`, full binary form: `clawform apply -f program.md`)
 2. Confirmation prompt is default in interactive shell; use `--yes` to skip
 3. One program file = one session execution
 4. Config path is fixed: `<cwd>/.clawform/config.json`
@@ -82,53 +82,92 @@ Variable rules:
 1. Load program + config and resolve model.
 2. Resolve program variables (frontmatter defaults + CLI `--var` overrides).
 3. Validate variable definitions and `${{ var.NAME }}` references.
-4. Build preview from last session context:
+4. Build preview from previous run records:
    - last session status/summary (if exists)
    - program diff vs last session snapshot (if available)
    - variable diff vs last session variable snapshot (if available)
 5. Ask for confirmation (interactive default; skipped by `--yes`).
 6. Write runtime variables file (`.clawform/agent_variables.json`) when variables are present.
 7. Run provider in the current workspace (no temp workspace copy).
-8. Stream provider events to terminal and persist artifacts.
+8. Stream provider events to terminal; during the run write session `commands/*` and `messages/*` for clickable `out`/`msg` links.
 9. Read agent status from `.clawform/agent_result.json` (required).
-10. Collect reported changed files (events-first, manifest fallback).
-11. Persist session artifacts + history record.
+10. Collect reported changed files from `.clawform/agent_outputs.json` when that file exists and was updated in this run.
+11. Persist run-end records (`output.md`, `outcome.json`) and append `.clawform/history/index.jsonl`.
 12. Persist program snapshot (`program.md`) and variable snapshot (`variables.json`) on success.
 
 ## 5) State and Storage Layout
 
-## 5.1 Session Artifacts
+Clawform keeps local data for three explicit behaviors:
 
-Per program/session:
+Path aliases used in this section:
 
-- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/prompt.md`
-- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/plan.json`
-- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/events.ndjson`
-- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/provider.stdout.log`
-- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/provider.stderr.log`
-- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/outcome.json`
-- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/output.md` (Clawform summary)
-- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/program.md` (success snapshot)
-- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/variables.json` (success snapshot)
-- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/commands/*` (captured command outputs)
-- `<cwd>/.clawform/programs/<program_id>/sessions/<session_id>/messages/*` (captured message outputs)
+- `<protocol_root> = <cwd>/.clawform`
+- `<history_index> = <protocol_root>/history/index.jsonl`
+- `<session_root> = <protocol_root>/programs/<program_id>/sessions/<session_id>`
+- `<last_session_root> = <protocol_root>/programs/<program_id>/sessions/<last_session_id>`
+- `<last_session_id>` = `session_id` from the newest `<history_index>` record for the same `program_id`
 
-## 5.2 Run History Index
+1. Before provider execution, write `<protocol_root>/agent_variables.json` (when variables exist) so the agent can read resolved `${{ var.NAME }}` values for this run.
+2. After provider execution, read agent protocol files from `<protocol_root>/`:
+   - required: `agent_result.json`
+   - expected for file reporting: `agent_outputs.json`
+   - optional summary: `agent_output.md`
+3. After apply completes, persist session/history files (`<session_root>/program.md`, `<session_root>/variables.json`, `<session_root>/output.md`, `<session_root>/outcome.json`, `<history_index>`) so the next run can compute diffs and include previous-run status/summary.
 
-- `<cwd>/.clawform/history/index.jsonl`
+## 5.1 When Data Is Used
 
-This is Clawform-owned history, independent from provider-side memory.
+During the current run:
 
-## 5.3 Agent Report Files in Workspace Root
+- Write `<protocol_root>/agent_variables.json` (when variables exist); the agent reads this file for resolved `${{ var.NAME }}` values.
+- Write `<session_root>/commands/*` and `<session_root>/messages/*` for clickable `out`/`msg` links in live progress output.
+- Read `<protocol_root>/agent_result.json`, `<protocol_root>/agent_outputs.json`, and optional `<protocol_root>/agent_output.md` at run end to determine status, changed files, and summary.
 
-Agent may write:
+On the next run of the same program:
 
-- `<cwd>/.clawform/agent_result.json` (required)
-- `<cwd>/.clawform/agent_output.md` (optional human summary)
-- `<cwd>/.clawform/agent_outputs.json` (optional fallback list of changed files)
-- `<cwd>/.clawform/agent_variables.json` (runtime resolved variable values provided by Clawform)
+- Read `<history_index>`, select the newest record for the same `program_id`, and use its `session_id` as `<last_session_id>`.
+- Read `<last_session_root>/program.md` and compare it to the current program file to compute program-text diff.
+- Read `<last_session_root>/variables.json` and compare it to current resolved variables to compute variable diff.
+- Read `<last_session_root>/output.md` as the prior run summary shown in plan preview and included in the runtime prompt.
 
-These files are execution protocol files, not user deliverables.
+For audit/debug visibility:
+
+- Write `<session_root>/outcome.json` as the final machine-readable run outcome. It is for inspection and is not currently used as a control input for future apply decisions.
+
+## 5.2 Data Inventory (What, Why, When)
+
+| Data path | Scope | Why we store it | When it is used |
+|---|---|---|---|
+| `<protocol_root>/agent_variables.json` | Workspace-global scratch file for the currently running apply (overwritten on each apply) | Provide resolved runtime variables to the agent | Read by the agent during that same apply run |
+| `<protocol_root>/agent_result.json` | Workspace-global scratch file for the currently running apply (overwritten on each apply) | Receive final structured run status (`success/partial/failure`) and short reason/message from the agent | Read by Clawform at run end (and sandbox-retry logic), only if file mtime is from this run |
+| `<protocol_root>/agent_outputs.json` | Workspace-global scratch file for the currently running apply (overwritten on each apply) | Receive changed-file list from the agent | Read by Clawform at run end for file summary/history, only if file mtime is from this run |
+| `<protocol_root>/agent_output.md` | Workspace-global scratch file for the currently running apply (optional; overwritten on each apply) | Receive agent-written summary text | Read by Clawform at run end; then copied into session `output.md` |
+| `<session_root>/commands/*.txt` | Per-session (`<program_id>/<session_id>`) | Preserve command output behind clickable `out` links | Used immediately in terminal progress output |
+| `<session_root>/messages/*.md` | Per-session (`<program_id>/<session_id>`) | Preserve assistant/message output behind clickable `msg` links | Used immediately in terminal progress output; also fallback summary source |
+| `<session_root>/output.md` | Per-session (`<program_id>/<session_id>`) | Store stable summary artifact for this session | Used on next run of same `program_id` for preview/prompt reference |
+| `<session_root>/program.md` | Per-session (`<program_id>/<session_id>`) | Snapshot program text that produced this session | Used on next run of same `program_id` to compute program diff |
+| `<session_root>/variables.json` | Per-session (`<program_id>/<session_id>`) | Snapshot resolved variables for this session | Used on next run of same `program_id` to compute variables diff |
+| `<session_root>/outcome.json` | Per-session (`<program_id>/<session_id>`) | Store machine-readable session outcome with status/error/token/file counters | Inspection/audit; not currently a control input |
+| `<history_index>` | Workspace-global append-only index | Store per-run summary metadata (status, summary_short, file/token stats) | Loaded at next run start for previous-run status/summary/stats in preview and prompt |
+
+Compatibility behavior:
+
+- No read fallback is used for `agent_summary.md` or `events.ndjson`.
+- Current apply reads only the current protocol files documented in this section.
+
+Current limitation:
+
+- `.clawform/agent_*.json|md` protocol files are workspace-global and not namespaced by `program_id/session_id`.
+- This can conflict if two applies run concurrently in the same workspace.
+- TODO: move current-run protocol files to per-session paths (for example: `<session_root>/protocol/agent_result.json`, `agent_outputs.json`, `agent_output.md`, `agent_variables.json`).
+
+## 5.3 Data We Intentionally Do Not Persist
+
+Current apply does not persist:
+
+- `prompt.md`
+- `plan.json`
+- provider stdout/stderr artifact logs
+- canonical `events.ndjson` for new sessions
 
 ## 6) Known Bugs
 
@@ -136,7 +175,7 @@ These files are execution protocol files, not user deliverables.
 
 Steps to reproduce:
 
-1. Start `cf -f <program.md>` in interactive mode.
+1. Start `cf -f program.md` in interactive mode.
 2. Interrupt with `Ctrl+C`.
 3. Run apply again and inspect the last-session preview/history.
 
@@ -147,6 +186,22 @@ Expected:
 Actual:
 
 - Interrupted runs are recorded and shown as generic `failure`.
+
+### 6.2 Workspace-Global Protocol File Collisions Under Concurrent Applies
+
+Steps to reproduce:
+
+1. Start `cf apply -f <program-a.md>` in one terminal (same workspace).
+2. While it is still running, start `cf apply -f <program-b.md>` in another terminal (same workspace).
+3. Both runs write/read `.clawform/agent_result.json` / `.clawform/agent_outputs.json` / `.clawform/agent_output.md`.
+
+Expected:
+
+- Each run uses isolated protocol files for its own session.
+
+Actual:
+
+- Protocol files are shared workspace-global scratch paths and can overwrite each other.
 
 ## 7) Backlog (Out of Scope for now)
 
@@ -161,7 +216,7 @@ These items are intentionally deferred. Each item describes desired product capa
 4. Changes/diff reliability and consistency  
    Goal: for the same session, preview, apply output, debug output, and history should report the same changed-file set and line counts, with generated/noise files handled consistently.
 5. Agent-reported changes as single source of truth  
-   Goal: remove legacy local diff-based change reporting and use agent-reported change data consistently across apply, debug, and history.
+   Goal: remove local diff-based change reporting and use agent-reported change data consistently across apply, debug, and history.
 6. MCP and broader tool integration model  
    Goal: support richer external tool and integration patterns.
 7. Multi-agent orchestration model  
@@ -170,3 +225,5 @@ These items are intentionally deferred. Each item describes desired product capa
    Goal: support multiple model providers in a consistent user experience.
 9. Improved session storage and retrieval performance  
    Goal: keep history/state operations fast and scalable as usage grows.
+10. Session-scoped protocol files for concurrent apply safety  
+   Goal: move `.clawform/agent_*.json|md` to per-session protocol paths.
