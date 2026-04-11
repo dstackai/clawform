@@ -32,9 +32,9 @@ Before execution, Clawform previews:
 - last session changed files
 - program diff since the last comparable snapshot
 
-Then it asks for confirmation and executes the program with the configured provider.
+Then it asks for confirmation and executes the program with the configured provider, or with the explicitly selected provider when you pass `-p/--provider`.
 
-During execution, Clawform streams progress events to the terminal.
+During execution, Clawform streams progress events to the terminal. Use `--progress rich|plain|off` to control rendering.
 
 After execution, Clawform stores:
 
@@ -66,8 +66,13 @@ CLAWFORM_VERSION=v0.0.7 curl -fsSL https://raw.githubusercontent.com/dstackai/cl
     "providers": {
       "codex": {
         "type": "codex",
-        "default": true,
+        "default": false,
         "default_model": "gpt-5-codex"
+      },
+      "claude": {
+        "type": "claude",
+        "default": true,
+        "default_model": "sonnet"
       }
     }
   }
@@ -78,6 +83,13 @@ CLAWFORM_VERSION=v0.0.7 curl -fsSL https://raw.githubusercontent.com/dstackai/cl
 
 ```bash
 cf -f examples/smoke.md
+```
+
+Run the same program with a specific provider override:
+
+```bash
+cf -f examples/smoke.md -p claude
+cf -f examples/smoke.md -p codex
 ```
 
 Override a program variable for one run:
@@ -124,6 +136,8 @@ For internal protocol details and strict agent result schema, see `contrib/ARCHI
 ```bash
 cf -f program.md
 cf apply -f program.md
+cf -f program.md -p claude
+cf -f program.md --progress plain
 ```
 
 ## Status

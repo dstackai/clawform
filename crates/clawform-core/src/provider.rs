@@ -30,6 +30,7 @@ pub struct ProviderRequest {
     pub prompt: String,
     pub progress: bool,
     pub render_progress: bool,
+    pub debug_mode: bool,
     pub verbose_output: bool,
     pub verbose_events: bool,
     pub interactive_ui: bool,
@@ -565,6 +566,7 @@ fn run_claude_once(
         return collect_claude_with_progress(
             child,
             request.render_progress,
+            request.verbose_output || request.debug_mode,
             request.verbose_output,
             request.verbose_events,
             request.interactive_ui,
@@ -648,6 +650,7 @@ fn parse_claude_json_result(
 fn collect_claude_with_progress(
     mut child: std::process::Child,
     render_progress: bool,
+    show_housekeeping: bool,
     verbose_output: bool,
     verbose_events: bool,
     interactive_ui: bool,
@@ -711,6 +714,7 @@ fn collect_claude_with_progress(
                 $message_payload,
                 $file_payload,
                 render_progress,
+                show_housekeeping,
                 verbose_output,
                 verbose_events,
                 show_intermediate_steps,
@@ -1013,6 +1017,7 @@ fn handle_progress_event(
     message_payload: Option<&MessageOutputPayload>,
     file_payload: Option<&FileChangePayload>,
     render_progress: bool,
+    show_housekeeping: bool,
     verbose_output: bool,
     verbose_events: bool,
     show_intermediate_steps: bool,
@@ -1049,7 +1054,12 @@ fn handle_progress_event(
             if let Some(id) = item_id.clone() {
                 item_started_at.insert(id, Instant::now());
             }
-            if should_count_item_progress(item_type, summary.as_deref(), show_intermediate_steps) {
+            if should_count_item_progress(
+                item_type,
+                summary.as_deref(),
+                show_housekeeping,
+                show_intermediate_steps,
+            ) {
                 let label = status_activity_label(item_type, summary.as_deref());
                 if let Some(id) = item_id.as_ref() {
                     active_progress_items.retain(|(active_id, _)| active_id != id);
@@ -1063,7 +1073,12 @@ fn handle_progress_event(
             item_type,
             summary,
         } => {
-            if should_count_item_progress(item_type, summary.as_deref(), show_intermediate_steps) {
+            if should_count_item_progress(
+                item_type,
+                summary.as_deref(),
+                show_housekeeping,
+                show_intermediate_steps,
+            ) {
                 if let Some(id) = item_id.as_ref() {
                     active_progress_items.retain(|(active_id, _)| active_id != id);
                 }
@@ -1101,8 +1116,12 @@ fn handle_progress_event(
     }
 
     let completion_duration = item_completion_duration_label(normalized, item_started_at);
-    let mut progress_line =
-        format_terminal_event(normalized, verbose_events, show_intermediate_steps);
+    let mut progress_line = format_terminal_event(
+        normalized,
+        verbose_events,
+        show_housekeeping,
+        show_intermediate_steps,
+    );
     if show_intermediate_steps && progress_line.is_none() {
         if let ProviderEvent::TurnCompleted { usage } = normalized {
             progress_line = format_turn_usage_line(turn_index, usage);
@@ -1677,6 +1696,7 @@ fn run_codex_once(
         return collect_with_progress(
             child,
             request.render_progress,
+            request.verbose_output || request.debug_mode,
             request.verbose_output,
             request.verbose_events,
             request.interactive_ui,
@@ -1884,6 +1904,7 @@ fn maybe_build_early_auto_retry_monitor(
 fn collect_with_progress(
     mut child: std::process::Child,
     render_progress: bool,
+    show_housekeeping: bool,
     verbose_output: bool,
     verbose_events: bool,
     interactive_ui: bool,
@@ -1993,6 +2014,7 @@ fn collect_with_progress(
                                 if should_count_item_progress(
                                     item_type,
                                     summary.as_deref(),
+                                    show_housekeeping,
                                     show_intermediate_steps,
                                 ) {
                                     let label =
@@ -2014,6 +2036,7 @@ fn collect_with_progress(
                                 if should_count_item_progress(
                                     item_type,
                                     summary.as_deref(),
+                                    show_housekeeping,
                                     show_intermediate_steps,
                                 ) {
                                     if let Some(id) = item_id.as_ref() {
@@ -2059,6 +2082,7 @@ fn collect_with_progress(
                         let mut progress_line = format_terminal_event(
                             &normalized,
                             verbose_events,
+                            show_housekeeping,
                             show_intermediate_steps,
                         );
                         if show_intermediate_steps
@@ -2950,6 +2974,7 @@ fn truncate_one_line(s: &str, max: usize) -> String {
 fn format_terminal_event(
     event: &ProviderEvent,
     verbose_events: bool,
+    show_housekeeping: bool,
     show_intermediate_steps: bool,
 ) -> Option<String> {
     match event {
@@ -2985,6 +3010,7 @@ fn format_terminal_event(
                 item_type,
                 item_id.as_deref(),
                 summary.as_deref(),
+                show_housekeeping,
                 show_intermediate_steps,
             )
         }
@@ -3014,6 +3040,7 @@ fn format_item_event(
     item_type: &str,
     item_id: Option<&str>,
     summary: Option<&str>,
+    show_housekeeping: bool,
     show_intermediate_steps: bool,
 ) -> Option<String> {
     if !show_intermediate_steps {
@@ -3048,7 +3075,10 @@ fn format_item_event(
     let _ = phase;
     let _ = item_id;
     let summary = summary?.trim();
-    if kind == "cmd" && is_clawform_housekeeping_command(summary) {
+    if !show_housekeeping
+        && (kind == "cmd" || kind == "file")
+        && is_clawform_housekeeping_summary(summary)
+    {
         return None;
     }
     if kind == "cmd" {
@@ -3085,17 +3115,29 @@ fn is_low_signal_command(summary: &str) -> bool {
         || s.starts_with("git status")
 }
 
-fn is_clawform_housekeeping_command(summary: &str) -> bool {
+fn is_clawform_housekeeping_summary(summary: &str) -> bool {
     let s = summary.trim().to_ascii_lowercase();
     s.starts_with("write .clawform/agent_output.md")
         || s.starts_with("write .clawform/agent_outputs.json")
         || s.starts_with("write .clawform/agent_result.json")
+        || s.starts_with("read .clawform/agent_output.md")
+        || s.starts_with("read .clawform/agent_outputs.json")
+        || s.starts_with("read .clawform/agent_result.json")
+        || s.starts_with("read .clawform/agent_variables.json")
         || s.starts_with("cat .clawform/agent_output.md")
         || s.starts_with("cat .clawform/agent_outputs.json")
         || s.starts_with("cat .clawform/agent_result.json")
         || {
-            let is_read_write = s.starts_with("write ") || s.starts_with("cat ");
-            is_read_write
+            let is_protocol_mkdir = s.starts_with("mkdir -p ")
+                && (s.ends_with(" .clawform")
+                    || s.ends_with("/.clawform")
+                    || s.contains(" /.clawform "));
+            is_protocol_mkdir
+        }
+        || {
+            let is_protocol_io =
+                s.starts_with("write ") || s.starts_with("read ") || s.starts_with("cat ");
+            is_protocol_io
                 && s.contains(".clawform/programs/")
                 && (s.contains("/reports/agent_output")
                     || s.contains("/reports/agent_outputs")
@@ -3186,15 +3228,16 @@ fn status_activity_label(item_type: &str, summary: Option<&str>) -> String {
 fn should_count_item_progress(
     item_type: &str,
     summary: Option<&str>,
+    show_housekeeping: bool,
     show_intermediate_steps: bool,
 ) -> bool {
-    if item_type != "command_execution" {
-        return true;
-    }
     if let Some(s) = summary {
-        if is_clawform_housekeeping_command(s) {
+        if !show_housekeeping && is_clawform_housekeeping_summary(s) {
             return false;
         }
+    }
+    if item_type != "command_execution" {
+        return true;
     }
     if show_intermediate_steps {
         return true;
@@ -3746,6 +3789,7 @@ mod tests {
                 run_id: Some("thread_123".to_string()),
             },
             true,
+            false,
             true,
         )
         .expect("expected session line");
@@ -3976,7 +4020,7 @@ mod tests {
     fn non_json_line_maps_to_raw_text_without_progress_line() {
         let ev = parse_codex_stream_line("OpenAI Codex v0.118.0").expect("expected raw text");
         assert!(matches!(ev, ProviderEvent::RawText { .. }));
-        assert!(format_terminal_event(&ev, true, false).is_none());
+        assert!(format_terminal_event(&ev, true, false, false).is_none());
     }
 
     #[test]
@@ -4020,6 +4064,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            debug_mode: false,
             verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
@@ -4045,6 +4090,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            debug_mode: false,
             verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
@@ -4070,6 +4116,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            debug_mode: false,
             verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
@@ -4472,6 +4519,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            debug_mode: false,
             verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
@@ -4502,6 +4550,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            debug_mode: false,
             verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
@@ -4547,6 +4596,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            debug_mode: false,
             verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
@@ -4584,6 +4634,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            debug_mode: false,
             verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
@@ -4608,6 +4659,7 @@ mod tests {
             },
             false,
             false,
+            false,
         );
         assert!(line.is_none());
     }
@@ -4624,6 +4676,7 @@ mod tests {
             },
             true,
             false,
+            false,
         );
         assert!(line.is_none());
     }
@@ -4637,6 +4690,7 @@ mod tests {
                 summary: Some("Updated `src/main.rs` with fix".to_string()),
             },
             true,
+            false,
             true,
         )
         .expect("expected text line");
@@ -4652,6 +4706,7 @@ mod tests {
                 summary: Some("Planning approach for patch.".to_string()),
             },
             true,
+            false,
             true,
         )
         .expect("expected reasoning line");
@@ -4668,6 +4723,7 @@ mod tests {
             },
             true,
             false,
+            false,
         );
         assert!(line.is_none());
     }
@@ -4681,6 +4737,7 @@ mod tests {
                 summary: Some("ls src".to_string()),
             },
             true,
+            false,
             true,
         )
         .expect("expected command line");
@@ -4697,6 +4754,7 @@ mod tests {
             },
             true,
             false,
+            false,
         );
         assert!(line.is_none());
     }
@@ -4708,6 +4766,7 @@ mod tests {
                 run_id: Some("thread_123".to_string()),
             },
             true,
+            false,
             false,
         );
         assert!(line.is_none());
@@ -4724,9 +4783,71 @@ mod tests {
                 ),
             },
             true,
+            false,
             true,
         );
         assert!(line.is_none());
+    }
+
+    #[test]
+    fn hides_housekeeping_file_changes_even_when_intermediate_enabled() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "file_change".to_string(),
+                item_id: Some("x".to_string()),
+                summary: Some("write .clawform/agent_outputs.json".to_string()),
+            },
+            true,
+            false,
+            true,
+        );
+        assert!(line.is_none());
+    }
+
+    #[test]
+    fn hides_housekeeping_reads_even_when_intermediate_enabled() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "command_execution".to_string(),
+                item_id: Some("x".to_string()),
+                summary: Some("read .clawform/agent_variables.json".to_string()),
+            },
+            true,
+            false,
+            true,
+        );
+        assert!(line.is_none());
+    }
+
+    #[test]
+    fn hides_housekeeping_mkdir_even_when_intermediate_enabled() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "command_execution".to_string(),
+                item_id: Some("x".to_string()),
+                summary: Some("mkdir -p /Users/dstack/clawform/.clawform".to_string()),
+            },
+            true,
+            false,
+            true,
+        );
+        assert!(line.is_none());
+    }
+
+    #[test]
+    fn shows_housekeeping_commands_when_internal_visibility_enabled() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "command_execution".to_string(),
+                item_id: Some("x".to_string()),
+                summary: Some("read .clawform/agent_variables.json".to_string()),
+            },
+            true,
+            true,
+            true,
+        )
+        .expect("expected line");
+        assert!(line.contains("read .clawform/agent_variables.json"));
     }
 
     #[test]
@@ -4734,12 +4855,38 @@ mod tests {
         assert!(!should_count_item_progress(
             "command_execution",
             Some("write .clawform/programs/release-notes/reports/agent_outputs.json"),
+            false,
             true
         ));
         assert!(!should_count_item_progress(
             "command_execution",
             Some("cat .clawform/programs/release-notes/reports/agent_result.json"),
+            false,
             false
+        ));
+        assert!(!should_count_item_progress(
+            "file_change",
+            Some("write .clawform/agent_result.json"),
+            false,
+            true
+        ));
+        assert!(!should_count_item_progress(
+            "command_execution",
+            Some("read .clawform/agent_variables.json"),
+            false,
+            true
+        ));
+        assert!(!should_count_item_progress(
+            "command_execution",
+            Some("mkdir -p /Users/dstack/clawform/.clawform"),
+            false,
+            true
+        ));
+        assert!(should_count_item_progress(
+            "command_execution",
+            Some("read .clawform/agent_variables.json"),
+            true,
+            true
         ));
     }
 

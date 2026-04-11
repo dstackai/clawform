@@ -327,6 +327,7 @@ fn execute_apply<R: ProviderRunner + ?Sized>(
         prompt,
         progress: request.progress,
         render_progress: request.render_progress,
+        debug_mode: request.debug,
         verbose_output: request.verbose_output,
         verbose_events: true,
         interactive_ui: request.interactive_ui,

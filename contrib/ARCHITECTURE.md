@@ -1,6 +1,6 @@
 # Clawform Architecture
 
-Last updated: 2026-04-10  
+Last updated: 2026-04-11  
 Status: v0 (implemented baseline)
 
 ## 1) Product Goal
@@ -18,8 +18,8 @@ A **program** is one markdown file (`*.md`) representing one task.
 2. Confirmation prompt is default in interactive shell; use `--yes` to skip
 3. One program file = one session execution
 4. Config path is fixed: `<cwd>/.clawform/config.json`
-5. Provider support in v0: Codex only
-6. Live progress events are on by default (`--no-progress` disables)
+5. Provider support in v0: Codex and Claude
+6. Live progress events are on by default (`--progress off` disables, `--progress plain` keeps non-interactive streaming)
 7. Session artifacts and run history are stored under `.clawform/`
 
 ## 3) Config and Program
@@ -32,8 +32,8 @@ Path:
 
 Rules:
 
-1. exactly one provider has `"default": true`
-2. provider `type` must be `"codex"` in v0
+1. when no explicit provider override is passed, exactly one provider must have `"default": true`
+2. provider `type` must be `"codex"` or `"claude"` in v0
 
 Example:
 
@@ -43,8 +43,13 @@ Example:
     "providers": {
       "codex": {
         "type": "codex",
-        "default": true,
+        "default": false,
         "default_model": "gpt-5-codex"
+      },
+      "claude": {
+        "type": "claude",
+        "default": true,
+        "default_model": "sonnet"
       }
     }
   }
@@ -79,7 +84,7 @@ Variable rules:
 
 ## 4) Apply Session Flow (Current Behavior)
 
-1. Load program + config and resolve model.
+1. Load program + config and resolve provider + model (`-p/--provider` overrides default provider selection).
 2. Resolve program variables (frontmatter defaults + CLI `--var` overrides).
 3. Validate variable definitions and `${{ var.NAME }}` references.
 4. Build preview from previous run records:
@@ -261,7 +266,7 @@ These items are intentionally deferred. Each item describes desired product capa
    Goal: support richer external tool and integration patterns.
 7. Multi-agent orchestration model  
    Goal: support coordinated workflows that involve more than one agent.
-8. Additional providers beyond Codex  
+8. Additional providers beyond Codex and Claude  
    Goal: support multiple model providers in a consistent user experience.
 9. Improved session storage and retrieval performance  
    Goal: keep history/state operations fast and scalable as usage grows.
