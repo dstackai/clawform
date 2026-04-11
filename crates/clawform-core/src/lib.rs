@@ -15,6 +15,6 @@ pub use history::{
     HistoryResetTarget, ProgramHistoryContext, RunHistoryRecord, RunStatus,
 };
 pub use provider::{
-    resolve_provider_runner, CodexRunner, ProviderCapabilities, ProviderEvent, ProviderRequest,
-    ProviderRunResult, ProviderRunner, ProviderUsage, SandboxMode,
+    resolve_provider_runner, ClaudeRunner, CodexRunner, ProviderCapabilities, ProviderEvent,
+    ProviderRequest, ProviderRunResult, ProviderRunner, ProviderUsage, SandboxMode,
 };

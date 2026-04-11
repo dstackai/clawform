@@ -138,14 +138,7 @@ impl ToolConfig {
         }
 
         for (name, provider) in &self.providers {
-            let provider_type = parse_provider_kind(name, &provider.provider_type)?;
-            if provider_type != ProviderKind::Codex {
-                bail!(
-                    "provider '{}' has unsupported type '{}' in v0 (only 'codex' is supported)",
-                    name,
-                    provider_type
-                );
-            }
+            parse_provider_kind(name, &provider.provider_type)?;
             if let Some(model) = &provider.default_model {
                 if model.trim().is_empty() {
                     bail!("provider '{}' default_model cannot be empty", name);
@@ -173,13 +166,15 @@ impl ToolConfig {
 }
 
 fn parse_provider_kind(name: &str, raw: &str) -> Result<ProviderKind> {
-    ProviderKind::parse(raw).ok_or_else(|| {
-        anyhow!(
-            "provider '{}' has unsupported type '{}' in v0 (only 'codex' is supported)",
-            name,
-            raw
-        )
-    })
+    ProviderKind::parse(raw).ok_or_else(|| unsupported_provider_type_error(name, raw))
+}
+
+fn unsupported_provider_type_error(name: &str, raw: &str) -> anyhow::Error {
+    anyhow!(
+        "provider '{}' has unsupported type '{}' in v0 (supported: 'codex', 'claude')",
+        name,
+        raw
+    )
 }
 
 #[cfg(test)]
@@ -225,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn fails_on_non_codex_provider_type() {
+    fn fails_on_non_supported_provider_type() {
         let cfg = parse_tool_config(
             r#"{
               "clawform": {
@@ -238,6 +233,26 @@ mod tests {
         .unwrap();
 
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_claude_provider_type() {
+        let cfg = parse_tool_config(
+            r#"{
+              "clawform": {
+                "providers": {
+                  "claude": {"type":"claude", "default": true, "default_model":"sonnet"}
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        cfg.validate().unwrap();
+        let provider = cfg.resolve_default_provider().unwrap();
+        assert_eq!(provider.name, "claude");
+        assert_eq!(provider.provider_type, ProviderKind::Claude);
+        assert_eq!(provider.default_model.as_deref(), Some("sonnet"));
     }
 
     #[test]

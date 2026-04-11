@@ -17,7 +17,7 @@ use crate::config::ProviderKind;
 use crate::path_utils::to_slash_path;
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone)]
 pub struct ProviderRequest {
@@ -104,6 +104,18 @@ impl ProviderCapabilities {
             approvals: false,
         }
     }
+
+    pub fn claude_v0() -> Self {
+        Self {
+            live_events: false,
+            partial_text: false,
+            tool_call_events: false,
+            file_change_events: false,
+            resume: true,
+            cancel: false,
+            approvals: false,
+        }
+    }
 }
 
 impl Default for ProviderCapabilities {
@@ -170,15 +182,15 @@ pub trait ProviderRunner {
 
 #[derive(Debug, Default, Clone)]
 pub struct CodexRunner;
+#[derive(Debug, Default, Clone)]
+pub struct ClaudeRunner;
 static CODEX_RUNNER: CodexRunner = CodexRunner;
+static CLAUDE_RUNNER: ClaudeRunner = ClaudeRunner;
 
 pub fn resolve_provider_runner(provider_type: ProviderKind) -> Result<&'static dyn ProviderRunner> {
     match provider_type {
         ProviderKind::Codex => Ok(&CODEX_RUNNER),
-        ProviderKind::Claude => Err(anyhow!(
-            "provider type '{}' is not supported yet",
-            provider_type
-        )),
+        ProviderKind::Claude => Ok(&CLAUDE_RUNNER),
     }
 }
 
@@ -195,6 +207,12 @@ impl CodexExecutionMode {
             Self::Unsandboxed => "danger-full-access",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeExecutionMode {
+    Sandboxed,
+    Unsandboxed,
 }
 
 const PROVIDER_HEARTBEAT_SECS: u64 = 10;
@@ -227,6 +245,40 @@ struct AgentResultProtocolFile {
     status: AgentResultStatus,
     #[serde(default)]
     reason: Option<AgentResultReason>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ClaudeJsonResult {
+    #[serde(default)]
+    is_error: bool,
+    #[serde(default)]
+    result: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    num_turns: u64,
+    #[serde(default)]
+    usage: ClaudeUsage,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ClaudeUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+}
+
+impl ClaudeUsage {
+    fn into_provider_usage(self) -> ProviderUsage {
+        ProviderUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cached_input_tokens: self.cache_read_input_tokens,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -404,6 +456,155 @@ impl ProviderRunner for CodexRunner {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::codex_v0()
     }
+}
+
+impl ProviderRunner for ClaudeRunner {
+    fn run(&self, request: &ProviderRequest) -> Result<ProviderRunResult> {
+        match request.sandbox_mode {
+            SandboxMode::Sandboxed => {
+                return run_claude_once(request, ClaudeExecutionMode::Sandboxed);
+            }
+            SandboxMode::Unsandboxed => {
+                return run_claude_once(request, ClaudeExecutionMode::Unsandboxed);
+            }
+            SandboxMode::Auto => {}
+        }
+
+        let sandbox_started_at = SystemTime::now();
+        let sandboxed = run_claude_once(request, ClaudeExecutionMode::Sandboxed)?;
+        if sandboxed.exit_code == Some(0) {
+            if should_retry_unsandboxed_after_success(request, sandbox_started_at) {
+                print_auto_sandbox_retry_decision(request, sandbox_started_at, &sandboxed);
+                return run_claude_once(request, ClaudeExecutionMode::Unsandboxed);
+            }
+            print_auto_sandbox_turn_usage_line(&sandboxed);
+            return Ok(sandboxed);
+        }
+
+        if should_retry_unsandboxed_after_failure_with_agent_result(request, sandbox_started_at) {
+            print_auto_sandbox_retry_decision(request, sandbox_started_at, &sandboxed);
+            return run_claude_once(request, ClaudeExecutionMode::Unsandboxed);
+        }
+
+        print_auto_sandbox_turn_usage_line(&sandboxed);
+        Ok(sandboxed)
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::claude_v0()
+    }
+}
+
+fn run_claude_once(
+    request: &ProviderRequest,
+    mode: ClaudeExecutionMode,
+) -> Result<ProviderRunResult> {
+    ensure_interrupt_handler()?;
+    clear_interrupt_request();
+    clear_agent_result_protocol_file(&request.workspace_root, request.agent_result_rel.as_str())?;
+
+    let mut cmd = Command::new("claude");
+    cmd.arg("-p")
+        .arg("--input-format")
+        .arg("text")
+        .arg("--output-format")
+        .arg("json")
+        .arg("--permission-mode")
+        .arg("bypassPermissions")
+        .current_dir(&request.workspace_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if let Some(model) = &request.model {
+        cmd.arg("--model").arg(model);
+    }
+
+    if let Some(settings) = claude_settings_json(mode) {
+        cmd.arg("--settings").arg(settings);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .context("failed launching provider command 'claude'")?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("failed to open stdin for provider process")?;
+        stdin
+            .write_all(request.prompt.as_bytes())
+            .context("failed writing prompt to provider stdin")?;
+    }
+
+    let output = wait_with_output_interruptible(child)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    parse_claude_json_result(stdout, stderr, output.status.code())
+}
+
+fn claude_settings_json(mode: ClaudeExecutionMode) -> Option<String> {
+    match mode {
+        ClaudeExecutionMode::Sandboxed => Some(
+            json!({
+                "sandbox": {
+                    "enabled": true,
+                    "autoAllowBashIfSandboxed": true,
+                    "allowUnsandboxedCommands": false,
+                    "failIfUnavailable": true
+                }
+            })
+            .to_string(),
+        ),
+        ClaudeExecutionMode::Unsandboxed => None,
+    }
+}
+
+fn parse_claude_json_result(
+    stdout: String,
+    mut stderr: String,
+    process_exit_code: Option<i32>,
+) -> Result<ProviderRunResult> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("claude returned empty stdout in json mode"));
+    }
+
+    let parsed: ClaudeJsonResult =
+        serde_json::from_str(trimmed).context("failed parsing Claude JSON result")?;
+    let mut exit_code = process_exit_code;
+
+    if parsed.is_error {
+        if stderr.trim().is_empty() && !parsed.result.trim().is_empty() {
+            stderr = parsed.result.clone();
+        } else if !parsed.result.trim().is_empty() && !stderr.contains(parsed.result.as_str()) {
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(parsed.result.as_str());
+        }
+        if exit_code == Some(0) {
+            exit_code = Some(1);
+        }
+    }
+
+    let session_id = parsed
+        .session_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .map(sanitize_session_id)
+        .unwrap_or_else(|| format!("local-{}", now_unix_millis()));
+
+    Ok(ProviderRunResult {
+        session_id: Some(session_id),
+        exit_code,
+        stdout,
+        stderr,
+        usage: parsed.usage.into_provider_usage(),
+        turn_count: parsed.num_turns,
+    })
 }
 
 fn print_auto_sandbox_turn_usage_line(run: &ProviderRunResult) {
@@ -2832,6 +3033,15 @@ mod tests {
     }
 
     #[test]
+    fn claude_capabilities_exposed() {
+        let caps = ClaudeRunner.capabilities();
+        assert!(!caps.live_events);
+        assert!(!caps.tool_call_events);
+        assert!(!caps.file_change_events);
+        assert!(caps.resume);
+    }
+
+    #[test]
     fn provider_runner_factory_returns_codex_runner() {
         let runner = resolve_provider_runner(ProviderKind::Codex).expect("codex runner");
         let caps = runner.capabilities();
@@ -2840,12 +3050,61 @@ mod tests {
     }
 
     #[test]
-    fn provider_runner_factory_rejects_unimplemented_claude_runner() {
-        let err = match resolve_provider_runner(ProviderKind::Claude) {
-            Ok(_) => panic!("claude not ready"),
-            Err(err) => err,
-        };
-        assert!(format!("{:#}", err).contains("not supported yet"));
+    fn provider_runner_factory_returns_claude_runner() {
+        let runner = resolve_provider_runner(ProviderKind::Claude).expect("claude runner");
+        let caps = runner.capabilities();
+        assert!(!caps.live_events);
+        assert!(caps.resume);
+    }
+
+    #[test]
+    fn parses_claude_json_success_result() {
+        let result = parse_claude_json_result(
+            r#"{"type":"result","is_error":false,"result":"ok","session_id":"claude-session","num_turns":6,"usage":{"input_tokens":5,"output_tokens":7,"cache_read_input_tokens":11}}"#
+                .to_string(),
+            String::new(),
+            Some(0),
+        )
+        .expect("claude json result");
+
+        assert_eq!(result.session_id.as_deref(), Some("claude-session"));
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.turn_count, 6);
+        assert_eq!(result.usage.input_tokens, Some(5));
+        assert_eq!(result.usage.output_tokens, Some(7));
+        assert_eq!(result.usage.cached_input_tokens, Some(11));
+    }
+
+    #[test]
+    fn promotes_claude_json_error_even_when_process_exit_is_zero() {
+        let result = parse_claude_json_result(
+            r#"{"type":"result","is_error":true,"result":"auth missing","session_id":"claude-session","num_turns":1,"usage":{}}"#
+                .to_string(),
+            String::new(),
+            Some(0),
+        )
+        .expect("claude json result");
+
+        assert_eq!(result.exit_code, Some(1));
+        assert_eq!(result.stderr, "auth missing");
+    }
+
+    #[test]
+    fn claude_sandbox_settings_enable_guardrails() {
+        let raw = claude_settings_json(ClaudeExecutionMode::Sandboxed).expect("settings");
+        let parsed: Value = serde_json::from_str(&raw).expect("json");
+
+        assert_eq!(parsed["sandbox"]["enabled"], Value::Bool(true));
+        assert_eq!(
+            parsed["sandbox"]["autoAllowBashIfSandboxed"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            parsed["sandbox"]["allowUnsandboxedCommands"],
+            Value::Bool(false)
+        );
+        assert_eq!(parsed["sandbox"]["failIfUnavailable"], Value::Bool(true));
+        assert!(claude_settings_json(ClaudeExecutionMode::Unsandboxed).is_none());
     }
 
     #[test]
