@@ -6,7 +6,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 #[cfg(test)]
@@ -18,22 +18,67 @@ use clawform_core::{
 
 const MAX_REPORTED_FILES_DISPLAY: usize = 20;
 const AGENT_RESULT_REL: &str = ".clawform/agent_result.json";
+const HELP_RENDER_WIDTH: usize = 100;
+const HELP_SPEC_WIDTH: usize = 30;
+const TOP_LEVEL_HELP_ROWS: &[(&str, &str)] = &[
+    ("-h, --help", "print help"),
+    ("-V, --version", "print version"),
+];
+const SUBCOMMAND_HELP_ROWS: &[(&str, &str)] = &[
+    ("apply", "apply a single markdown program"),
+    ("reset", "delete local session history and artifacts"),
+    ("help", "print help for a subcommand"),
+];
+const APPLY_HELP_ROWS: &[(&str, &str)] = &[
+    ("-f, --file <FILE>", "program markdown file"),
+    (
+        "-p, --provider <PROVIDER>",
+        "provider name from .clawform/config.json",
+    ),
+    (
+        "--var <NAME=VALUE>",
+        "program variable (NAME=VALUE), repeatable",
+    ),
+    ("-y, --yes", "skip confirmation prompt"),
+    ("-d, --debug", "enable debug output"),
+    (
+        "-v, --verbose",
+        "print full command and message outputs in the live stream",
+    ),
+    (
+        "--progress <MODE>",
+        "progress mode (default: rich; values: rich, plain, off)",
+    ),
+    (
+        "-q, --quiet",
+        "hide intermediate progress steps (read/search/text/turn details)",
+    ),
+    ("-r, --reset", "ignore prior run history context"),
+    (
+        "-s, --sandbox <MODE>",
+        "sandbox mode (default: auto; values: auto, workspace, full-access)",
+    ),
+    ("--auto", "shorthand for --sandbox auto"),
+    ("--workspace", "shorthand for --sandbox workspace"),
+    ("--full-access", "shorthand for --sandbox full-access"),
+    ("-h, --help", "print help"),
+];
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum CliSandboxMode {
     Auto,
-    #[value(alias = "sandboxed")]
-    WorkspaceWrite,
-    #[value(alias = "unsandboxed")]
-    DangerFullAccess,
+    #[value(alias = "workspace-write", alias = "sandboxed")]
+    Workspace,
+    #[value(alias = "danger-full-access", alias = "unsandboxed", alias = "full")]
+    FullAccess,
 }
 
 impl From<CliSandboxMode> for SandboxMode {
     fn from(value: CliSandboxMode) -> Self {
         match value {
             CliSandboxMode::Auto => SandboxMode::Auto,
-            CliSandboxMode::WorkspaceWrite => SandboxMode::Sandboxed,
-            CliSandboxMode::DangerFullAccess => SandboxMode::Unsandboxed,
+            CliSandboxMode::Workspace => SandboxMode::Sandboxed,
+            CliSandboxMode::FullAccess => SandboxMode::Unsandboxed,
         }
     }
 }
@@ -46,7 +91,7 @@ enum CliProgressMode {
 }
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Markdown-first declarative agent apply")]
+#[command(version, about = "markdown-first declarative agent apply")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -54,33 +99,33 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Apply a single markdown program.
+    /// apply a single markdown program.
     Apply {
-        /// Program markdown file.
+        /// program markdown file.
         #[arg(short = 'f', long = "file")]
         file: PathBuf,
 
-        /// Provider name from `.clawform/config.json` to use for this run.
+        /// provider name from `.clawform/config.json`.
         #[arg(short = 'p', long = "provider", value_name = "PROVIDER")]
         provider: Option<String>,
 
-        /// Program variable value (`NAME=VALUE`). Repeatable.
+        /// program variable (`NAME=VALUE`). repeatable.
         #[arg(long = "var", value_name = "NAME=VALUE", action = ArgAction::Append)]
         vars: Vec<String>,
 
-        /// Auto-approve apply without interactive confirmation prompt.
+        /// skip confirmation prompt.
         #[arg(short = 'y', long)]
         yes: bool,
 
-        /// Enable concise debug output.
+        /// enable debug output.
         #[arg(short = 'd', long)]
         debug: bool,
 
-        /// Print full command and message outputs in the live stream.
+        /// print full command and message outputs in the live stream.
         #[arg(short = 'v', long)]
         verbose: bool,
 
-        /// Progress rendering mode.
+        /// progress mode.
         #[arg(
             long = "progress",
             value_enum,
@@ -88,15 +133,15 @@ enum Commands {
         )]
         progress_mode: CliProgressMode,
 
-        /// Legacy alias for `--progress off`.
+        /// legacy alias for `--progress off`.
         #[arg(long = "no-progress", action = ArgAction::SetTrue, hide = true)]
         no_progress_legacy: bool,
 
-        /// Legacy alias for `--progress plain`.
+        /// legacy alias for `--progress plain`.
         #[arg(long = "no-interactive", action = ArgAction::SetTrue, hide = true)]
         no_interactive_legacy: bool,
 
-        /// Quiet mode: hide intermediate progress steps (read/search/text/turn details).
+        /// hide intermediate progress steps (read/search/text/turn details).
         #[arg(
             short = 'q',
             long = "quiet",
@@ -105,31 +150,55 @@ enum Commands {
         )]
         quiet: bool,
 
-        /// Reset context for this run (ignore prior run history context).
+        /// ignore prior run history context.
         #[arg(short = 'r', long = "reset", action = ArgAction::SetTrue)]
         reset_context: bool,
 
-        /// Sandbox policy for model-generated shell commands (`auto` escalates when needed).
         #[arg(
             short = 's',
             long = "sandbox",
             alias = "sandbox-mode",
+            help = "sandbox mode (default: auto)",
             value_enum,
-            default_value_t = CliSandboxMode::Auto
+            value_name = "MODE"
         )]
-        sandbox_mode: CliSandboxMode,
+        sandbox_mode: Option<CliSandboxMode>,
+
+        /// shorthand for `--sandbox auto`.
+        #[arg(
+            long = "auto",
+            action = ArgAction::SetTrue,
+            conflicts_with_all = ["sandbox_mode", "sandbox_workspace", "sandbox_full_access"]
+        )]
+        sandbox_auto: bool,
+
+        /// shorthand for `--sandbox workspace`.
+        #[arg(
+            long = "workspace",
+            action = ArgAction::SetTrue,
+            conflicts_with_all = ["sandbox_mode", "sandbox_auto", "sandbox_full_access"]
+        )]
+        sandbox_workspace: bool,
+
+        /// shorthand for `--sandbox full-access`.
+        #[arg(
+            long = "full-access",
+            action = ArgAction::SetTrue,
+            conflicts_with_all = ["sandbox_mode", "sandbox_auto", "sandbox_workspace"]
+        )]
+        sandbox_full_access: bool,
     },
-    /// Delete local session history and artifacts.
+    /// delete local session history and artifacts.
     Reset {
-        /// Program id whose session history should be deleted.
+        /// program id whose session history should be deleted.
         #[arg(short = 'p', long)]
         program: Option<String>,
 
-        /// Delete session history for all programs.
+        /// delete session history for all programs.
         #[arg(short = 'a', long)]
         all: bool,
 
-        /// Auto-approve destructive delete without interactive confirmation prompt.
+        /// skip confirmation prompt.
         #[arg(short = 'y', long)]
         yes: bool,
     },
@@ -167,6 +236,9 @@ fn real_main() -> Result<()> {
             quiet,
             reset_context,
             sandbox_mode,
+            sandbox_auto,
+            sandbox_workspace,
+            sandbox_full_access,
         } => {
             let workspace_root =
                 env::current_dir().context("failed resolving current working directory")?;
@@ -188,7 +260,12 @@ fn real_main() -> Result<()> {
                 CliProgressMode::Off => (false, false),
             };
             let confirm = interactive_shell && !yes;
-            let sandbox_mode: SandboxMode = sandbox_mode.into();
+            let sandbox_mode = resolve_cli_sandbox_mode(
+                sandbox_mode,
+                sandbox_auto,
+                sandbox_workspace,
+                sandbox_full_access,
+            )?;
             let program_variables = parse_apply_variables(&vars)?;
 
             if debug {
@@ -277,16 +354,64 @@ fn parse_cli() -> Cli {
     if should_show_combined_help(&args) {
         print_combined_help_and_exit();
     }
+    if should_show_apply_help(&args) {
+        print_apply_help_and_exit();
+    }
     if should_infer_apply_subcommand(&args) {
         args.insert(1, OsString::from("apply"));
     }
     Cli::parse_from(args)
 }
 
+fn resolve_cli_sandbox_mode(
+    sandbox_mode: Option<CliSandboxMode>,
+    sandbox_auto: bool,
+    sandbox_workspace: bool,
+    sandbox_full_access: bool,
+) -> Result<SandboxMode> {
+    let mut selected = Vec::new();
+
+    if let Some(mode) = sandbox_mode {
+        selected.push(mode);
+    }
+    if sandbox_auto {
+        selected.push(CliSandboxMode::Auto);
+    }
+    if sandbox_workspace {
+        selected.push(CliSandboxMode::Workspace);
+    }
+    if sandbox_full_access {
+        selected.push(CliSandboxMode::FullAccess);
+    }
+
+    if selected.len() > 1 {
+        return Err(anyhow!(
+            "choose only one sandbox mode: use either --sandbox <MODE> or one of --auto/--workspace/--full-access"
+        ));
+    }
+
+    Ok(selected
+        .into_iter()
+        .next()
+        .unwrap_or(CliSandboxMode::Auto)
+        .into())
+}
+
 fn should_show_combined_help(args: &[OsString]) -> bool {
     matches!(
         args.get(1).map(|s| s.to_string_lossy()),
         Some(flag) if flag.as_ref() == "-h" || flag.as_ref() == "--help"
+    )
+}
+
+fn should_show_apply_help(args: &[OsString]) -> bool {
+    matches!(
+        (
+            args.get(1).map(|s| s.to_string_lossy()),
+            args.get(2).map(|s| s.to_string_lossy())
+        ),
+        (Some(cmd), Some(flag))
+            if cmd.as_ref() == "apply" && (flag.as_ref() == "-h" || flag.as_ref() == "--help")
     )
 }
 
@@ -297,35 +422,120 @@ fn print_combined_help_and_exit() -> ! {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "cf".to_string());
 
-    let mut top = Cli::command()
-        .subcommand_required(false)
-        .override_usage(format!(
-            "{bin} [GLOBAL_OPTIONS] <COMMAND>\n       {bin} -f <program.md> [APPLY_OPTIONS]"
-        ));
-    top = top.after_help(
-        "Mode guide:\n  GLOBAL_OPTIONS: -h, --help, -V, --version\n  APPLY_OPTIONS: shown in the 'Default apply mode' section below",
-    );
+    let mut help = String::new();
+    help.push_str("markdown-first declarative agent apply\n\n");
+    help.push_str(&format!(
+        "{} {bin} -f <program.md> [apply options]\n       {bin} <subcommand>\n\n",
+        format_help_heading("Usage:")
+    ));
+    help.push_str(&render_help_rows(
+        &format_help_heading("Subcommands:"),
+        SUBCOMMAND_HELP_ROWS,
+    ));
+    help.push('\n');
+    help.push_str(&render_help_rows(
+        &format_help_heading("Options:"),
+        TOP_LEVEL_HELP_ROWS,
+    ));
+    help.push('\n');
+    help.push_str(&render_apply_options_block(&format_help_heading(
+        "Apply options:",
+    )));
+    print!("{help}");
+    std::process::exit(0);
+}
 
-    if let Err(err) = top.print_long_help() {
-        eprintln!("error: failed rendering help: {err}");
-        std::process::exit(2);
+fn print_apply_help_and_exit() -> ! {
+    let bin = env::args_os()
+        .next()
+        .and_then(|p| PathBuf::from(p).file_name().map(|n| n.to_owned()))
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "cf".to_string());
+
+    let mut help = String::new();
+    help.push_str("apply a single markdown program\n\n");
+    help.push_str(&format!(
+        "{} {bin} apply [options] --file <FILE>\n\n",
+        format_help_heading("Usage:")
+    ));
+    help.push_str(&render_help_rows(
+        &format_help_heading("Options:"),
+        APPLY_HELP_ROWS,
+    ));
+    print!("{help}");
+    std::process::exit(0);
+}
+
+fn render_apply_options_block(heading: &str) -> String {
+    render_help_rows(heading, APPLY_HELP_ROWS)
+}
+
+fn render_help_rows(heading: &str, rows: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    out.push_str(heading);
+    out.push('\n');
+
+    let desc_width = HELP_RENDER_WIDTH
+        .saturating_sub(2 + HELP_SPEC_WIDTH + 2)
+        .max(24);
+
+    for (spec, desc) in rows {
+        let wrapped = wrap_help_text(desc, desc_width);
+        let mut lines = wrapped.into_iter();
+        if let Some(first) = lines.next() {
+            out.push_str(&format!(
+                "  {:<width$}  {}\n",
+                spec,
+                first,
+                width = HELP_SPEC_WIDTH
+            ));
+        }
+        for line in lines {
+            out.push_str(&format!(
+                "  {:<width$}  {}\n",
+                "",
+                line,
+                width = HELP_SPEC_WIDTH
+            ));
+        }
     }
+    out
+}
 
-    if let Some(mut apply) = Cli::command().find_subcommand("apply").cloned() {
-        println!();
-        println!();
-        println!("Default apply mode (used by `cf -f ...` and by explicit `cf apply ...`):");
-        apply = apply.override_usage(format!(
-            "{bin} -f <program.md> [APPLY_OPTIONS]\n       {bin} apply -f <program.md> [APPLY_OPTIONS]"
-        ));
-        if let Err(err) = apply.print_long_help() {
-            eprintln!("error: failed rendering apply help: {err}");
-            std::process::exit(2);
+fn format_help_heading(text: &str) -> String {
+    if io::stdout().is_terminal() {
+        format!("\x1b[1m{}\x1b[0m", text)
+    } else {
+        text.to_string()
+    }
+}
+
+fn wrap_help_text(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in text.split_whitespace() {
+        let next_len = current.len() + usize::from(!current.is_empty()) + word.len();
+        if next_len > width && !current.is_empty() {
+            lines.push(current);
+            current = word.to_string();
+        } else {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
         }
     }
 
-    println!();
-    std::process::exit(0);
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    lines
 }
 
 fn should_infer_apply_subcommand(args: &[OsString]) -> bool {
@@ -1037,6 +1247,24 @@ mod tests {
     }
 
     #[test]
+    fn show_apply_help_for_apply_help_flags() {
+        for flag in ["-h", "--help"] {
+            let args = vec![
+                OsString::from("cf"),
+                OsString::from("apply"),
+                OsString::from(flag),
+            ];
+            assert!(should_show_apply_help(&args));
+        }
+    }
+
+    #[test]
+    fn do_not_show_apply_help_for_top_level_help() {
+        let args = vec![OsString::from("cf"), OsString::from("--help")];
+        assert!(!should_show_apply_help(&args));
+    }
+
+    #[test]
     fn print_agent_status_line_includes_reason_and_result_path() {
         let result = AgentResult {
             status: AgentStatus::Failure,
@@ -1095,6 +1323,110 @@ mod tests {
     }
 
     #[test]
+    fn apply_cli_accepts_workspace_sandbox_value() {
+        let cli = Cli::try_parse_from(["cf", "apply", "-f", "demo.md", "--sandbox", "workspace"])
+            .expect("must parse");
+
+        match cli.command {
+            Commands::Apply { sandbox_mode, .. } => {
+                assert_eq!(sandbox_mode, Some(CliSandboxMode::Workspace));
+            }
+            _ => panic!("expected apply command"),
+        }
+    }
+
+    #[test]
+    fn apply_cli_accepts_legacy_workspace_write_alias() {
+        let cli = Cli::try_parse_from([
+            "cf",
+            "apply",
+            "-f",
+            "demo.md",
+            "--sandbox",
+            "workspace-write",
+        ])
+        .expect("must parse");
+
+        match cli.command {
+            Commands::Apply { sandbox_mode, .. } => {
+                assert_eq!(sandbox_mode, Some(CliSandboxMode::Workspace));
+            }
+            _ => panic!("expected apply command"),
+        }
+    }
+
+    #[test]
+    fn apply_cli_accepts_full_access_shortcut_flag() {
+        let cli = Cli::try_parse_from(["cf", "apply", "-f", "demo.md", "--full-access"])
+            .expect("must parse");
+
+        match cli.command {
+            Commands::Apply {
+                sandbox_mode,
+                sandbox_full_access,
+                ..
+            } => {
+                assert_eq!(sandbox_mode, None);
+                assert!(sandbox_full_access);
+            }
+            _ => panic!("expected apply command"),
+        }
+    }
+
+    #[test]
+    fn apply_cli_accepts_workspace_shortcut_flag() {
+        let cli = Cli::try_parse_from(["cf", "apply", "-f", "demo.md", "--workspace"])
+            .expect("must parse");
+
+        match cli.command {
+            Commands::Apply {
+                sandbox_mode,
+                sandbox_workspace,
+                ..
+            } => {
+                assert_eq!(sandbox_mode, None);
+                assert!(sandbox_workspace);
+            }
+            _ => panic!("expected apply command"),
+        }
+    }
+
+    #[test]
+    fn apply_cli_rejects_conflicting_sandbox_selectors() {
+        let err = Cli::try_parse_from([
+            "cf",
+            "apply",
+            "-f",
+            "demo.md",
+            "--sandbox",
+            "workspace",
+            "--full-access",
+        ])
+        .expect_err("must fail");
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--sandbox <MODE>") || rendered.contains("--full-access"),
+            "unexpected clap error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn resolve_cli_sandbox_mode_defaults_to_auto() {
+        let mode = resolve_cli_sandbox_mode(None, false, false, false).expect("must resolve");
+        assert_eq!(mode, SandboxMode::Auto);
+    }
+
+    #[test]
+    fn resolve_cli_sandbox_mode_prefers_shortcut_flags() {
+        let mode = resolve_cli_sandbox_mode(None, false, true, false).expect("must resolve");
+        assert_eq!(mode, SandboxMode::Sandboxed);
+
+        let mode = resolve_cli_sandbox_mode(None, false, false, true).expect("must resolve");
+        assert_eq!(mode, SandboxMode::Unsandboxed);
+    }
+
+    #[test]
     fn apply_cli_still_accepts_progress_long_flag() {
         let cli = Cli::try_parse_from(["cf", "apply", "-f", "demo.md", "--progress", "off"])
             .expect("must parse");
@@ -1105,5 +1437,17 @@ mod tests {
             }
             _ => panic!("expected apply command"),
         }
+    }
+
+    #[test]
+    fn render_apply_options_block_is_flat_and_explicit() {
+        let block = render_apply_options_block("Apply options:");
+        assert!(block.starts_with("Apply options:\n"));
+        assert!(block.contains("\n  --var <NAME=VALUE>"));
+        assert!(block.contains("\n  --progress <MODE>"));
+        assert!(block.contains("--sandbox <MODE>"));
+        assert!(block.contains("\n  --auto"));
+        assert!(block.contains("enable debug output"));
+        assert!(!block.contains("\n      --var"));
     }
 }

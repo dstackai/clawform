@@ -20,7 +20,8 @@ A **program** is one markdown file (`*.md`) representing one task.
 4. Config path is fixed: `<cwd>/.clawform/config.json`
 5. Provider support in v0: Codex and Claude
 6. Live progress events are on by default (`--progress off` disables, `--progress plain` keeps non-interactive streaming)
-7. Session artifacts and run history are stored under `.clawform/`
+7. Sandbox selector is exposed as `--sandbox auto|workspace|full-access` (default: `auto`) plus shorthand flags `--auto`, `--workspace`, and `--full-access`
+8. Session artifacts and run history are stored under `.clawform/`
 
 ## 3) Config and Program
 

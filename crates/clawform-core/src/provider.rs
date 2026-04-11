@@ -58,8 +58,8 @@ impl SandboxMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::Sandboxed => "workspace-write",
-            Self::Unsandboxed => "danger-full-access",
+            Self::Sandboxed => "workspace",
+            Self::Unsandboxed => "full-access",
         }
     }
 }
@@ -204,8 +204,8 @@ enum CodexExecutionMode {
 impl CodexExecutionMode {
     fn label(self) -> &'static str {
         match self {
-            Self::Sandboxed => "workspace-write",
-            Self::Unsandboxed => "danger-full-access",
+            Self::Sandboxed => "workspace",
+            Self::Unsandboxed => "full-access",
         }
     }
 }
@@ -219,8 +219,8 @@ enum ClaudeExecutionMode {
 impl ClaudeExecutionMode {
     fn label(self) -> &'static str {
         match self {
-            Self::Sandboxed => "workspace-write",
-            Self::Unsandboxed => "danger-full-access",
+            Self::Sandboxed => "workspace",
+            Self::Unsandboxed => "full-access",
         }
     }
 }
@@ -3441,14 +3441,14 @@ fn colorize_session_payload(payload: &str) -> String {
 fn colorize_session_segment(segment: &str) -> String {
     let trimmed = segment.trim();
     match trimmed {
-        "workspace-write" => return "\x1b[34mworkspace-write\x1b[0m".to_string(),
-        "danger-full-access" => return "\x1b[33mdanger-full-access\x1b[0m".to_string(),
+        "workspace" | "workspace-write" => return "\x1b[34mworkspace\x1b[0m".to_string(),
+        "full-access" | "danger-full-access" => return "\x1b[33mfull-access\x1b[0m".to_string(),
         _ => {}
     }
     if let Some((key, value)) = trimmed.split_once('=') {
         let code = match (key, value) {
-            ("sandbox", "workspace-write") => Some("34"),
-            ("sandbox", "danger-full-access") => Some("33"),
+            ("sandbox", "workspace") | ("sandbox", "workspace-write") => Some("34"),
+            ("sandbox", "full-access") | ("sandbox", "danger-full-access") => Some("33"),
             _ => None,
         };
         if let Some(code) = code {
@@ -3982,24 +3982,24 @@ mod tests {
     fn sandbox_mode_labels_match_cli_values() {
         assert_eq!(SandboxMode::default(), SandboxMode::Auto);
         assert_eq!(SandboxMode::Auto.label(), "auto");
-        assert_eq!(SandboxMode::Sandboxed.label(), "workspace-write");
-        assert_eq!(SandboxMode::Unsandboxed.label(), "danger-full-access");
+        assert_eq!(SandboxMode::Sandboxed.label(), "workspace");
+        assert_eq!(SandboxMode::Unsandboxed.label(), "full-access");
     }
 
     #[test]
     fn session_lines_include_execution_mode_values() {
-        let sandboxed = colorize_session_payload("019d-session | workspace-write");
-        assert!(sandboxed.contains("workspace-write"));
+        let sandboxed = colorize_session_payload("019d-session | workspace");
+        assert!(sandboxed.contains("workspace"));
 
-        let unsandboxed = colorize_session_payload("019d-session | danger-full-access");
-        assert!(unsandboxed.contains("danger-full-access"));
+        let unsandboxed = colorize_session_payload("019d-session | full-access");
+        assert!(unsandboxed.contains("full-access"));
     }
 
     #[test]
     fn session_payload_uses_readable_sandbox_value() {
-        let rendered = colorize_session_payload("019d-session | workspace-write");
+        let rendered = colorize_session_payload("019d-session | workspace");
         assert!(rendered.contains("019d-session"));
-        assert!(rendered.contains("\x1b[34mworkspace-write\x1b[0m"));
+        assert!(rendered.contains("\x1b[34mworkspace\x1b[0m"));
     }
 
     #[test]
@@ -4010,10 +4010,10 @@ mod tests {
             spinner_idx: 0,
             cursor_hidden: false,
         };
-        let rendered = printer.render_event_line("🧵 019d-session | danger-full-access");
+        let rendered = printer.render_event_line("🧵 019d-session | full-access");
         assert!(rendered.contains("🧵"));
         assert!(!rendered.contains("🧵 session "));
-        assert!(rendered.contains("\x1b[33mdanger-full-access\x1b[0m"));
+        assert!(rendered.contains("\x1b[33mfull-access\x1b[0m"));
     }
 
     #[test]
