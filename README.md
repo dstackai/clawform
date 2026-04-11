@@ -2,7 +2,7 @@
 
 Clawform executes agentic programs from markdown files.
 
-You keep instructions in repo files and run `cf -f program.md` (equivalent to `cf apply -f program.md`). Each run writes session data under `.clawform/programs/<program_id>/sessions/<session_id>/` and appends `.clawform/history/index.jsonl`.
+You keep instructions in repo files and run `cf -f program.md`.
 
 ## Why It Exists
 
@@ -34,13 +34,9 @@ Before execution, Clawform previews:
 
 Then it asks for confirmation and executes the program with the configured provider, or with the explicitly selected provider when you pass `-p/--provider`.
 
-During execution, Clawform streams progress events to the terminal. Use `--progress rich|plain|off` to control rendering. Use `--sandbox auto|workspace|full-access` to choose sandbox policy (default: `auto`), or the shorthand flags `--auto`, `--workspace`, and `--full-access`.
+During execution, Clawform streams progress to the terminal. Use `--progress rich|plain|off` to control rendering. Use `--sandbox auto|workspace|full-access` to choose sandbox policy (default: `auto`), or the shorthand flags `--auto`, `--workspace`, and `--full-access`.
 
-After execution, Clawform stores:
-
-- run outcome and summary (`outcome.json`, `output.md`)
-- per-session snapshots for next-run diff (`program.md`, `variables.json`)
-- changed files reported for this session
+After execution, Clawform keeps local session history so the next run can show previews and diffs.
 
 ## Install
 
@@ -118,18 +114,6 @@ turn 1 | tokens: in=117k out=1.6k cached=107k
 total | tokens: in=117k out=1.6k cached=107k
 changes: 0 files
 ```
-
-## State Layout
-
-Clawform keeps local state under `.clawform/`:
-
-- config: `.clawform/config.json`
-- history index: `.clawform/history/index.jsonl`
-- per-program sessions: `.clawform/programs/<program_id>/sessions/<session_id>/`
-
-Session folders keep `program.md`, `variables.json`, `output.md`, `outcome.json`, plus `commands/*` and `messages/*` used by interactive `out`/`msg` links.
-
-For internal protocol details and strict agent result schema, see `contrib/ARCHITECTURE.md`.
 
 ## Commands
 

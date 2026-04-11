@@ -19,7 +19,7 @@ A **program** is one markdown file (`*.md`) representing one task.
 3. One program file = one session execution
 4. Config path is fixed: `<cwd>/.clawform/config.json`
 5. Provider support in v0: Codex and Claude
-6. Live progress events are on by default (`--progress off` disables, `--progress plain` keeps non-interactive streaming)
+6. Live progress is on by default (`--progress off` disables, `--progress plain` keeps non-interactive streaming, rich mode is used automatically in an interactive TTY)
 7. Sandbox selector is exposed as `--sandbox auto|workspace|full-access` (default: `auto`) plus shorthand flags `--auto`, `--workspace`, and `--full-access`
 8. Session artifacts and run history are stored under `.clawform/`
 
@@ -96,12 +96,22 @@ Variable rules:
 6. Clear prior run protocol files in `.clawform/` and write runtime variables file (`.clawform/agent_variables.json`) when variables are present.
 7. Build runtime prompt; in `workspace` and `auto` modes include explicit verdict-gate rules for sandbox-vs-program blocking.
 8. Run provider in the current workspace (no temp workspace copy).
-9. Stream provider events to terminal; during the run write session `commands/*` and `messages/*`.
+9. Normalize provider-native events into shared progress categories, stream them to terminal, and during the run write session `commands/*` and `messages/*`.
 10. In `auto` mode, allow at most one retry in `full-access` mode only when current-run `.clawform/agent_result.json` reports `status=partial|failure` and `reason=sandbox_blocked` (no stdout/stderr heuristic fallback).
 11. Read agent status from `.clawform/agent_result.json` (required) and validate strict status/reason schema.
 12. Collect reported changed files from `.clawform/agent_outputs.json` when that file exists and was updated in this run.
 13. Persist run-end records (`output.md`, `outcome.json`) and append `.clawform/history/index.jsonl`.
 14. Persist program snapshot (`program.md`) and variable snapshot (`variables.json`) on success.
+
+## 4.1 Progress Rendering Semantics
+
+- In an interactive TTY, rich progress keeps a spinner plus a live `running` or `running: <activity>` status line.
+- `running` means the provider run is still alive. It is a liveness indicator, not the same thing as reasoning text.
+- The live activity suffix is derived from the highest-priority active provider item, for example `search ...`, `fetch ...`, `use ...`, `edit ...`, or `update plan`.
+- Completed progress lines are normalized across Claude and Codex into shared categories such as reasoning (`💭`), assistant text (`💬`), search (`🔎`), fetch (`🌐`), command (`❱`), file change (`✎`), plan update (`🗒️`), generic tool (`🔧`), and unknown provider event (`📦`).
+- In `plain` mode, Clawform prints stable progress lines without the interactive spinner/status renderer.
+- Unknown tool-like and non-tool provider items are rendered through generic fallbacks instead of being silently dropped.
+- Interrupting with `Ctrl+C` should surface cancellation rather than a raw provider stdout/stderr dump.
 
 ## 5) State and Storage Layout
 
@@ -217,23 +227,7 @@ Applies only when sandbox mode is `auto`:
 
 ## 6) Known Bugs
 
-### 6.1 Interrupted Runs Recorded as Failure
-
-Steps to reproduce:
-
-1. Start `cf -f program.md` in interactive mode.
-2. Interrupt with `Ctrl+C`.
-3. Run apply again and inspect the last-session preview/history.
-
-Expected:
-
-- Interrupted runs are shown as `interrupted`/`canceled`.
-
-Actual:
-
-- Interrupted runs are recorded and shown as generic `failure`.
-
-### 6.2 Workspace-Global Protocol File Collisions Under Concurrent Applies
+### 6.1 Workspace-Global Protocol File Collisions Under Concurrent Applies
 
 Steps to reproduce:
 
@@ -257,8 +251,8 @@ These items are intentionally deferred. Each item describes desired product capa
    Goal: support durable context across sessions with predictable usage rules.
 2. Plan support  
    Goal: support planning as a first-class workflow, separate from execution.
-3. Interrupted/canceled session handling  
-   Goal: represent and communicate non-completed runs clearly to users.
+3. Persisted provider trace artifacts  
+   Goal: optionally persist canonical normalized provider events for audit/debug flows without requiring raw provider stdout parsing.
 4. Changes/diff reliability and consistency  
    Goal: for the same session, preview, apply output, debug output, and history should report the same changed-file set and line counts, with generated/noise files handled consistently.
 5. Agent-reported changes as single source of truth  
