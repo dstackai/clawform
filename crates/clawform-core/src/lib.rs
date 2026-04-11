@@ -9,12 +9,12 @@ pub mod provider;
 pub use apply::{
     run_apply, AgentReason, AgentResult, AgentStatus, ApplyRequest, ApplyResult, FileResult,
 };
-pub use config::{load_config, ResolvedProvider, ToolConfig};
+pub use config::{load_config, ProviderKind, ResolvedProvider, ToolConfig};
 pub use history::{
     append_history_record, load_program_history_context, reset_history, HistoryResetOutcome,
     HistoryResetTarget, ProgramHistoryContext, RunHistoryRecord, RunStatus,
 };
 pub use provider::{
-    CodexRunner, ProviderCapabilities, ProviderEvent, ProviderRequest, ProviderRunResult,
-    ProviderRunner, ProviderUsage, SandboxMode,
+    resolve_provider_runner, CodexRunner, ProviderCapabilities, ProviderEvent, ProviderRequest,
+    ProviderRunResult, ProviderRunner, ProviderUsage, SandboxMode,
 };

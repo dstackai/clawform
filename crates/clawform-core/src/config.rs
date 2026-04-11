@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -32,10 +33,39 @@ pub struct ProviderConfig {
     pub default_model: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    Codex,
+    Claude,
+}
+
+impl ProviderKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+}
+
+impl fmt::Display for ProviderKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedProvider {
     pub name: String,
-    pub provider_type: String,
+    pub provider_type: ProviderKind,
     pub default_model: Option<String>,
 }
 
@@ -108,11 +138,12 @@ impl ToolConfig {
         }
 
         for (name, provider) in &self.providers {
-            if provider.provider_type != "codex" {
+            let provider_type = parse_provider_kind(name, &provider.provider_type)?;
+            if provider_type != ProviderKind::Codex {
                 bail!(
                     "provider '{}' has unsupported type '{}' in v0 (only 'codex' is supported)",
                     name,
-                    provider.provider_type
+                    provider_type
                 );
             }
             if let Some(model) = &provider.default_model {
@@ -131,13 +162,24 @@ impl ToolConfig {
             .iter()
             .find(|(_, p)| p.default)
             .context("no default provider found after validation")?;
+        let provider_type = parse_provider_kind(name, &provider.provider_type)?;
 
         Ok(ResolvedProvider {
             name: name.clone(),
-            provider_type: provider.provider_type.clone(),
+            provider_type,
             default_model: provider.default_model.clone(),
         })
     }
+}
+
+fn parse_provider_kind(name: &str, raw: &str) -> Result<ProviderKind> {
+    ProviderKind::parse(raw).ok_or_else(|| {
+        anyhow!(
+            "provider '{}' has unsupported type '{}' in v0 (only 'codex' is supported)",
+            name,
+            raw
+        )
+    })
 }
 
 #[cfg(test)]
@@ -196,6 +238,26 @@ mod tests {
         .unwrap();
 
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn resolves_typed_default_provider() {
+        let cfg = parse_tool_config(
+            r#"{
+              "clawform": {
+                "providers": {
+                  "codex": {"type":"codex", "default": true, "default_model":"gpt-5-codex"}
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        cfg.validate().unwrap();
+        let provider = cfg.resolve_default_provider().unwrap();
+        assert_eq!(provider.name, "codex");
+        assert_eq!(provider.provider_type, ProviderKind::Codex);
+        assert_eq!(provider.default_model.as_deref(), Some("gpt-5-codex"));
     }
 
     #[test]

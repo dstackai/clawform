@@ -12,8 +12,8 @@ use serde_json::Value;
 #[cfg(test)]
 use clawform_core::AgentReason;
 use clawform_core::{
-    reset_history, run_apply, AgentResult, AgentStatus, ApplyRequest, CodexRunner, FileResult,
-    HistoryResetTarget, ProviderRunner, ProviderUsage, SandboxMode,
+    load_config, reset_history, resolve_provider_runner, run_apply, AgentResult, AgentStatus,
+    ApplyRequest, FileResult, HistoryResetTarget, ProviderUsage, SandboxMode,
 };
 
 const MAX_REPORTED_FILES_DISPLAY: usize = 20;
@@ -166,7 +166,9 @@ fn real_main() -> Result<()> {
         } => {
             let workspace_root =
                 env::current_dir().context("failed resolving current working directory")?;
-            let runner = CodexRunner;
+            let config = load_config(&workspace_root)?;
+            let provider = config.resolve_default_provider()?;
+            let runner = resolve_provider_runner(provider.provider_type)?;
             let interactive_shell =
                 std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
             let progress_mode = if no_progress_legacy {
@@ -187,7 +189,7 @@ fn real_main() -> Result<()> {
 
             if debug {
                 let caps = runner.capabilities();
-                println!("Provider: codex");
+                println!("Provider: {}", provider.provider_type);
                 println!(
                     "Capabilities: live_events={} partial_text={} tool_call_events={} file_change_events={} resume={} cancel={} approvals={}",
                     caps.live_events,
@@ -224,7 +226,7 @@ fn real_main() -> Result<()> {
                     use_history_context: !reset_context,
                     sandbox_mode,
                 },
-                &runner,
+                runner,
             ) {
                 Ok(result) => result,
                 Err(err) => {

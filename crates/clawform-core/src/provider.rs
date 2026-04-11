@@ -13,6 +13,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::config::ProviderKind;
 use crate::path_utils::to_slash_path;
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
@@ -169,6 +170,17 @@ pub trait ProviderRunner {
 
 #[derive(Debug, Default, Clone)]
 pub struct CodexRunner;
+static CODEX_RUNNER: CodexRunner = CodexRunner;
+
+pub fn resolve_provider_runner(provider_type: ProviderKind) -> Result<&'static dyn ProviderRunner> {
+    match provider_type {
+        ProviderKind::Codex => Ok(&CODEX_RUNNER),
+        ProviderKind::Claude => Err(anyhow!(
+            "provider type '{}' is not supported yet",
+            provider_type
+        )),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexExecutionMode {
@@ -448,8 +460,16 @@ fn format_auto_sandbox_retry_decision_line(
         } else {
             " | "
         };
-        let turn_line = format_turn_usage_line(run.turn_count, &run.usage)
-            .unwrap_or_else(|| format!("turn {}", if run.turn_count == 0 { 1 } else { run.turn_count }));
+        let turn_line = format_turn_usage_line(run.turn_count, &run.usage).unwrap_or_else(|| {
+            format!(
+                "turn {}",
+                if run.turn_count == 0 {
+                    1
+                } else {
+                    run.turn_count
+                }
+            )
+        });
         let turn_segment = if use_color {
             format!("\x1b[2m{}\x1b[0m", turn_line)
         } else {
@@ -1070,11 +1090,12 @@ fn collect_with_progress(
                             }
                         }
                         if let Some(progress_line) = progress_line {
-                            let progress_line = if matches!(normalized, ProviderEvent::RunStarted { .. }) {
-                                format!("{} | {}", progress_line, execution_mode.label())
-                            } else {
-                                progress_line
-                            };
+                            let progress_line =
+                                if matches!(normalized, ProviderEvent::RunStarted { .. }) {
+                                    format!("{} | {}", progress_line, execution_mode.label())
+                                } else {
+                                    progress_line
+                                };
                             let progress_line =
                                 add_completion_duration_suffix(&progress_line, completion_duration);
                             let progress_line = if verbose_output {
@@ -2808,6 +2829,23 @@ mod tests {
         assert!(caps.tool_call_events);
         assert!(caps.file_change_events);
         assert!(caps.resume);
+    }
+
+    #[test]
+    fn provider_runner_factory_returns_codex_runner() {
+        let runner = resolve_provider_runner(ProviderKind::Codex).expect("codex runner");
+        let caps = runner.capabilities();
+        assert!(caps.live_events);
+        assert!(caps.resume);
+    }
+
+    #[test]
+    fn provider_runner_factory_rejects_unimplemented_claude_runner() {
+        let err = match resolve_provider_runner(ProviderKind::Claude) {
+            Ok(_) => panic!("claude not ready"),
+            Err(err) => err,
+        };
+        assert!(format!("{:#}", err).contains("not supported yet"));
     }
 
     #[test]

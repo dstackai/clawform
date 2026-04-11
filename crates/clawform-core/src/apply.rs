@@ -237,7 +237,10 @@ struct SessionOutcome {
     cached_input_tokens: Option<u64>,
 }
 
-pub fn run_apply<R: ProviderRunner>(request: &ApplyRequest, runner: &R) -> Result<ApplyResult> {
+pub fn run_apply<R: ProviderRunner + ?Sized>(
+    request: &ApplyRequest,
+    runner: &R,
+) -> Result<ApplyResult> {
     let context = build_context(request)?;
     let history_context = if request.use_history_context {
         load_program_history_context(&request.workspace_root, &context.program_key)?
@@ -293,7 +296,7 @@ fn build_context(request: &ApplyRequest) -> Result<ApplyContext> {
     })
 }
 
-fn execute_apply<R: ProviderRunner>(
+fn execute_apply<R: ProviderRunner + ?Sized>(
     request: &ApplyRequest,
     context: ApplyContext,
     history_context: ProgramHistoryContext,
