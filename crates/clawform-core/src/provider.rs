@@ -13,10 +13,11 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::config::ProviderKind;
 use crate::path_utils::to_slash_path;
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone)]
 pub struct ProviderRequest {
@@ -29,6 +30,7 @@ pub struct ProviderRequest {
     pub prompt: String,
     pub progress: bool,
     pub render_progress: bool,
+    pub debug_mode: bool,
     pub verbose_output: bool,
     pub verbose_events: bool,
     pub interactive_ui: bool,
@@ -56,8 +58,8 @@ impl SandboxMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::Sandboxed => "workspace-write",
-            Self::Unsandboxed => "danger-full-access",
+            Self::Sandboxed => "workspace",
+            Self::Unsandboxed => "full-access",
         }
     }
 }
@@ -98,6 +100,18 @@ impl ProviderCapabilities {
             partial_text: false,
             tool_call_events: true,
             file_change_events: true,
+            resume: true,
+            cancel: false,
+            approvals: false,
+        }
+    }
+
+    pub fn claude_v0() -> Self {
+        Self {
+            live_events: true,
+            partial_text: false,
+            tool_call_events: true,
+            file_change_events: false,
             resume: true,
             cancel: false,
             approvals: false,
@@ -169,6 +183,17 @@ pub trait ProviderRunner {
 
 #[derive(Debug, Default, Clone)]
 pub struct CodexRunner;
+#[derive(Debug, Default, Clone)]
+pub struct ClaudeRunner;
+static CODEX_RUNNER: CodexRunner = CodexRunner;
+static CLAUDE_RUNNER: ClaudeRunner = ClaudeRunner;
+
+pub fn resolve_provider_runner(provider_type: ProviderKind) -> Result<&'static dyn ProviderRunner> {
+    match provider_type {
+        ProviderKind::Codex => Ok(&CODEX_RUNNER),
+        ProviderKind::Claude => Ok(&CLAUDE_RUNNER),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexExecutionMode {
@@ -179,8 +204,23 @@ enum CodexExecutionMode {
 impl CodexExecutionMode {
     fn label(self) -> &'static str {
         match self {
-            Self::Sandboxed => "workspace-write",
-            Self::Unsandboxed => "danger-full-access",
+            Self::Sandboxed => "workspace",
+            Self::Unsandboxed => "full-access",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeExecutionMode {
+    Sandboxed,
+    Unsandboxed,
+}
+
+impl ClaudeExecutionMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sandboxed => "workspace",
+            Self::Unsandboxed => "full-access",
         }
     }
 }
@@ -215,6 +255,50 @@ struct AgentResultProtocolFile {
     status: AgentResultStatus,
     #[serde(default)]
     reason: Option<AgentResultReason>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ClaudeJsonResult {
+    #[serde(default)]
+    is_error: bool,
+    #[serde(default)]
+    result: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    num_turns: u64,
+    #[serde(default)]
+    usage: ClaudeUsage,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ClaudeUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+}
+
+impl ClaudeUsage {
+    fn into_provider_usage(self) -> ProviderUsage {
+        ProviderUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cached_input_tokens: self.cache_read_input_tokens,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ClaudePendingTool {
+    item_type: String,
+    item_id: String,
+    summary: Option<String>,
+    command: Option<String>,
+    paths: Vec<String>,
+    emits_command_output: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -394,6 +478,933 @@ impl ProviderRunner for CodexRunner {
     }
 }
 
+impl ProviderRunner for ClaudeRunner {
+    fn run(&self, request: &ProviderRequest) -> Result<ProviderRunResult> {
+        match request.sandbox_mode {
+            SandboxMode::Sandboxed => {
+                return run_claude_once(request, ClaudeExecutionMode::Sandboxed);
+            }
+            SandboxMode::Unsandboxed => {
+                return run_claude_once(request, ClaudeExecutionMode::Unsandboxed);
+            }
+            SandboxMode::Auto => {}
+        }
+
+        let sandbox_started_at = SystemTime::now();
+        let sandboxed = run_claude_once(request, ClaudeExecutionMode::Sandboxed)?;
+        if sandboxed.exit_code == Some(0) {
+            if should_retry_unsandboxed_after_success(request, sandbox_started_at) {
+                print_auto_sandbox_retry_decision(request, sandbox_started_at, &sandboxed);
+                return run_claude_once(request, ClaudeExecutionMode::Unsandboxed);
+            }
+            return Ok(sandboxed);
+        }
+
+        if should_retry_unsandboxed_after_failure_with_agent_result(request, sandbox_started_at) {
+            print_auto_sandbox_retry_decision(request, sandbox_started_at, &sandboxed);
+            return run_claude_once(request, ClaudeExecutionMode::Unsandboxed);
+        }
+
+        Ok(sandboxed)
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::claude_v0()
+    }
+}
+
+fn run_claude_once(
+    request: &ProviderRequest,
+    mode: ClaudeExecutionMode,
+) -> Result<ProviderRunResult> {
+    ensure_interrupt_handler()?;
+    clear_interrupt_request();
+    clear_agent_result_protocol_file(&request.workspace_root, request.agent_result_rel.as_str())?;
+
+    let mut cmd = Command::new("claude");
+    cmd.arg("-p")
+        .arg("--input-format")
+        .arg("text")
+        .arg("--permission-mode")
+        .arg("bypassPermissions")
+        .current_dir(&request.workspace_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if request.progress {
+        cmd.arg("--output-format")
+            .arg("stream-json")
+            .arg("--verbose");
+    } else {
+        cmd.arg("--output-format").arg("json");
+    }
+
+    if let Some(model) = &request.model {
+        cmd.arg("--model").arg(model);
+    }
+
+    if let Some(settings) = claude_settings_json(mode) {
+        cmd.arg("--settings").arg(settings);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .context("failed launching provider command 'claude'")?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("failed to open stdin for provider process")?;
+        stdin
+            .write_all(request.prompt.as_bytes())
+            .context("failed writing prompt to provider stdin")?;
+    }
+
+    if request.progress {
+        return collect_claude_with_progress(
+            child,
+            request.render_progress,
+            request.verbose_output || request.debug_mode,
+            request.verbose_output,
+            request.verbose_events,
+            request.interactive_ui,
+            request.show_intermediate_steps,
+            mode,
+            &request.workspace_root,
+            request.artifacts_root.as_deref(),
+            request.program_id.as_deref(),
+        );
+    }
+
+    let output = wait_with_output_interruptible(child)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    parse_claude_json_result(stdout, stderr, output.status.code())
+}
+
+fn claude_settings_json(mode: ClaudeExecutionMode) -> Option<String> {
+    match mode {
+        ClaudeExecutionMode::Sandboxed => Some(
+            json!({
+                "sandbox": {
+                    "enabled": true,
+                    "autoAllowBashIfSandboxed": true,
+                    "allowUnsandboxedCommands": false,
+                    "failIfUnavailable": true
+                }
+            })
+            .to_string(),
+        ),
+        ClaudeExecutionMode::Unsandboxed => None,
+    }
+}
+
+fn parse_claude_json_result(
+    stdout: String,
+    mut stderr: String,
+    process_exit_code: Option<i32>,
+) -> Result<ProviderRunResult> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("claude returned empty stdout in json mode"));
+    }
+
+    let parsed: ClaudeJsonResult =
+        serde_json::from_str(trimmed).context("failed parsing Claude JSON result")?;
+    let mut exit_code = process_exit_code;
+
+    if parsed.is_error {
+        if stderr.trim().is_empty() && !parsed.result.trim().is_empty() {
+            stderr = parsed.result.clone();
+        } else if !parsed.result.trim().is_empty() && !stderr.contains(parsed.result.as_str()) {
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(parsed.result.as_str());
+        }
+        if exit_code == Some(0) {
+            exit_code = Some(1);
+        }
+    }
+
+    let session_id = parsed
+        .session_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .map(sanitize_session_id)
+        .unwrap_or_else(|| format!("local-{}", now_unix_millis()));
+
+    Ok(ProviderRunResult {
+        session_id: Some(session_id),
+        exit_code,
+        stdout,
+        stderr,
+        usage: parsed.usage.into_provider_usage(),
+        turn_count: parsed.num_turns,
+    })
+}
+
+fn collect_claude_with_progress(
+    mut child: std::process::Child,
+    render_progress: bool,
+    show_housekeeping: bool,
+    verbose_output: bool,
+    verbose_events: bool,
+    interactive_ui: bool,
+    show_intermediate_steps: bool,
+    execution_mode: ClaudeExecutionMode,
+    workspace_root: &Path,
+    artifacts_root: Option<&Path>,
+    program_id: Option<&str>,
+) -> Result<ProviderRunResult> {
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture provider stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture provider stderr")?;
+
+    let (tx, rx) = mpsc::channel::<StreamEvent>();
+    let stdout_handle = spawn_stream_reader(stdout, StreamKind::Stdout, tx.clone());
+    let stderr_handle = spawn_stream_reader(stderr, StreamKind::Stderr, tx);
+
+    let mut raw_stdout = String::new();
+    let mut raw_stderr = String::new();
+    let mut emitted_progress_events = 0usize;
+    let mut last_activity = String::new();
+    let mut active_progress_items: Vec<(String, String)> = Vec::new();
+    let mut last_agent_text_line: Option<String> = None;
+    let mut item_started_at: HashMap<String, Instant> = HashMap::new();
+    let mut usage_totals = ProviderUsage::default();
+    let mut printer = ProgressPrinter::new(render_progress && interactive_ui);
+    let mut last_heartbeat_at = Instant::now();
+    let mut status = None;
+    let mut channel_closed = false;
+    let mut turn_index: u64 = 0;
+    let mut session_id: Option<String> = None;
+    let mut last_visible_turn_message_id: Option<String> = None;
+    let mut final_result_line: Option<String> = None;
+    let mut pending_tools: HashMap<String, ClaudePendingTool> = HashMap::new();
+    let heartbeat_interval = if printer.interactive_mode() {
+        Duration::from_millis(PROVIDER_INTERACTIVE_HEARTBEAT_MS)
+    } else {
+        Duration::from_secs(PROVIDER_HEARTBEAT_SECS)
+    };
+    let poll_interval = if printer.interactive_mode() {
+        Duration::from_millis(PROVIDER_INTERACTIVE_POLL_MS)
+    } else {
+        Duration::from_secs(1)
+    };
+    let sink = CommandOutputSink::new(artifacts_root.map(Path::to_path_buf));
+    let supports_hyperlinks = supports_terminal_hyperlinks();
+    let mut command_output_links: HashMap<String, PathBuf> = HashMap::new();
+    let mut message_output_links: HashMap<String, PathBuf> = HashMap::new();
+    let mut file_change_links: HashMap<String, PathBuf> = HashMap::new();
+
+    macro_rules! emit_event {
+        ($event:expr, $command_payload:expr, $message_payload:expr, $file_payload:expr $(,)?) => {
+            handle_progress_event(
+                &$event,
+                $command_payload,
+                $message_payload,
+                $file_payload,
+                render_progress,
+                show_housekeeping,
+                verbose_output,
+                verbose_events,
+                show_intermediate_steps,
+                execution_mode.label(),
+                turn_index,
+                program_id,
+                &mut session_id,
+                &mut emitted_progress_events,
+                &mut last_activity,
+                &mut active_progress_items,
+                &mut last_agent_text_line,
+                &mut item_started_at,
+                &mut usage_totals,
+                &mut printer,
+                &sink,
+                &mut command_output_links,
+                &mut message_output_links,
+                &mut file_change_links,
+                supports_hyperlinks,
+                artifacts_root,
+            )?
+        };
+    }
+
+    while status.is_none() || !channel_closed {
+        if interrupt_requested() {
+            let _ = child.kill();
+            let _ = child.wait();
+            join_reader(stdout_handle, "stdout")?;
+            join_reader(stderr_handle, "stderr")?;
+            printer.finish();
+            clear_interrupt_request();
+            return Err(anyhow!("apply cancelled by user (Ctrl-C)"));
+        }
+
+        match rx.recv_timeout(poll_interval) {
+            Ok(event) => {
+                let (is_stdout, target, line) = match event {
+                    StreamEvent::Stdout(line) => (true, &mut raw_stdout, line),
+                    StreamEvent::Stderr(line) => (false, &mut raw_stderr, line),
+                };
+                target.push_str(&line);
+                target.push('\n');
+
+                if is_stdout {
+                    let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    match value.get("type").and_then(Value::as_str) {
+                        Some("system")
+                            if value.get("subtype").and_then(Value::as_str) == Some("init") =>
+                        {
+                            let run_id = value
+                                .get("session_id")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned);
+                            emit_event!(ProviderEvent::RunStarted { run_id }, None, None, None);
+                        }
+                        Some("assistant") => {
+                            let message = value.get("message").unwrap_or(&Value::Null);
+                            if let Some(message_id) = claude_message_id(message) {
+                                if last_visible_turn_message_id.as_deref()
+                                    != Some(message_id.as_str())
+                                {
+                                    last_visible_turn_message_id = Some(message_id);
+                                    turn_index = turn_index.saturating_add(1);
+                                    emit_event!(
+                                        ProviderEvent::TurnCompleted {
+                                            usage: claude_message_usage(message),
+                                        },
+                                        None,
+                                        None,
+                                        None,
+                                    );
+                                }
+                            }
+
+                            if let Some(contents) = message.get("content").and_then(Value::as_array)
+                            {
+                                for (idx, content) in contents.iter().enumerate() {
+                                    match content.get("type").and_then(Value::as_str) {
+                                        Some("thinking") => {
+                                            let text = content
+                                                .get("thinking")
+                                                .and_then(Value::as_str)
+                                                .map(str::trim)
+                                                .unwrap_or_default();
+                                            if text.is_empty() {
+                                                continue;
+                                            }
+                                            let item_id = claude_stream_event_item_id(
+                                                &value, idx, "thinking",
+                                            );
+                                            let message_payload = MessageOutputPayload {
+                                                item_id: item_id.clone(),
+                                                item_type: "reasoning".to_string(),
+                                                text: text.to_string(),
+                                            };
+                                            emit_event!(
+                                                ProviderEvent::ItemCompleted {
+                                                    item_type: "reasoning".to_string(),
+                                                    item_id: Some(item_id),
+                                                    summary: Some(truncate_one_line(text, 180)),
+                                                },
+                                                None,
+                                                Some(&message_payload),
+                                                None,
+                                            );
+                                        }
+                                        Some("text") => {
+                                            let text = content
+                                                .get("text")
+                                                .and_then(Value::as_str)
+                                                .map(str::trim)
+                                                .unwrap_or_default();
+                                            if text.is_empty() {
+                                                continue;
+                                            }
+                                            let item_id =
+                                                claude_stream_event_item_id(&value, idx, "text");
+                                            let message_payload = MessageOutputPayload {
+                                                item_id: item_id.clone(),
+                                                item_type: "assistant_message".to_string(),
+                                                text: text.to_string(),
+                                            };
+                                            emit_event!(
+                                                ProviderEvent::ItemCompleted {
+                                                    item_type: "assistant_message".to_string(),
+                                                    item_id: Some(item_id),
+                                                    summary: Some(truncate_one_line(text, 180)),
+                                                },
+                                                None,
+                                                Some(&message_payload),
+                                                None,
+                                            );
+                                        }
+                                        Some("tool_use") => {
+                                            let Some(tool) =
+                                                claude_pending_tool(content, workspace_root)
+                                            else {
+                                                continue;
+                                            };
+                                            emit_event!(
+                                                ProviderEvent::ItemStarted {
+                                                    item_type: tool.item_type.clone(),
+                                                    item_id: Some(tool.item_id.clone()),
+                                                    summary: tool.summary.clone(),
+                                                },
+                                                None,
+                                                None,
+                                                None,
+                                            );
+                                            pending_tools.insert(tool.item_id.clone(), tool);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        Some("user") => {
+                            let Some(content_items) = value
+                                .get("message")
+                                .and_then(|m| m.get("content"))
+                                .and_then(Value::as_array)
+                            else {
+                                continue;
+                            };
+                            for content in content_items {
+                                if content.get("type").and_then(Value::as_str)
+                                    != Some("tool_result")
+                                {
+                                    continue;
+                                }
+                                let Some(tool_use_id) =
+                                    content.get("tool_use_id").and_then(Value::as_str)
+                                else {
+                                    continue;
+                                };
+                                let Some(tool) = pending_tools.remove(tool_use_id) else {
+                                    continue;
+                                };
+
+                                let command_payload = if tool.emits_command_output {
+                                    claude_command_output_payload(
+                                        &tool,
+                                        content,
+                                        value.get("tool_use_result"),
+                                    )
+                                } else {
+                                    None
+                                };
+                                let file_payload = if tool.paths.is_empty() {
+                                    None
+                                } else {
+                                    Some(FileChangePayload {
+                                        item_id: tool.item_id.clone(),
+                                        paths: tool.paths.clone(),
+                                    })
+                                };
+
+                                emit_event!(
+                                    ProviderEvent::ItemCompleted {
+                                        item_type: tool.item_type,
+                                        item_id: Some(tool.item_id),
+                                        summary: tool.summary,
+                                    },
+                                    command_payload.as_ref(),
+                                    None,
+                                    file_payload.as_ref(),
+                                );
+                            }
+                        }
+                        Some("result") => {
+                            final_result_line = Some(line);
+                        }
+                        _ => {}
+                    }
+                } else if emitted_progress_events == 0 {
+                    if let Some(hint) = extract_startup_stderr_hint(&line) {
+                        if render_progress {
+                            printer.print_event(&format!("startup_hint | {}", hint));
+                        }
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                channel_closed = true;
+            }
+        }
+
+        if status.is_none() {
+            if let Some(done) = child
+                .try_wait()
+                .context("failed while polling provider process")?
+            {
+                status = Some(done);
+            } else if render_progress
+                && show_intermediate_steps
+                && Instant::now().duration_since(last_heartbeat_at) >= heartbeat_interval
+            {
+                printer.print_status(&format_status_line(&last_activity));
+                last_heartbeat_at = Instant::now();
+            }
+        }
+    }
+
+    join_reader(stdout_handle, "stdout")?;
+    join_reader(stderr_handle, "stderr")?;
+
+    if render_progress && show_intermediate_steps && emitted_progress_events == 0 {
+        printer.print_event("no_live_events");
+    }
+    printer.finish();
+
+    let Some(final_result_line) = final_result_line else {
+        return Err(anyhow!(
+            "claude stream-json run did not emit a final result event"
+        ));
+    };
+
+    let mut parsed = parse_claude_json_result(
+        final_result_line,
+        raw_stderr.clone(),
+        status.and_then(|s| s.code()),
+    )?;
+    if parsed
+        .session_id
+        .as_deref()
+        .map(|id| id.starts_with("local-"))
+        .unwrap_or(false)
+    {
+        if let Some(seen) = session_id {
+            parsed.session_id = Some(sanitize_session_id(&seen));
+        }
+    }
+    parsed.stdout = raw_stdout;
+    parsed.stderr = if parsed.stderr.is_empty() {
+        raw_stderr
+    } else {
+        parsed.stderr
+    };
+    if parsed.turn_count == 0 {
+        parsed.turn_count = turn_index;
+    }
+    if parsed.usage.input_tokens.is_none()
+        && parsed.usage.output_tokens.is_none()
+        && parsed.usage.cached_input_tokens.is_none()
+    {
+        parsed.usage = usage_totals;
+    }
+
+    Ok(parsed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_progress_event(
+    normalized: &ProviderEvent,
+    command_payload: Option<&CommandOutputPayload>,
+    message_payload: Option<&MessageOutputPayload>,
+    file_payload: Option<&FileChangePayload>,
+    render_progress: bool,
+    show_housekeeping: bool,
+    verbose_output: bool,
+    verbose_events: bool,
+    show_intermediate_steps: bool,
+    execution_mode_label: &str,
+    turn_index: u64,
+    program_id: Option<&str>,
+    session_id: &mut Option<String>,
+    emitted_progress_events: &mut usize,
+    last_activity: &mut String,
+    active_progress_items: &mut Vec<(String, String)>,
+    last_agent_text_line: &mut Option<String>,
+    item_started_at: &mut HashMap<String, Instant>,
+    usage_totals: &mut ProviderUsage,
+    printer: &mut ProgressPrinter,
+    sink: &CommandOutputSink,
+    command_output_links: &mut HashMap<String, PathBuf>,
+    message_output_links: &mut HashMap<String, PathBuf>,
+    file_change_links: &mut HashMap<String, PathBuf>,
+    supports_hyperlinks: bool,
+    artifacts_root: Option<&Path>,
+) -> Result<()> {
+    match normalized {
+        ProviderEvent::RunStarted { run_id } => {
+            if let Some(id) = run_id.as_ref() {
+                *session_id = Some(id.clone());
+            }
+        }
+        ProviderEvent::TurnStarted => {}
+        ProviderEvent::ItemStarted {
+            item_id,
+            item_type,
+            summary,
+        } => {
+            if let Some(id) = item_id.clone() {
+                item_started_at.insert(id, Instant::now());
+            }
+            if should_count_item_progress(
+                item_type,
+                summary.as_deref(),
+                show_housekeeping,
+                show_intermediate_steps,
+            ) {
+                let label = status_activity_label(item_type, summary.as_deref());
+                if let Some(id) = item_id.as_ref() {
+                    active_progress_items.retain(|(active_id, _)| active_id != id);
+                    active_progress_items.push((id.clone(), label.clone()));
+                }
+                *last_activity = label;
+            }
+        }
+        ProviderEvent::ItemCompleted {
+            item_id,
+            item_type,
+            summary,
+        } => {
+            if should_count_item_progress(
+                item_type,
+                summary.as_deref(),
+                show_housekeeping,
+                show_intermediate_steps,
+            ) {
+                if let Some(id) = item_id.as_ref() {
+                    active_progress_items.retain(|(active_id, _)| active_id != id);
+                }
+                *last_activity = active_progress_items
+                    .last()
+                    .map(|(_, label)| label.clone())
+                    .unwrap_or_default();
+            }
+        }
+        ProviderEvent::TurnCompleted { usage } => {
+            merge_usage(usage_totals, usage);
+        }
+        _ => {}
+    }
+
+    if !matches!(normalized, ProviderEvent::RawText { .. }) {
+        *emitted_progress_events += 1;
+    }
+
+    if let Some(payload) = command_payload {
+        if let Ok(Some(path)) = sink.persist(program_id, session_id.as_deref(), payload) {
+            command_output_links.insert(payload.item_id.clone(), path);
+        }
+    }
+    if let Some(payload) = message_payload {
+        if let Ok(Some(path)) = sink.persist_message(program_id, session_id.as_deref(), payload) {
+            message_output_links.insert(payload.item_id.clone(), path);
+        }
+    }
+    if let Some(payload) = file_payload {
+        if let Some(first_path) = payload.paths.first() {
+            let path = make_clickable_path(first_path, artifacts_root);
+            file_change_links.insert(payload.item_id.clone(), path);
+        }
+    }
+
+    let completion_duration = item_completion_duration_label(normalized, item_started_at);
+    let mut progress_line = format_terminal_event(
+        normalized,
+        verbose_events,
+        show_housekeeping,
+        show_intermediate_steps,
+    );
+    if show_intermediate_steps && progress_line.is_none() {
+        if let ProviderEvent::TurnCompleted { usage } = normalized {
+            progress_line = format_turn_usage_line(turn_index, usage);
+        }
+    }
+
+    if let Some(progress_line) = progress_line {
+        let progress_line = if matches!(normalized, ProviderEvent::RunStarted { .. }) {
+            format!("{} | {}", progress_line, execution_mode_label)
+        } else {
+            progress_line
+        };
+        let progress_line = add_completion_duration_suffix(&progress_line, completion_duration);
+        let progress_line = if verbose_output {
+            expand_verbose_progress_line(
+                normalized,
+                &progress_line,
+                command_payload,
+                message_payload,
+            )
+        } else {
+            let progress_line = add_command_output_link_suffix(
+                normalized,
+                &progress_line,
+                command_output_links,
+                supports_hyperlinks,
+            );
+            add_message_output_link_suffix(
+                normalized,
+                &progress_line,
+                message_output_links,
+                supports_hyperlinks,
+            )
+        };
+        let progress_line = add_file_change_link_suffix(
+            normalized,
+            &progress_line,
+            file_change_links,
+            supports_hyperlinks,
+        );
+        if is_text_event_line(&progress_line)
+            && last_agent_text_line.as_deref() == Some(progress_line.as_str())
+        {
+            return Ok(());
+        }
+        if is_text_event_line(&progress_line) {
+            *last_agent_text_line = Some(progress_line.clone());
+        }
+        if render_progress {
+            printer.print_event(&progress_line);
+        }
+    }
+
+    Ok(())
+}
+
+fn claude_message_id(message: &Value) -> Option<String> {
+    message
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn claude_message_usage(message: &Value) -> ProviderUsage {
+    let usage = message.get("usage").unwrap_or(&Value::Null);
+    ProviderUsage {
+        input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
+        output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
+        cached_input_tokens: usage.get("cache_read_input_tokens").and_then(Value::as_u64),
+    }
+}
+
+fn claude_stream_event_item_id(value: &Value, idx: usize, fallback: &str) -> String {
+    let base = value
+        .get("uuid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(sanitize_item_id)
+        .unwrap_or_else(|| format!("{}-{}", fallback, now_unix_millis()));
+    format!("{}-{}", base, idx)
+}
+
+fn claude_pending_tool(content: &Value, workspace_root: &Path) -> Option<ClaudePendingTool> {
+    let name = content.get("name").and_then(Value::as_str)?.trim();
+    let item_id = content.get("id").and_then(Value::as_str)?.trim();
+    if item_id.is_empty() {
+        return None;
+    }
+    let input = content.get("input").unwrap_or(&Value::Null);
+
+    let (item_type, summary, command, paths, emits_command_output) = match name {
+        "Bash" => {
+            let command = input
+                .get("command")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let summary = command
+                .as_deref()
+                .map(simplify_command_summary)
+                .or_else(|| {
+                    input
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(|desc| truncate_one_line(desc, 180))
+                });
+            (
+                "command_execution".to_string(),
+                summary,
+                command,
+                Vec::new(),
+                true,
+            )
+        }
+        "Read" => {
+            let path = input.get("file_path").and_then(Value::as_str)?;
+            (
+                "command_execution".to_string(),
+                Some(format!(
+                    "read {}",
+                    display_path_in_workspace(path, workspace_root)
+                )),
+                None,
+                Vec::new(),
+                false,
+            )
+        }
+        "Write" => {
+            let path = input.get("file_path").and_then(Value::as_str)?;
+            let path = path.trim().to_string();
+            (
+                "file_change".to_string(),
+                Some(format!(
+                    "write {}",
+                    display_path_in_workspace(path.as_str(), workspace_root)
+                )),
+                None,
+                vec![path],
+                false,
+            )
+        }
+        "Edit" | "NotebookEdit" => {
+            let path = input
+                .get("file_path")
+                .and_then(Value::as_str)
+                .or_else(|| input.get("notebook_path").and_then(Value::as_str))?;
+            let path = path.trim().to_string();
+            (
+                "file_change".to_string(),
+                Some(format!(
+                    "edit {}",
+                    display_path_in_workspace(path.as_str(), workspace_root)
+                )),
+                None,
+                vec![path],
+                false,
+            )
+        }
+        "Glob" => (
+            "command_execution".to_string(),
+            input
+                .get("pattern")
+                .and_then(Value::as_str)
+                .map(|pattern| format!("glob {}", truncate_one_line(pattern, 180))),
+            None,
+            Vec::new(),
+            false,
+        ),
+        "Grep" => (
+            "command_execution".to_string(),
+            input
+                .get("pattern")
+                .and_then(Value::as_str)
+                .map(|pattern| format!("grep {}", truncate_one_line(pattern, 180))),
+            None,
+            Vec::new(),
+            false,
+        ),
+        "ToolSearch" | "WebSearch" | "WebFetch" => (
+            "web_search".to_string(),
+            input
+                .get("query")
+                .and_then(Value::as_str)
+                .or_else(|| input.get("url").and_then(Value::as_str))
+                .map(|value| truncate_one_line(value, 180)),
+            None,
+            Vec::new(),
+            false,
+        ),
+        _ => (
+            "mcp_tool_call".to_string(),
+            Some(format!("tool={}", name)),
+            None,
+            Vec::new(),
+            false,
+        ),
+    };
+
+    Some(ClaudePendingTool {
+        item_type,
+        item_id: item_id.to_string(),
+        summary,
+        command,
+        paths,
+        emits_command_output,
+    })
+}
+
+fn claude_command_output_payload(
+    tool: &ClaudePendingTool,
+    content: &Value,
+    tool_use_result: Option<&Value>,
+) -> Option<CommandOutputPayload> {
+    let output = claude_tool_result_text(content, tool_use_result)?;
+    Some(CommandOutputPayload {
+        item_id: tool.item_id.clone(),
+        command: tool.command.clone(),
+        output,
+    })
+}
+
+fn claude_tool_result_text(content: &Value, tool_use_result: Option<&Value>) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(obj) = tool_use_result.and_then(Value::as_object) {
+        if let Some(stdout) = obj
+            .get("stdout")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            parts.push(stdout.to_string());
+        }
+        if let Some(stderr) = obj
+            .get("stderr")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            parts.push(stderr.to_string());
+        }
+    }
+
+    if let Some(text) = content
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !is_low_signal_claude_tool_result_text(text)
+            && parts.iter().all(|part| part.trim() != text)
+        {
+            parts.push(text.to_string());
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    let output = parts.join("\n");
+    if output.trim().is_empty() {
+        None
+    } else {
+        Some(output)
+    }
+}
+
+fn is_low_signal_claude_tool_result_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.is_empty() || (trimmed.starts_with("[rerun:") && trimmed.ends_with(']'))
+}
+
+fn display_path_in_workspace(raw_path: &str, workspace_root: &Path) -> String {
+    let path = Path::new(raw_path.trim());
+    if let Ok(relative) = path.strip_prefix(workspace_root) {
+        return to_slash_path(relative);
+    }
+    to_slash_path(path)
+}
+
 fn print_auto_sandbox_turn_usage_line(run: &ProviderRunResult) {
     let Some(line) = format_turn_usage_line(run.turn_count, &run.usage) else {
         return;
@@ -448,8 +1459,16 @@ fn format_auto_sandbox_retry_decision_line(
         } else {
             " | "
         };
-        let turn_line = format_turn_usage_line(run.turn_count, &run.usage)
-            .unwrap_or_else(|| format!("turn {}", if run.turn_count == 0 { 1 } else { run.turn_count }));
+        let turn_line = format_turn_usage_line(run.turn_count, &run.usage).unwrap_or_else(|| {
+            format!(
+                "turn {}",
+                if run.turn_count == 0 {
+                    1
+                } else {
+                    run.turn_count
+                }
+            )
+        });
         let turn_segment = if use_color {
             format!("\x1b[2m{}\x1b[0m", turn_line)
         } else {
@@ -677,6 +1696,7 @@ fn run_codex_once(
         return collect_with_progress(
             child,
             request.render_progress,
+            request.verbose_output || request.debug_mode,
             request.verbose_output,
             request.verbose_events,
             request.interactive_ui,
@@ -884,6 +1904,7 @@ fn maybe_build_early_auto_retry_monitor(
 fn collect_with_progress(
     mut child: std::process::Child,
     render_progress: bool,
+    show_housekeeping: bool,
     verbose_output: bool,
     verbose_events: bool,
     interactive_ui: bool,
@@ -993,6 +2014,7 @@ fn collect_with_progress(
                                 if should_count_item_progress(
                                     item_type,
                                     summary.as_deref(),
+                                    show_housekeeping,
                                     show_intermediate_steps,
                                 ) {
                                     let label =
@@ -1014,6 +2036,7 @@ fn collect_with_progress(
                                 if should_count_item_progress(
                                     item_type,
                                     summary.as_deref(),
+                                    show_housekeeping,
                                     show_intermediate_steps,
                                 ) {
                                     if let Some(id) = item_id.as_ref() {
@@ -1059,6 +2082,7 @@ fn collect_with_progress(
                         let mut progress_line = format_terminal_event(
                             &normalized,
                             verbose_events,
+                            show_housekeeping,
                             show_intermediate_steps,
                         );
                         if show_intermediate_steps
@@ -1070,11 +2094,12 @@ fn collect_with_progress(
                             }
                         }
                         if let Some(progress_line) = progress_line {
-                            let progress_line = if matches!(normalized, ProviderEvent::RunStarted { .. }) {
-                                format!("{} | {}", progress_line, execution_mode.label())
-                            } else {
-                                progress_line
-                            };
+                            let progress_line =
+                                if matches!(normalized, ProviderEvent::RunStarted { .. }) {
+                                    format!("{} | {}", progress_line, execution_mode.label())
+                                } else {
+                                    progress_line
+                                };
                             let progress_line =
                                 add_completion_duration_suffix(&progress_line, completion_duration);
                             let progress_line = if verbose_output {
@@ -1949,6 +2974,7 @@ fn truncate_one_line(s: &str, max: usize) -> String {
 fn format_terminal_event(
     event: &ProviderEvent,
     verbose_events: bool,
+    show_housekeeping: bool,
     show_intermediate_steps: bool,
 ) -> Option<String> {
     match event {
@@ -1984,6 +3010,7 @@ fn format_terminal_event(
                 item_type,
                 item_id.as_deref(),
                 summary.as_deref(),
+                show_housekeeping,
                 show_intermediate_steps,
             )
         }
@@ -2013,6 +3040,7 @@ fn format_item_event(
     item_type: &str,
     item_id: Option<&str>,
     summary: Option<&str>,
+    show_housekeeping: bool,
     show_intermediate_steps: bool,
 ) -> Option<String> {
     if !show_intermediate_steps {
@@ -2047,7 +3075,10 @@ fn format_item_event(
     let _ = phase;
     let _ = item_id;
     let summary = summary?.trim();
-    if kind == "cmd" && is_clawform_housekeeping_command(summary) {
+    if !show_housekeeping
+        && (kind == "cmd" || kind == "file")
+        && is_clawform_housekeeping_summary(summary)
+    {
         return None;
     }
     if kind == "cmd" {
@@ -2084,17 +3115,29 @@ fn is_low_signal_command(summary: &str) -> bool {
         || s.starts_with("git status")
 }
 
-fn is_clawform_housekeeping_command(summary: &str) -> bool {
+fn is_clawform_housekeeping_summary(summary: &str) -> bool {
     let s = summary.trim().to_ascii_lowercase();
     s.starts_with("write .clawform/agent_output.md")
         || s.starts_with("write .clawform/agent_outputs.json")
         || s.starts_with("write .clawform/agent_result.json")
+        || s.starts_with("read .clawform/agent_output.md")
+        || s.starts_with("read .clawform/agent_outputs.json")
+        || s.starts_with("read .clawform/agent_result.json")
+        || s.starts_with("read .clawform/agent_variables.json")
         || s.starts_with("cat .clawform/agent_output.md")
         || s.starts_with("cat .clawform/agent_outputs.json")
         || s.starts_with("cat .clawform/agent_result.json")
         || {
-            let is_read_write = s.starts_with("write ") || s.starts_with("cat ");
-            is_read_write
+            let is_protocol_mkdir = s.starts_with("mkdir -p ")
+                && (s.ends_with(" .clawform")
+                    || s.ends_with("/.clawform")
+                    || s.contains(" /.clawform "));
+            is_protocol_mkdir
+        }
+        || {
+            let is_protocol_io =
+                s.starts_with("write ") || s.starts_with("read ") || s.starts_with("cat ");
+            is_protocol_io
                 && s.contains(".clawform/programs/")
                 && (s.contains("/reports/agent_output")
                     || s.contains("/reports/agent_outputs")
@@ -2185,15 +3228,16 @@ fn status_activity_label(item_type: &str, summary: Option<&str>) -> String {
 fn should_count_item_progress(
     item_type: &str,
     summary: Option<&str>,
+    show_housekeeping: bool,
     show_intermediate_steps: bool,
 ) -> bool {
-    if item_type != "command_execution" {
-        return true;
-    }
     if let Some(s) = summary {
-        if is_clawform_housekeeping_command(s) {
+        if !show_housekeeping && is_clawform_housekeeping_summary(s) {
             return false;
         }
+    }
+    if item_type != "command_execution" {
+        return true;
     }
     if show_intermediate_steps {
         return true;
@@ -2397,14 +3441,14 @@ fn colorize_session_payload(payload: &str) -> String {
 fn colorize_session_segment(segment: &str) -> String {
     let trimmed = segment.trim();
     match trimmed {
-        "workspace-write" => return "\x1b[34mworkspace-write\x1b[0m".to_string(),
-        "danger-full-access" => return "\x1b[33mdanger-full-access\x1b[0m".to_string(),
+        "workspace" | "workspace-write" => return "\x1b[34mworkspace\x1b[0m".to_string(),
+        "full-access" | "danger-full-access" => return "\x1b[33mfull-access\x1b[0m".to_string(),
         _ => {}
     }
     if let Some((key, value)) = trimmed.split_once('=') {
         let code = match (key, value) {
-            ("sandbox", "workspace-write") => Some("34"),
-            ("sandbox", "danger-full-access") => Some("33"),
+            ("sandbox", "workspace") | ("sandbox", "workspace-write") => Some("34"),
+            ("sandbox", "full-access") | ("sandbox", "danger-full-access") => Some("33"),
             _ => None,
         };
         if let Some(code) = code {
@@ -2745,6 +3789,7 @@ mod tests {
                 run_id: Some("thread_123".to_string()),
             },
             true,
+            false,
             true,
         )
         .expect("expected session line");
@@ -2811,27 +3856,150 @@ mod tests {
     }
 
     #[test]
+    fn claude_capabilities_exposed() {
+        let caps = ClaudeRunner.capabilities();
+        assert!(caps.live_events);
+        assert!(caps.tool_call_events);
+        assert!(!caps.file_change_events);
+        assert!(caps.resume);
+    }
+
+    #[test]
+    fn provider_runner_factory_returns_codex_runner() {
+        let runner = resolve_provider_runner(ProviderKind::Codex).expect("codex runner");
+        let caps = runner.capabilities();
+        assert!(caps.live_events);
+        assert!(caps.resume);
+    }
+
+    #[test]
+    fn provider_runner_factory_returns_claude_runner() {
+        let runner = resolve_provider_runner(ProviderKind::Claude).expect("claude runner");
+        let caps = runner.capabilities();
+        assert!(caps.live_events);
+        assert!(caps.resume);
+    }
+
+    #[test]
+    fn claude_pending_tool_summarizes_bash_write_target() {
+        let content: Value = serde_json::from_str(
+            r#"{"id":"toolu_1","name":"Bash","input":{"command":"echo SMOKE_OK > example-data/output-smoke.txt"}}"#,
+        )
+        .expect("json");
+
+        let tool = claude_pending_tool(&content, Path::new("/tmp/work")).expect("tool");
+        assert_eq!(tool.item_type, "command_execution");
+        assert_eq!(
+            tool.summary.as_deref(),
+            Some("write example-data/output-smoke.txt")
+        );
+        assert!(tool.emits_command_output);
+    }
+
+    #[test]
+    fn claude_pending_tool_relativizes_workspace_write_path() {
+        let content: Value = serde_json::from_str(
+            r#"{"id":"toolu_2","name":"Write","input":{"file_path":"/tmp/work/example-data/output-smoke.txt"}}"#,
+        )
+        .expect("json");
+
+        let tool = claude_pending_tool(&content, Path::new("/tmp/work")).expect("tool");
+        assert_eq!(tool.item_type, "file_change");
+        assert_eq!(
+            tool.summary.as_deref(),
+            Some("write example-data/output-smoke.txt")
+        );
+        assert_eq!(
+            tool.paths,
+            vec!["/tmp/work/example-data/output-smoke.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn claude_tool_result_text_ignores_rerun_marker_without_output() {
+        let content: Value =
+            serde_json::from_str(r#"{"type":"tool_result","content":"[rerun: b1]"}"#)
+                .expect("json");
+        let tool_use_result: Value = serde_json::from_str(
+            r#"{"stdout":"","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":true}"#,
+        )
+        .expect("json");
+
+        assert!(claude_tool_result_text(&content, Some(&tool_use_result)).is_none());
+    }
+
+    #[test]
+    fn parses_claude_json_success_result() {
+        let result = parse_claude_json_result(
+            r#"{"type":"result","is_error":false,"result":"ok","session_id":"claude-session","num_turns":6,"usage":{"input_tokens":5,"output_tokens":7,"cache_read_input_tokens":11}}"#
+                .to_string(),
+            String::new(),
+            Some(0),
+        )
+        .expect("claude json result");
+
+        assert_eq!(result.session_id.as_deref(), Some("claude-session"));
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.turn_count, 6);
+        assert_eq!(result.usage.input_tokens, Some(5));
+        assert_eq!(result.usage.output_tokens, Some(7));
+        assert_eq!(result.usage.cached_input_tokens, Some(11));
+    }
+
+    #[test]
+    fn promotes_claude_json_error_even_when_process_exit_is_zero() {
+        let result = parse_claude_json_result(
+            r#"{"type":"result","is_error":true,"result":"auth missing","session_id":"claude-session","num_turns":1,"usage":{}}"#
+                .to_string(),
+            String::new(),
+            Some(0),
+        )
+        .expect("claude json result");
+
+        assert_eq!(result.exit_code, Some(1));
+        assert_eq!(result.stderr, "auth missing");
+    }
+
+    #[test]
+    fn claude_sandbox_settings_enable_guardrails() {
+        let raw = claude_settings_json(ClaudeExecutionMode::Sandboxed).expect("settings");
+        let parsed: Value = serde_json::from_str(&raw).expect("json");
+
+        assert_eq!(parsed["sandbox"]["enabled"], Value::Bool(true));
+        assert_eq!(
+            parsed["sandbox"]["autoAllowBashIfSandboxed"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            parsed["sandbox"]["allowUnsandboxedCommands"],
+            Value::Bool(false)
+        );
+        assert_eq!(parsed["sandbox"]["failIfUnavailable"], Value::Bool(true));
+        assert!(claude_settings_json(ClaudeExecutionMode::Unsandboxed).is_none());
+    }
+
+    #[test]
     fn sandbox_mode_labels_match_cli_values() {
         assert_eq!(SandboxMode::default(), SandboxMode::Auto);
         assert_eq!(SandboxMode::Auto.label(), "auto");
-        assert_eq!(SandboxMode::Sandboxed.label(), "workspace-write");
-        assert_eq!(SandboxMode::Unsandboxed.label(), "danger-full-access");
+        assert_eq!(SandboxMode::Sandboxed.label(), "workspace");
+        assert_eq!(SandboxMode::Unsandboxed.label(), "full-access");
     }
 
     #[test]
     fn session_lines_include_execution_mode_values() {
-        let sandboxed = colorize_session_payload("019d-session | workspace-write");
-        assert!(sandboxed.contains("workspace-write"));
+        let sandboxed = colorize_session_payload("019d-session | workspace");
+        assert!(sandboxed.contains("workspace"));
 
-        let unsandboxed = colorize_session_payload("019d-session | danger-full-access");
-        assert!(unsandboxed.contains("danger-full-access"));
+        let unsandboxed = colorize_session_payload("019d-session | full-access");
+        assert!(unsandboxed.contains("full-access"));
     }
 
     #[test]
     fn session_payload_uses_readable_sandbox_value() {
-        let rendered = colorize_session_payload("019d-session | workspace-write");
+        let rendered = colorize_session_payload("019d-session | workspace");
         assert!(rendered.contains("019d-session"));
-        assert!(rendered.contains("\x1b[34mworkspace-write\x1b[0m"));
+        assert!(rendered.contains("\x1b[34mworkspace\x1b[0m"));
     }
 
     #[test]
@@ -2842,17 +4010,17 @@ mod tests {
             spinner_idx: 0,
             cursor_hidden: false,
         };
-        let rendered = printer.render_event_line("🧵 019d-session | danger-full-access");
+        let rendered = printer.render_event_line("🧵 019d-session | full-access");
         assert!(rendered.contains("🧵"));
         assert!(!rendered.contains("🧵 session "));
-        assert!(rendered.contains("\x1b[33mdanger-full-access\x1b[0m"));
+        assert!(rendered.contains("\x1b[33mfull-access\x1b[0m"));
     }
 
     #[test]
     fn non_json_line_maps_to_raw_text_without_progress_line() {
         let ev = parse_codex_stream_line("OpenAI Codex v0.118.0").expect("expected raw text");
         assert!(matches!(ev, ProviderEvent::RawText { .. }));
-        assert!(format_terminal_event(&ev, true, false).is_none());
+        assert!(format_terminal_event(&ev, true, false, false).is_none());
     }
 
     #[test]
@@ -2896,6 +4064,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            debug_mode: false,
             verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
@@ -2921,6 +4090,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            debug_mode: false,
             verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
@@ -2946,6 +4116,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            debug_mode: false,
             verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
@@ -3348,6 +4519,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            debug_mode: false,
             verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
@@ -3378,6 +4550,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            debug_mode: false,
             verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
@@ -3423,6 +4596,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            debug_mode: false,
             verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
@@ -3460,6 +4634,7 @@ mod tests {
             prompt: "x".to_string(),
             progress: true,
             render_progress: false,
+            debug_mode: false,
             verbose_output: false,
             verbose_events: false,
             interactive_ui: false,
@@ -3484,6 +4659,7 @@ mod tests {
             },
             false,
             false,
+            false,
         );
         assert!(line.is_none());
     }
@@ -3500,6 +4676,7 @@ mod tests {
             },
             true,
             false,
+            false,
         );
         assert!(line.is_none());
     }
@@ -3513,6 +4690,7 @@ mod tests {
                 summary: Some("Updated `src/main.rs` with fix".to_string()),
             },
             true,
+            false,
             true,
         )
         .expect("expected text line");
@@ -3528,6 +4706,7 @@ mod tests {
                 summary: Some("Planning approach for patch.".to_string()),
             },
             true,
+            false,
             true,
         )
         .expect("expected reasoning line");
@@ -3544,6 +4723,7 @@ mod tests {
             },
             true,
             false,
+            false,
         );
         assert!(line.is_none());
     }
@@ -3557,6 +4737,7 @@ mod tests {
                 summary: Some("ls src".to_string()),
             },
             true,
+            false,
             true,
         )
         .expect("expected command line");
@@ -3573,6 +4754,7 @@ mod tests {
             },
             true,
             false,
+            false,
         );
         assert!(line.is_none());
     }
@@ -3584,6 +4766,7 @@ mod tests {
                 run_id: Some("thread_123".to_string()),
             },
             true,
+            false,
             false,
         );
         assert!(line.is_none());
@@ -3600,9 +4783,71 @@ mod tests {
                 ),
             },
             true,
+            false,
             true,
         );
         assert!(line.is_none());
+    }
+
+    #[test]
+    fn hides_housekeeping_file_changes_even_when_intermediate_enabled() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "file_change".to_string(),
+                item_id: Some("x".to_string()),
+                summary: Some("write .clawform/agent_outputs.json".to_string()),
+            },
+            true,
+            false,
+            true,
+        );
+        assert!(line.is_none());
+    }
+
+    #[test]
+    fn hides_housekeeping_reads_even_when_intermediate_enabled() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "command_execution".to_string(),
+                item_id: Some("x".to_string()),
+                summary: Some("read .clawform/agent_variables.json".to_string()),
+            },
+            true,
+            false,
+            true,
+        );
+        assert!(line.is_none());
+    }
+
+    #[test]
+    fn hides_housekeeping_mkdir_even_when_intermediate_enabled() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "command_execution".to_string(),
+                item_id: Some("x".to_string()),
+                summary: Some("mkdir -p /Users/dstack/clawform/.clawform".to_string()),
+            },
+            true,
+            false,
+            true,
+        );
+        assert!(line.is_none());
+    }
+
+    #[test]
+    fn shows_housekeeping_commands_when_internal_visibility_enabled() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "command_execution".to_string(),
+                item_id: Some("x".to_string()),
+                summary: Some("read .clawform/agent_variables.json".to_string()),
+            },
+            true,
+            true,
+            true,
+        )
+        .expect("expected line");
+        assert!(line.contains("read .clawform/agent_variables.json"));
     }
 
     #[test]
@@ -3610,12 +4855,38 @@ mod tests {
         assert!(!should_count_item_progress(
             "command_execution",
             Some("write .clawform/programs/release-notes/reports/agent_outputs.json"),
+            false,
             true
         ));
         assert!(!should_count_item_progress(
             "command_execution",
             Some("cat .clawform/programs/release-notes/reports/agent_result.json"),
+            false,
             false
+        ));
+        assert!(!should_count_item_progress(
+            "file_change",
+            Some("write .clawform/agent_result.json"),
+            false,
+            true
+        ));
+        assert!(!should_count_item_progress(
+            "command_execution",
+            Some("read .clawform/agent_variables.json"),
+            false,
+            true
+        ));
+        assert!(!should_count_item_progress(
+            "command_execution",
+            Some("mkdir -p /Users/dstack/clawform/.clawform"),
+            false,
+            true
+        ));
+        assert!(should_count_item_progress(
+            "command_execution",
+            Some("read .clawform/agent_variables.json"),
+            true,
+            true
         ));
     }
 

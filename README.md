@@ -32,9 +32,9 @@ Before execution, Clawform previews:
 - last session changed files
 - program diff since the last comparable snapshot
 
-Then it asks for confirmation and executes the program with the configured provider.
+Then it asks for confirmation and executes the program with the configured provider, or with the explicitly selected provider when you pass `-p/--provider`.
 
-During execution, Clawform streams progress events to the terminal.
+During execution, Clawform streams progress events to the terminal. Use `--progress rich|plain|off` to control rendering. Use `--sandbox auto|workspace|full-access` to choose sandbox policy (default: `auto`), or the shorthand flags `--auto`, `--workspace`, and `--full-access`.
 
 After execution, Clawform stores:
 
@@ -66,8 +66,13 @@ CLAWFORM_VERSION=v0.0.7 curl -fsSL https://raw.githubusercontent.com/dstackai/cl
     "providers": {
       "codex": {
         "type": "codex",
-        "default": true,
+        "default": false,
         "default_model": "gpt-5-codex"
+      },
+      "claude": {
+        "type": "claude",
+        "default": true,
+        "default_model": "sonnet"
       }
     }
   }
@@ -78,6 +83,13 @@ CLAWFORM_VERSION=v0.0.7 curl -fsSL https://raw.githubusercontent.com/dstackai/cl
 
 ```bash
 cf -f examples/smoke.md
+```
+
+Run the same program with a specific provider override:
+
+```bash
+cf -f examples/smoke.md -p claude
+cf -f examples/smoke.md -p codex
 ```
 
 Override a program variable for one run:
@@ -98,7 +110,7 @@ Last session: 019d5843-eb2d-70b1-b49a-343033117944 (success, 43m ago)
   program: examples/smoke.md unchanged
   changes: 0 files
 Proceed? [y/N] y
-🧵 019d586b-aa65-78b2-8a0d-27b5543c59bb | workspace-write
+🧵 019d586b-aa65-78b2-8a0d-27b5543c59bb | workspace
 ✔ cat examples/smoke.md | 1ms | out
 💬 Verified `example-data/output-smoke.txt:1` already contains the required `SMOKE_OK` line with trailing newline. | msg
 turn 1 | tokens: in=117k out=1.6k cached=107k
@@ -124,6 +136,11 @@ For internal protocol details and strict agent result schema, see `contrib/ARCHI
 ```bash
 cf -f program.md
 cf apply -f program.md
+cf -f program.md -p claude
+cf -f program.md --auto
+cf -f program.md --progress plain
+cf -f program.md --workspace
+cf -f program.md --full-access
 ```
 
 ## Status

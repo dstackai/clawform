@@ -35,6 +35,7 @@ const SNAPSHOT_TEXT_LIMIT_BYTES: usize = 256 * 1024;
 pub struct ApplyRequest {
     pub workspace_root: PathBuf,
     pub program_path: PathBuf,
+    pub provider_name: Option<String>,
     pub program_variables: BTreeMap<String, String>,
     pub confirm: bool,
     pub debug: bool,
@@ -237,7 +238,10 @@ struct SessionOutcome {
     cached_input_tokens: Option<u64>,
 }
 
-pub fn run_apply<R: ProviderRunner>(request: &ApplyRequest, runner: &R) -> Result<ApplyResult> {
+pub fn run_apply<R: ProviderRunner + ?Sized>(
+    request: &ApplyRequest,
+    runner: &R,
+) -> Result<ApplyResult> {
     let context = build_context(request)?;
     let history_context = if request.use_history_context {
         load_program_history_context(&request.workspace_root, &context.program_key)?
@@ -276,7 +280,7 @@ fn build_context(request: &ApplyRequest) -> Result<ApplyContext> {
     let workspace_root = &request.workspace_root;
 
     let config = load_config(workspace_root)?;
-    let provider = config.resolve_default_provider()?;
+    let provider = config.resolve_provider(request.provider_name.as_deref())?;
 
     let program = load_program(&request.program_path)?;
     let program_key = program.program_key()?;
@@ -293,7 +297,7 @@ fn build_context(request: &ApplyRequest) -> Result<ApplyContext> {
     })
 }
 
-fn execute_apply<R: ProviderRunner>(
+fn execute_apply<R: ProviderRunner + ?Sized>(
     request: &ApplyRequest,
     context: ApplyContext,
     history_context: ProgramHistoryContext,
@@ -323,6 +327,7 @@ fn execute_apply<R: ProviderRunner>(
         prompt,
         progress: request.progress,
         render_progress: request.render_progress,
+        debug_mode: request.debug,
         verbose_output: request.verbose_output,
         verbose_events: true,
         interactive_ui: request.interactive_ui,
