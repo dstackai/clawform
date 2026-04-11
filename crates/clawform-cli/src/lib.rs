@@ -60,6 +60,10 @@ enum Commands {
         #[arg(short = 'f', long = "file")]
         file: PathBuf,
 
+        /// Provider name from `.clawform/config.json` to use for this run.
+        #[arg(short = 'p', long = "provider", value_name = "PROVIDER")]
+        provider: Option<String>,
+
         /// Program variable value (`NAME=VALUE`). Repeatable.
         #[arg(long = "var", value_name = "NAME=VALUE", action = ArgAction::Append)]
         vars: Vec<String>,
@@ -78,7 +82,6 @@ enum Commands {
 
         /// Progress rendering mode.
         #[arg(
-            short = 'p',
             long = "progress",
             value_enum,
             default_value_t = CliProgressMode::Rich
@@ -153,6 +156,7 @@ fn real_main() -> Result<()> {
     match cli.command {
         Commands::Apply {
             file,
+            provider,
             vars,
             yes,
             debug,
@@ -167,8 +171,8 @@ fn real_main() -> Result<()> {
             let workspace_root =
                 env::current_dir().context("failed resolving current working directory")?;
             let config = load_config(&workspace_root)?;
-            let provider = config.resolve_default_provider()?;
-            let runner = resolve_provider_runner(provider.provider_type)?;
+            let resolved_provider = config.resolve_provider(provider.as_deref())?;
+            let runner = resolve_provider_runner(resolved_provider.provider_type)?;
             let interactive_shell =
                 std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
             let progress_mode = if no_progress_legacy {
@@ -189,7 +193,10 @@ fn real_main() -> Result<()> {
 
             if debug {
                 let caps = runner.capabilities();
-                println!("Provider: {}", provider.provider_type);
+                println!(
+                    "Provider: {} ({})",
+                    resolved_provider.name, resolved_provider.provider_type
+                );
                 println!(
                     "Capabilities: live_events={} partial_text={} tool_call_events={} file_change_events={} resume={} cancel={} approvals={}",
                     caps.live_events,
@@ -215,6 +222,7 @@ fn real_main() -> Result<()> {
                 &ApplyRequest {
                     workspace_root: workspace_root.clone(),
                     program_path: file,
+                    provider_name: provider,
                     program_variables,
                     confirm,
                     debug,
@@ -1071,5 +1079,31 @@ mod tests {
     fn style_short_link_token_uses_pink() {
         assert_eq!(style_short_link_token("msg", true), "\x1b[95mmsg\x1b[0m");
         assert_eq!(style_short_link_token("file", true), "\x1b[95mfile\x1b[0m");
+    }
+
+    #[test]
+    fn apply_cli_accepts_provider_override_short_flag() {
+        let cli = Cli::try_parse_from(["cf", "apply", "-f", "demo.md", "-p", "claude_safe"])
+            .expect("must parse");
+
+        match cli.command {
+            Commands::Apply { provider, .. } => {
+                assert_eq!(provider.as_deref(), Some("claude_safe"));
+            }
+            _ => panic!("expected apply command"),
+        }
+    }
+
+    #[test]
+    fn apply_cli_still_accepts_progress_long_flag() {
+        let cli = Cli::try_parse_from(["cf", "apply", "-f", "demo.md", "--progress", "off"])
+            .expect("must parse");
+
+        match cli.command {
+            Commands::Apply { progress_mode, .. } => {
+                assert_eq!(progress_mode, CliProgressMode::Off);
+            }
+            _ => panic!("expected apply command"),
+        }
     }
 }

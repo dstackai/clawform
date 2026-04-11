@@ -35,6 +35,7 @@ const SNAPSHOT_TEXT_LIMIT_BYTES: usize = 256 * 1024;
 pub struct ApplyRequest {
     pub workspace_root: PathBuf,
     pub program_path: PathBuf,
+    pub provider_name: Option<String>,
     pub program_variables: BTreeMap<String, String>,
     pub confirm: bool,
     pub debug: bool,
@@ -279,7 +280,7 @@ fn build_context(request: &ApplyRequest) -> Result<ApplyContext> {
     let workspace_root = &request.workspace_root;
 
     let config = load_config(workspace_root)?;
-    let provider = config.resolve_default_provider()?;
+    let provider = config.resolve_provider(request.provider_name.as_deref())?;
 
     let program = load_program(&request.program_path)?;
     let program_key = program.program_key()?;

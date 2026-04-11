@@ -121,6 +121,7 @@ fn run_with_variables(
         &ApplyRequest {
             workspace_root: ws.path().to_path_buf(),
             program_path: ws.path().join("program.md"),
+            provider_name: None,
             program_variables,
             confirm: false,
             debug: false,

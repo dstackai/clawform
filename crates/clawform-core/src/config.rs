@@ -123,20 +123,6 @@ impl ToolConfig {
             bail!(".clawform/config.json must define at least one provider");
         }
 
-        let defaults: Vec<_> = self
-            .providers
-            .iter()
-            .filter(|(_, p)| p.default)
-            .map(|(name, _)| name)
-            .collect();
-
-        if defaults.len() != 1 {
-            bail!(
-                "exactly one provider must set default=true (found {})",
-                defaults.len()
-            );
-        }
-
         for (name, provider) in &self.providers {
             parse_provider_kind(name, &provider.provider_type)?;
             if let Some(model) = &provider.default_model {
@@ -150,15 +136,41 @@ impl ToolConfig {
     }
 
     pub fn resolve_default_provider(&self) -> Result<ResolvedProvider> {
-        let (name, provider) = self
-            .providers
-            .iter()
-            .find(|(_, p)| p.default)
-            .context("no default provider found after validation")?;
-        let provider_type = parse_provider_kind(name, &provider.provider_type)?;
+        self.resolve_provider(None)
+    }
+
+    pub fn resolve_provider(&self, name: Option<&str>) -> Result<ResolvedProvider> {
+        let (name, provider) = match name {
+            Some(name) => {
+                let provider = self
+                    .providers
+                    .get(name)
+                    .with_context(|| unknown_provider_error_message(name, &self.providers))?;
+                (name.to_string(), provider)
+            }
+            None => {
+                let defaults = self
+                    .providers
+                    .iter()
+                    .filter(|(_, p)| p.default)
+                    .collect::<Vec<_>>();
+                if defaults.len() != 1 {
+                    bail!(
+                        "exactly one provider must set default=true (found {})",
+                        defaults.len()
+                    );
+                }
+                let (name, provider) = defaults
+                    .into_iter()
+                    .next()
+                    .context("no default provider found after validation")?;
+                (name.clone(), provider)
+            }
+        };
+        let provider_type = parse_provider_kind(&name, &provider.provider_type)?;
 
         Ok(ResolvedProvider {
-            name: name.clone(),
+            name,
             provider_type,
             default_model: provider.default_model.clone(),
         })
@@ -174,6 +186,17 @@ fn unsupported_provider_type_error(name: &str, raw: &str) -> anyhow::Error {
         "provider '{}' has unsupported type '{}' in v0 (supported: 'codex', 'claude')",
         name,
         raw
+    )
+}
+
+fn unknown_provider_error_message(
+    requested: &str,
+    providers: &BTreeMap<String, ProviderConfig>,
+) -> String {
+    let available = providers.keys().cloned().collect::<Vec<_>>().join(", ");
+    format!(
+        "unknown provider '{}' (available providers: {})",
+        requested, available
     )
 }
 
@@ -216,7 +239,28 @@ mod tests {
         )
         .unwrap();
 
-        assert!(cfg.validate().is_err());
+        cfg.validate().unwrap();
+        let err = cfg.resolve_default_provider().expect_err("must fail");
+        assert!(format!("{:#}", err).contains("exactly one provider must set default=true"));
+    }
+
+    #[test]
+    fn fails_when_no_default_for_default_resolution() {
+        let cfg = parse_tool_config(
+            r#"{
+              "clawform": {
+                "providers": {
+                  "a": {"type":"codex", "default": false},
+                  "b": {"type":"claude", "default": false}
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        cfg.validate().unwrap();
+        let err = cfg.resolve_default_provider().expect_err("must fail");
+        assert!(format!("{:#}", err).contains("exactly one provider must set default=true"));
     }
 
     #[test]
@@ -273,6 +317,51 @@ mod tests {
         assert_eq!(provider.name, "codex");
         assert_eq!(provider.provider_type, ProviderKind::Codex);
         assert_eq!(provider.default_model.as_deref(), Some("gpt-5-codex"));
+    }
+
+    #[test]
+    fn resolves_named_provider() {
+        let cfg = parse_tool_config(
+            r#"{
+              "clawform": {
+                "providers": {
+                  "codex_fast": {"type":"codex", "default": true, "default_model":"gpt-5-codex"},
+                  "claude_safe": {"type":"claude", "default": false, "default_model":"sonnet"}
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        cfg.validate().unwrap();
+        let provider = cfg.resolve_provider(Some("claude_safe")).unwrap();
+        assert_eq!(provider.name, "claude_safe");
+        assert_eq!(provider.provider_type, ProviderKind::Claude);
+        assert_eq!(provider.default_model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn errors_on_unknown_named_provider() {
+        let cfg = parse_tool_config(
+            r#"{
+              "clawform": {
+                "providers": {
+                  "codex_fast": {"type":"codex", "default": true},
+                  "claude_safe": {"type":"claude", "default": false}
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        cfg.validate().unwrap();
+        let err = cfg
+            .resolve_provider(Some("missing"))
+            .expect_err("must fail");
+        let rendered = format!("{:#}", err);
+        assert!(rendered.contains("unknown provider 'missing'"));
+        assert!(rendered.contains("codex_fast"));
+        assert!(rendered.contains("claude_safe"));
     }
 
     #[test]
