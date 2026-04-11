@@ -5,14 +5,17 @@ This project implements Clawform v0 in Rust.
 ## Prerequisites
 
 1. Install Rust (stable) via `rustup`.
-2. Install Codex CLI and ensure it is on `PATH`.
-3. Verify Codex authentication:
+2. Install the provider CLI you want to test locally and ensure it is on `PATH`:
+   - Codex: `codex`
+   - Claude: `claude`
+3. Verify provider authentication before running real provider tests:
 
 ```bash
 codex login status
+claude auth status --text
 ```
 
-Expected for authenticated runs: a successful status output.
+Expected for authenticated runs: a successful status output for the provider you plan to use.
 
 ## Install From Releases (No Source Build)
 
@@ -93,6 +96,13 @@ cf -f examples/smoke.md
 cf apply -f examples/smoke.md
 ```
 
+Select a provider explicitly:
+
+```bash
+cargo run -p clawform -- apply -f examples/smoke.md -p codex
+cargo run -p clawform -- apply -f examples/smoke.md -p claude
+```
+
 Interactive progress UI is enabled automatically only when stdin/stdout are attached to an interactive terminal.
 
 Show provider raw logs (debug mode):
@@ -132,19 +142,25 @@ Control sandbox policy for model-generated shell commands:
 ```bash
 # default behavior (auto escalation when needed)
 cargo run -p clawform -- apply -f examples/smoke.md --sandbox auto
+# shorthand equivalent
+cargo run -p clawform -- apply -f examples/smoke.md --auto
 
-# force sandboxed execution
-cargo run -p clawform -- apply -f examples/smoke.md --sandbox workspace-write
+# force workspace mode
+cargo run -p clawform -- apply -f examples/smoke.md --sandbox workspace
+# shorthand equivalent
+cargo run -p clawform -- apply -f examples/smoke.md --workspace
 
-# force unsandboxed execution
-cargo run -p clawform -- apply -f examples/smoke.md --sandbox danger-full-access
+# force full-access mode
+cargo run -p clawform -- apply -f examples/smoke.md --sandbox full-access
+# shorthand equivalent
+cargo run -p clawform -- apply -f examples/smoke.md --full-access
 ```
 
 Simple sandbox behavior check:
 
 ```bash
-# force sandboxed mode (network fetch may fail in restricted environments)
-cargo run -p clawform -- apply -f examples/sandbox-check.md --sandbox workspace-write --yes
+# force workspace mode (network fetch may fail in restricted environments)
+cargo run -p clawform -- apply -f examples/sandbox-check.md --sandbox workspace --yes
 
 # auto mode may escalate and complete with NETWORK_OK
 cargo run -p clawform -- apply -f examples/sandbox-check.md --sandbox auto --yes
@@ -212,20 +228,27 @@ Run only core integration tests:
 cargo test -p clawform-core --test apply_mock
 ```
 
-## Real Codex Integration Tests (Opt-in)
+## Real Provider Integration Tests (Opt-in)
 
-Real provider tests are in `crates/clawform-cli/tests/codex_e2e.rs` and are skipped unless explicitly enabled.
+Real provider tests are skipped unless explicitly enabled.
 
-Enable and run:
+Codex:
 
 ```bash
 CLAWFORM_E2E_CODEX=1 cargo test -p clawform --test codex_e2e -- --test-threads=1
 ```
 
+Claude:
+
+```bash
+CLAWFORM_E2E_CLAUDE=1 cargo test -p clawform --test claude_e2e -- --test-threads=1
+```
+
 Notes:
 
 - These tests require valid Codex auth (`codex login status`).
-- These tests require DNS/connectivity to `api.openai.com`.
+- Claude tests require valid Claude auth (`claude auth status --text`).
+- Codex tests require DNS/connectivity to `api.openai.com`.
 - They may consume API credits and run slower/flakier than mock tests.
 - Keep them opt-in locally and in CI.
 
@@ -251,15 +274,16 @@ Release type:
 1. `rustc: command not found`
 - Install Rust via `rustup` and open a new shell.
 
-2. `codex: command not found`
-- Install Codex CLI and ensure its install location is on `PATH`.
+2. provider CLI not found (`codex: command not found` or `claude: command not found`)
+- Install the relevant CLI and ensure its install location is on `PATH`.
 
-3. `codex login status` fails
-- Authenticate first, then rerun tests/commands.
+3. provider auth check fails
+- Codex: run `codex login status` and authenticate first.
+- Claude: run `claude auth status --text` and authenticate first.
 
 4. Apply fails with provider execution error
-- Rerun `codex login status`, then retry apply.
-- Clawform performs DNS preflight for `api.openai.com`; fix DNS/VPN/proxy first if it fails early.
+- Rerun the provider auth check for the provider you selected, then retry apply.
+- Codex performs DNS preflight for `api.openai.com`; fix DNS/VPN/proxy first if it fails early.
 - Check stderr output from `clawform apply` for model/auth/runtime failures.
 - During long runs, Clawform prints live progress events and periodic heartbeat lines.
 - In v0, Clawform does not enforce its own max runtime timeout; provider behavior determines run duration.

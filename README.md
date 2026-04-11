@@ -137,6 +137,7 @@ For internal protocol details and strict agent result schema, see `contrib/ARCHI
 cf -f program.md
 cf apply -f program.md
 cf -f program.md -p claude
+cf -f program.md --auto
 cf -f program.md --progress plain
 cf -f program.md --workspace
 cf -f program.md --full-access

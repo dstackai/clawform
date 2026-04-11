@@ -94,10 +94,10 @@ Variable rules:
    - variable diff vs last session variable snapshot (if available)
 5. Ask for confirmation (interactive default; skipped by `--yes`).
 6. Clear prior run protocol files in `.clawform/` and write runtime variables file (`.clawform/agent_variables.json`) when variables are present.
-7. Build runtime prompt; in sandboxed modes (`sandboxed`/`auto`) include explicit verdict-gate rules for sandbox-vs-program blocking.
+7. Build runtime prompt; in `workspace` and `auto` modes include explicit verdict-gate rules for sandbox-vs-program blocking.
 8. Run provider in the current workspace (no temp workspace copy).
 9. Stream provider events to terminal; during the run write session `commands/*` and `messages/*`.
-10. In `auto` sandbox mode, allow at most one unsandboxed retry only when current-run `.clawform/agent_result.json` reports `status=partial|failure` and `reason=sandbox_blocked` (no stdout/stderr heuristic fallback).
+10. In `auto` mode, allow at most one retry in `full-access` mode only when current-run `.clawform/agent_result.json` reports `status=partial|failure` and `reason=sandbox_blocked` (no stdout/stderr heuristic fallback).
 11. Read agent status from `.clawform/agent_result.json` (required) and validate strict status/reason schema.
 12. Collect reported changed files from `.clawform/agent_outputs.json` when that file exists and was updated in this run.
 13. Persist run-end records (`output.md`, `outcome.json`) and append `.clawform/history/index.jsonl`.
@@ -198,7 +198,7 @@ Rules:
 2. `reason` is strict enum: `sandbox_blocked | program_blocked`.
 3. `reason` is required for `partial` and `failure`; omitted for `success`.
 4. Unknown `reason` values are rejected when Clawform parses `agent_result.json`.
-5. In sandboxed modes (`sandboxed`/`auto`), runtime prompt enforces verdict gate semantics:
+5. In `workspace` and `auto` modes, runtime prompt enforces verdict gate semantics:
    - first restriction symptom triggers block-cause classification
    - any sandbox evidence (including non-fatal permission/network warnings), mixed evidence, or uncertainty => `reason: sandbox_blocked`
    - `reason: program_blocked` only when zero restriction symptoms appeared and one read-only check confirms an independent non-sandbox cause
@@ -208,12 +208,12 @@ Rules:
 
 Applies only when sandbox mode is `auto`:
 
-1. First pass runs sandboxed.
-2. One unsandboxed retry is allowed only when current-run `agent_result.json` reports:
+1. First pass runs in `workspace` mode.
+2. One retry in `full-access` mode is allowed only when current-run `agent_result.json` reports:
    - `status` in `partial|failure`
    - `reason: sandbox_blocked`
 3. No retry is triggered from command-output text heuristics.
-4. When retry is triggered, Clawform emits a retry-decision progress line and then launches one unsandboxed attempt.
+4. When retry is triggered, Clawform emits a retry-decision progress line and then launches one `full-access` attempt.
 
 ## 6) Known Bugs
 
@@ -237,8 +237,8 @@ Actual:
 
 Steps to reproduce:
 
-1. Start `cf apply -f <program-a.md>` in one terminal (same workspace).
-2. While it is still running, start `cf apply -f <program-b.md>` in another terminal (same workspace).
+1. Start `cf -f <program-a.md>` in one terminal (same workspace).
+2. While it is still running, start `cf -f <program-b.md>` in another terminal (same workspace).
 3. Both runs write/read `.clawform/agent_result.json` / `.clawform/agent_outputs.json` / `.clawform/agent_output.md`.
 
 Expected:
@@ -272,4 +272,6 @@ These items are intentionally deferred. Each item describes desired product capa
 9. Improved session storage and retrieval performance  
    Goal: keep history/state operations fast and scalable as usage grows.
 10. Session-scoped protocol files for concurrent apply safety  
-   Goal: move `.clawform/agent_*.json|md` to per-session protocol paths.
+    Goal: move `.clawform/agent_*.json|md` to per-session protocol paths.
+11. Optional Claude `--bare` provider mode
+    Goal: add a more deterministic no-ambient-context Claude launch mode as an explicit provider option without making it required for v1.
