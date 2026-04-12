@@ -108,7 +108,7 @@ Interactive progress UI is enabled automatically only when stdin/stdout are atta
 Current progress semantics:
 
 - Rich mode keeps a spinner plus a live `running` or `running: <activity>` status line.
-- The run-start line includes the session id, execution mode, and a compact `provider:model` suffix such as `🧵 <session> | workspace | claude:sonnet`.
+- The run-start line includes the session id, execution mode, a compact `provider:model` suffix, and when applicable a compact `skills:` suffix such as `🧵 <session> | workspace | claude:sonnet | skills:dstack`.
 - `running` is a liveness indicator. It does not mean the model is explicitly emitting reasoning.
 - Plain mode prints stable progress lines without the interactive spinner/status renderer.
 - Completed provider items are normalized across Claude and Codex into categories such as `💭`, `💬`, `🔎`, `🌐`, `❱`, `✏️`, `update plan | ...`, `🔧`, and `📦`.
@@ -123,6 +123,16 @@ cargo run -p clawform -- apply -f examples/smoke.md --debug
 ```
 
 That debug run will also persist `.clawform/programs/<program_id>/sessions/<session_id>/events.ndjson` for postmortem event inspection.
+
+Program frontmatter also supports required provider-native skills:
+
+```yaml
+---
+skills: [dstack]
+---
+```
+
+When present, Clawform prepends explicit provider-native skill validation/invocation lines to the real session prompt before the normal apply contract, for example `$dstack Fail if skill is not found.` or `/dstack Fail if skill is not found.`. The injected prelude also tells the agent to stop and write `.clawform/agent_result.json` with `reason: program_blocked` if a required skill is unavailable.
 
 Disable progress rendering entirely:
 

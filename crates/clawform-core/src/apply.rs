@@ -10,7 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 
-use crate::config::load_config;
+use crate::config::{load_config, ProviderKind};
 use crate::fingerprint::hash_file_or_missing;
 use crate::history::{
     append_history_record, load_program_history_context, now_unix_secs, ProgramHistoryContext,
@@ -144,7 +144,9 @@ pub struct FileResult {
 struct ApplyContext {
     program_key: String,
     program_file: String,
+    provider_kind: ProviderKind,
     resolved_model: Option<String>,
+    required_skills: Vec<String>,
     program_raw: String,
     program_variables: BTreeMap<String, String>,
 }
@@ -285,13 +287,16 @@ fn build_context(request: &ApplyRequest) -> Result<ApplyContext> {
     let program = load_program(&request.program_path)?;
     let program_key = program.program_key()?;
     let resolved_model = program.resolved_model(provider.default_model.as_deref());
+    let required_skills = program.resolved_skills();
     let program_variables = program.resolve_variables(&request.program_variables)?;
     let program_file = display_program_file(&request.workspace_root, &request.program_path);
 
     Ok(ApplyContext {
         program_key,
         program_file,
+        provider_kind: provider.provider_type,
         resolved_model,
+        required_skills,
         program_raw: program.raw_markdown,
         program_variables,
     })
@@ -315,13 +320,20 @@ fn execute_apply<R: ProviderRunner + ?Sized>(
     let history_injected_failure = history_context.last_failure.is_some();
 
     sync_runtime_variables_input(&request.workspace_root, &context.program_variables)?;
-    let prompt = build_runtime_prompt(&context.program_raw, &plan_data, request.sandbox_mode)?;
+    let prompt = build_runtime_prompt(
+        &context.program_raw,
+        &plan_data,
+        request.sandbox_mode,
+        context.provider_kind,
+        &context.required_skills,
+    )?;
 
     let run_result = match runner.run(&ProviderRequest {
         workspace_root: request.workspace_root.clone(),
         artifacts_root: Some(request.workspace_root.clone()),
         program_id: Some(context.program_key.clone()),
         model: context.resolved_model.clone(),
+        required_skills: context.required_skills.clone(),
         agent_result_rel: AGENT_RESULT_REL.to_string(),
         sandbox_mode: request.sandbox_mode,
         prompt,
@@ -373,7 +385,52 @@ fn execute_apply<R: ProviderRunner + ?Sized>(
         }
     };
 
+    let missing_required_skill =
+        detect_missing_required_skill(&run_result, context.provider_kind, &context.required_skills);
+
     if let Err(err) = run_result.ensure_success() {
+        if let Some(missing_skill) = missing_required_skill.clone() {
+            let skill_err =
+                anyhow!("required skill '{}' unavailable for this session", missing_skill);
+            let failure_session_id = derive_session_key(run_result.session_id.as_deref());
+            let _ = persist_session_outcome(
+                &request.workspace_root,
+                &context.program_key,
+                &SessionOutcome {
+                    program_id: context.program_key.clone(),
+                    session_id: failure_session_id.clone(),
+                    status: "failure".to_string(),
+                    agent_status: Some(AgentStatus::Failure.as_str().to_string()),
+                    agent_message: Some(format!(
+                        "required skill {} unavailable for this session",
+                        missing_skill
+                    )),
+                    model: context.resolved_model.clone(),
+                    error: Some(truncate_chars(
+                        &format!("{:#}", skill_err),
+                        MAX_HISTORY_TEXT_CHARS,
+                    )),
+                    files_total: 0,
+                    insertions: 0,
+                    deletions: 0,
+                    files_changed: Vec::new(),
+                    input_tokens: run_result.usage.input_tokens,
+                    output_tokens: run_result.usage.output_tokens,
+                    cached_input_tokens: run_result.usage.cached_input_tokens,
+                },
+            );
+            let _ = append_history_record(
+                &request.workspace_root,
+                &build_failure_history_record(
+                    &context.program_key,
+                    Some(failure_session_id.as_str()),
+                    context.resolved_model.as_deref(),
+                    Some(&format!("{:#}", skill_err)),
+                    Some(&run_result),
+                ),
+            );
+            return Err(skill_err);
+        }
         let failure_session_id = derive_session_key(run_result.session_id.as_deref());
         let _ = persist_session_outcome(
             &request.workspace_root,
@@ -426,7 +483,26 @@ fn execute_apply<R: ProviderRunner + ?Sized>(
     let agent_human_summary_explicit = read_agent_human_summary(&request.workspace_root)
         .ok()
         .flatten();
-    let agent_result = read_agent_result(&request.workspace_root)?;
+    let mut agent_result = read_agent_result(&request.workspace_root)?;
+    if let Some(missing_skill) = missing_required_skill {
+        let keep_existing_failure = matches!(
+            agent_result,
+            Some(AgentResult {
+                status: AgentStatus::Failure,
+                ..
+            })
+        );
+        if !keep_existing_failure {
+            agent_result = Some(AgentResult {
+                status: AgentStatus::Failure,
+                reason: Some(AgentReason::ProgramBlocked),
+                message: Some(format!(
+                    "required skill {} unavailable for this session",
+                    missing_skill
+                )),
+            });
+        }
+    }
     let derived_summary = read_derived_agent_summary(
         &request.workspace_root,
         &context.program_key,
@@ -1076,10 +1152,79 @@ fn truncate_chars(raw: &str, max: usize) -> String {
     out
 }
 
+fn required_skill_command(provider_kind: ProviderKind, skill: &str) -> String {
+    match provider_kind {
+        ProviderKind::Codex => format!("${skill}"),
+        ProviderKind::Claude => format!("/{skill}"),
+    }
+}
+
+fn required_skill_validation_line(provider_kind: ProviderKind, skill: &str) -> String {
+    format!(
+        "{} Fail if skill is not found.",
+        required_skill_command(provider_kind, skill)
+    )
+}
+
+fn detect_missing_required_skill(
+    run: &ProviderRunResult,
+    provider_kind: ProviderKind,
+    skills: &[String],
+) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+
+    let combined = format!("{}\n{}", run.stdout, run.stderr);
+    for skill in skills {
+        if provider_reports_missing_skill(provider_kind, combined.as_str(), skill.as_str()) {
+            return Some(skill.clone());
+        }
+    }
+    None
+}
+
+fn provider_reports_missing_skill(provider_kind: ProviderKind, text: &str, skill: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let skill_lower = skill.to_ascii_lowercase();
+    match provider_kind {
+        ProviderKind::Codex => {
+            let mentions_skill = [
+                format!("skill `{skill_lower}`"),
+                format!("skill `${skill_lower}`"),
+                format!("required skill `{skill_lower}`"),
+                format!("required skill `${skill_lower}`"),
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle));
+            let indicates_missing = ["not available", "unavailable", "not found"]
+                .iter()
+                .any(|needle| lower.contains(needle));
+            mentions_skill && indicates_missing
+        }
+        ProviderKind::Claude => {
+            let mentions_skill = [
+                format!("`/{skill_lower}`"),
+                format!("`${skill_lower}`"),
+                format!("unknown skill: {skill_lower}"),
+                format!("skill {skill_lower}"),
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle));
+            let indicates_missing = ["no skill named", "unknown skill", "not found", "was found"]
+                .iter()
+                .any(|needle| lower.contains(needle));
+            mentions_skill && indicates_missing
+        }
+    }
+}
+
 fn build_runtime_prompt(
     _program_raw: &str,
     plan_data: &SharedPlanData,
     sandbox_mode: SandboxMode,
+    provider_kind: ProviderKind,
+    required_skills: &[String],
 ) -> Result<String> {
     let mut block = String::new();
     let program_file = plan_data.program_file.as_str();
@@ -1089,6 +1234,21 @@ fn build_runtime_prompt(
     let sandbox_verdict_guidance_enabled =
         matches!(sandbox_mode, SandboxMode::Sandboxed | SandboxMode::Auto);
     let sandbox_auto_retry_enabled = matches!(sandbox_mode, SandboxMode::Auto);
+
+    if !required_skills.is_empty() {
+        for skill in required_skills {
+            block.push_str(required_skill_validation_line(provider_kind, skill.as_str()).as_str());
+            block.push('\n');
+        }
+        block.push('\n');
+        block.push_str("If any required skill above is unavailable:\n");
+        block.push_str("- write `./");
+        block.push_str(AGENT_RESULT_REL);
+        block.push_str("` with `{\"status\":\"failure\",\"reason\":\"program_blocked\",\"message\":\"required skill <name> unavailable for this session\"}`\n");
+        block.push_str("- in that message, replace `<name>` with the exact missing skill name.\n");
+        block.push_str("- stop immediately and do not continue with the rest of this program.\n\n");
+        block.push_str("Continue with the remaining instructions below only after all required skills above are loaded.\n\n");
+    }
 
     if let Some(last) = &plan_data.last_session {
         let session_id_raw = last
@@ -2429,7 +2589,13 @@ mod tests {
             last_session: None,
         };
 
-        let prompt = build_runtime_prompt("# test\n", &plan, SandboxMode::Auto)
+        let prompt = build_runtime_prompt(
+            "# test\n",
+            &plan,
+            SandboxMode::Auto,
+            ProviderKind::Codex,
+            &[],
+        )
             .expect("prompt should build");
         assert_eq!(prompt, PROMPT_EXAMPLE_NO_LAST);
     }
@@ -2466,7 +2632,13 @@ mod tests {
             }),
         };
 
-        let prompt = build_runtime_prompt("# test\n", &plan, SandboxMode::Auto)
+        let prompt = build_runtime_prompt(
+            "# test\n",
+            &plan,
+            SandboxMode::Auto,
+            ProviderKind::Codex,
+            &[],
+        )
             .expect("prompt should build");
         assert_eq!(prompt, PROMPT_EXAMPLE_WITH_LAST);
     }
@@ -2498,7 +2670,13 @@ mod tests {
             last_session: None,
         };
 
-        let prompt = build_runtime_prompt("# test\n", &plan, SandboxMode::Auto)
+        let prompt = build_runtime_prompt(
+            "# test\n",
+            &plan,
+            SandboxMode::Auto,
+            ProviderKind::Codex,
+            &[],
+        )
             .expect("prompt should build");
         assert!(prompt.contains("Resolved program variables for this session"));
         assert!(prompt.contains(RUNTIME_VARIABLES_INPUT_REL));
@@ -2547,7 +2725,13 @@ mod tests {
             }),
         };
 
-        let prompt = build_runtime_prompt("# test\n", &plan, SandboxMode::Auto)
+        let prompt = build_runtime_prompt(
+            "# test\n",
+            &plan,
+            SandboxMode::Auto,
+            ProviderKind::Codex,
+            &[],
+        )
             .expect("prompt should build");
         assert!(prompt.contains("Resolved program variables for this \"current session\""));
         assert!(prompt.contains("last_session_variables_file"));
@@ -2572,7 +2756,13 @@ mod tests {
             last_session: None,
         };
 
-        let prompt = build_runtime_prompt("# test\n", &plan, SandboxMode::Unsandboxed)
+        let prompt = build_runtime_prompt(
+            "# test\n",
+            &plan,
+            SandboxMode::Unsandboxed,
+            ProviderKind::Codex,
+            &[],
+        )
             .expect("prompt should build");
         assert!(!prompt.contains(
             "Verdict gate (required): after the first restriction symptom, stop normal task work and classify the block cause."
@@ -2612,7 +2802,13 @@ mod tests {
             }),
         };
 
-        let prompt = build_runtime_prompt("# test\n", &plan, SandboxMode::Unsandboxed)
+        let prompt = build_runtime_prompt(
+            "# test\n",
+            &plan,
+            SandboxMode::Unsandboxed,
+            ProviderKind::Codex,
+            &[],
+        )
             .expect("prompt should build");
         assert!(!prompt.contains(
             "Verdict gate (required): after the first restriction symptom, stop normal task work and classify the block cause."
@@ -2638,7 +2834,13 @@ mod tests {
             last_session: None,
         };
 
-        let prompt = build_runtime_prompt("# test\n", &plan, SandboxMode::Auto)
+        let prompt = build_runtime_prompt(
+            "# test\n",
+            &plan,
+            SandboxMode::Auto,
+            ProviderKind::Codex,
+            &[],
+        )
             .expect("prompt should build");
         assert!(prompt.contains(
             "use `sandbox_blocked` if any restriction symptom appears in a failing required command"
@@ -2646,6 +2848,160 @@ mod tests {
         assert!(prompt.contains(
             "Use `reason: program_blocked` only when zero restriction symptoms appeared in failing required commands"
         ));
+    }
+
+    #[test]
+    fn build_runtime_prompt_prepends_codex_skill_commands() {
+        let plan = SharedPlanData {
+            program_id: "calc".to_string(),
+            program_file: "examples/calc.md".to_string(),
+            model: Some("gpt-test".to_string()),
+            program_variables: None,
+            program_variables_diff_vs_last_session: None,
+            program_diff_vs_last_session: PlanProgramDiff {
+                status: "first_apply".to_string(),
+                file: "examples/calc.md".to_string(),
+                lines_changed: 0,
+                lines_added: 0,
+                lines_deleted: 0,
+            },
+            last_session: None,
+        };
+
+        let prompt = build_runtime_prompt(
+            "# test\n",
+            &plan,
+            SandboxMode::Auto,
+            ProviderKind::Codex,
+            &["dstack".to_string(), "find-skills".to_string()],
+        )
+        .expect("prompt should build");
+
+        assert!(prompt.starts_with(
+            "$dstack Fail if skill is not found.\n$find-skills Fail if skill is not found.\n\nIf any required skill above is unavailable:"
+        ));
+        assert!(prompt.contains("write `./.clawform/agent_result.json`"));
+        assert!(prompt.contains("\"reason\":\"program_blocked\""));
+        assert!(prompt.contains("required skill <name> unavailable for this session"));
+        assert!(prompt.contains("replace `<name>` with the exact missing skill name"));
+        assert!(prompt.contains("Clawform apply session contract"));
+    }
+
+    #[test]
+    fn build_runtime_prompt_prepends_claude_skill_commands() {
+        let plan = SharedPlanData {
+            program_id: "calc".to_string(),
+            program_file: "examples/calc.md".to_string(),
+            model: Some("gpt-test".to_string()),
+            program_variables: None,
+            program_variables_diff_vs_last_session: None,
+            program_diff_vs_last_session: PlanProgramDiff {
+                status: "first_apply".to_string(),
+                file: "examples/calc.md".to_string(),
+                lines_changed: 0,
+                lines_added: 0,
+                lines_deleted: 0,
+            },
+            last_session: None,
+        };
+
+        let prompt = build_runtime_prompt(
+            "# test\n",
+            &plan,
+            SandboxMode::Auto,
+            ProviderKind::Claude,
+            &["dstack".to_string()],
+        )
+        .expect("prompt should build");
+
+        assert!(prompt.starts_with(
+            "/dstack Fail if skill is not found.\n\nIf any required skill above is unavailable:"
+        ));
+        assert!(prompt.contains("write `./.clawform/agent_result.json`"));
+        assert!(prompt.contains("\"reason\":\"program_blocked\""));
+        assert!(prompt.contains("required skill <name> unavailable for this session"));
+        assert!(prompt.contains("replace `<name>` with the exact missing skill name"));
+        assert!(prompt.contains("Clawform apply session contract"));
+    }
+
+    #[test]
+    fn detect_missing_required_skill_matches_codex_message() {
+        let run = ProviderRunResult {
+            session_id: Some("s-1".to_string()),
+            exit_code: Some(0),
+            stdout: "Skill `dstack` is not available in this session.".to_string(),
+            stderr: String::new(),
+            usage: Default::default(),
+            turn_count: 0,
+        };
+
+        let missing =
+            detect_missing_required_skill(&run, ProviderKind::Codex, &["dstack".to_string()]);
+        assert_eq!(missing.as_deref(), Some("dstack"));
+    }
+
+    #[test]
+    fn detect_missing_required_skill_matches_codex_required_skill_message() {
+        let run = ProviderRunResult {
+            session_id: Some("s-1".to_string()),
+            exit_code: Some(0),
+            stdout: "Required skill `$dstack` is not available in this environment, so I'm stopping here as requested.".to_string(),
+            stderr: String::new(),
+            usage: Default::default(),
+            turn_count: 0,
+        };
+
+        let missing =
+            detect_missing_required_skill(&run, ProviderKind::Codex, &["dstack".to_string()]);
+        assert_eq!(missing.as_deref(), Some("dstack"));
+    }
+
+    #[test]
+    fn detect_missing_required_skill_matches_claude_message() {
+        let run = ProviderRunResult {
+            session_id: Some("s-1".to_string()),
+            exit_code: Some(0),
+            stdout: "No skill named `/dstack` was found.".to_string(),
+            stderr: String::new(),
+            usage: Default::default(),
+            turn_count: 0,
+        };
+
+        let missing =
+            detect_missing_required_skill(&run, ProviderKind::Claude, &["dstack".to_string()]);
+        assert_eq!(missing.as_deref(), Some("dstack"));
+    }
+
+    #[test]
+    fn detect_missing_required_skill_matches_claude_plain_missing_message() {
+        let run = ProviderRunResult {
+            session_id: Some("s-1".to_string()),
+            exit_code: Some(0),
+            stdout: "No skill named `$dstack` was found. Available skills are:\n- dstack\n".to_string(),
+            stderr: String::new(),
+            usage: Default::default(),
+            turn_count: 0,
+        };
+
+        let missing =
+            detect_missing_required_skill(&run, ProviderKind::Claude, &["dstack".to_string()]);
+        assert_eq!(missing.as_deref(), Some("dstack"));
+    }
+
+    #[test]
+    fn detect_missing_required_skill_matches_claude_unknown_skill_message() {
+        let run = ProviderRunResult {
+            session_id: Some("s-1".to_string()),
+            exit_code: Some(0),
+            stdout: "Unknown skill: dstack".to_string(),
+            stderr: String::new(),
+            usage: Default::default(),
+            turn_count: 0,
+        };
+
+        let missing =
+            detect_missing_required_skill(&run, ProviderKind::Claude, &["dstack".to_string()]);
+        assert_eq!(missing.as_deref(), Some("dstack"));
     }
 
     #[test]

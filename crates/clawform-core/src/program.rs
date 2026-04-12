@@ -20,6 +20,8 @@ pub struct ProgramFrontmatter {
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
     pub variables: BTreeMap<String, ProgramVariableSpec>,
 }
 
@@ -48,6 +50,7 @@ pub fn load_program(program_path: &Path) -> Result<ProgramDocument> {
             bail!("frontmatter model cannot be empty");
         }
     }
+    validate_skill_definitions(&frontmatter.skills)?;
     validate_variable_definitions(&frontmatter.variables)?;
     validate_variable_references(&body_markdown, &frontmatter.variables)?;
 
@@ -83,6 +86,14 @@ impl ProgramDocument {
             .model
             .clone()
             .or_else(|| provider_default_model.map(ToString::to_string))
+    }
+
+    pub fn resolved_skills(&self) -> Vec<String> {
+        self.frontmatter
+            .skills
+            .iter()
+            .map(|skill| skill.trim().to_string())
+            .collect()
     }
 
     pub fn resolve_variables(
@@ -177,6 +188,26 @@ fn validate_variable_definitions(
     Ok(())
 }
 
+fn validate_skill_definitions(skills: &[String]) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for raw in skills {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            bail!("frontmatter skill names cannot be empty");
+        }
+        if trimmed.chars().any(char::is_whitespace) {
+            bail!(
+                "invalid frontmatter skill '{}': expected a single token without whitespace",
+                raw
+            );
+        }
+        if !seen.insert(trimmed.to_string()) {
+            bail!("duplicate frontmatter skill '{}'", trimmed);
+        }
+    }
+    Ok(())
+}
+
 fn validate_variable_references(
     body_markdown: &str,
     definitions: &BTreeMap<String, ProgramVariableSpec>,
@@ -247,10 +278,11 @@ mod tests {
 
     #[test]
     fn parses_frontmatter_with_id_and_model() {
-        let input = "---\nid: abc\nmodel: gpt-5\n---\nbody";
+        let input = "---\nid: abc\nmodel: gpt-5\nskills: [dstack]\n---\nbody";
         let (fm, body) = parse_frontmatter(input).unwrap();
         assert_eq!(fm.id.as_deref(), Some("abc"));
         assert_eq!(fm.model.as_deref(), Some("gpt-5"));
+        assert_eq!(fm.skills, vec!["dstack".to_string()]);
         assert!(fm.variables.is_empty());
         assert_eq!(body, "body");
     }
@@ -277,6 +309,7 @@ mod tests {
         let input =
             "---\nvariables:\n  APP_NAME: {}\n  APP_PORT:\n    default: \"8080\"\n---\nbody";
         let (fm, body) = parse_frontmatter(input).unwrap();
+        assert!(fm.skills.is_empty());
         assert!(fm.variables.contains_key("APP_NAME"));
         assert_eq!(
             fm.variables
@@ -298,6 +331,43 @@ mod tests {
         .unwrap();
         let err = load_program(&path).expect_err("must fail");
         assert!(format!("{:#}", err).contains("invalid frontmatter variable name"));
+    }
+
+    #[test]
+    fn load_program_resolves_trimmed_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("program.md");
+        fs::write(
+            &path,
+            "---\nskills:\n  - dstack\n  - find-skills\n---\nbody\n",
+        )
+        .unwrap();
+
+        let program = load_program(&path).unwrap();
+        assert_eq!(
+            program.resolved_skills(),
+            vec!["dstack".to_string(), "find-skills".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_program_rejects_duplicate_skill_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("program.md");
+        fs::write(&path, "---\nskills: [dstack, dstack]\n---\nbody\n").unwrap();
+
+        let err = load_program(&path).expect_err("must reject duplicate skills");
+        assert!(format!("{:#}", err).contains("duplicate frontmatter skill"));
+    }
+
+    #[test]
+    fn load_program_rejects_skill_names_with_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("program.md");
+        fs::write(&path, "---\nskills: ['bad skill']\n---\nbody\n").unwrap();
+
+        let err = load_program(&path).expect_err("must reject invalid skill names");
+        assert!(format!("{:#}", err).contains("invalid frontmatter skill"));
     }
 
     #[test]
@@ -335,6 +405,7 @@ mod tests {
             frontmatter: ProgramFrontmatter {
                 id: None,
                 model: None,
+                skills: Vec::new(),
                 variables: BTreeMap::from([
                     (
                         "APP_NAME".to_string(),
@@ -364,6 +435,7 @@ mod tests {
             frontmatter: ProgramFrontmatter {
                 id: None,
                 model: None,
+                skills: Vec::new(),
                 variables: BTreeMap::from([(
                     "APP_NAME".to_string(),
                     ProgramVariableSpec { default: None },
@@ -385,6 +457,7 @@ mod tests {
             frontmatter: ProgramFrontmatter {
                 id: None,
                 model: None,
+                skills: Vec::new(),
                 variables: BTreeMap::new(),
             },
         };
