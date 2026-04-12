@@ -108,17 +108,21 @@ Interactive progress UI is enabled automatically only when stdin/stdout are atta
 Current progress semantics:
 
 - Rich mode keeps a spinner plus a live `running` or `running: <activity>` status line.
+- The run-start line includes the session id, execution mode, and a compact `provider:model` suffix such as `🧵 <session> | workspace | claude:sonnet`.
 - `running` is a liveness indicator. It does not mean the model is explicitly emitting reasoning.
 - Plain mode prints stable progress lines without the interactive spinner/status renderer.
-- Completed provider items are normalized across Claude and Codex into categories such as `💭`, `💬`, `🔎`, `🌐`, `❱`, `✎`, `🗒️`, `🔧`, and `📦`.
+- Completed provider items are normalized across Claude and Codex into categories such as `💭`, `💬`, `🔎`, `🌐`, `❱`, `✏️`, `update plan | ...`, `🔧`, and `📦`.
 - Unknown provider item types still surface through `🔧` / `📦` fallbacks instead of being silently dropped.
 - `Ctrl+C` should report cancellation rather than dumping raw provider stdout/stderr.
+- Per-session `events.ndjson` traces are written only in debug mode.
 
 Show provider raw logs (debug mode):
 
 ```bash
 cargo run -p clawform -- apply -f examples/smoke.md --debug
 ```
+
+That debug run will also persist `.clawform/programs/<program_id>/sessions/<session_id>/events.ndjson` for postmortem event inspection.
 
 Disable progress rendering entirely:
 

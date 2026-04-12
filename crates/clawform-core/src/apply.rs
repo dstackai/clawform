@@ -416,7 +416,11 @@ fn execute_apply<R: ProviderRunner + ?Sized>(
     let plan_artifact = None;
     let provider_stdout_artifact = None;
     let provider_stderr_artifact = None;
-    let events_artifact = None;
+    let events_artifact = events_artifact_rel_path(
+        &request.workspace_root,
+        &context.program_key,
+        &success_session_id,
+    );
     let agent_reported_files =
         read_agent_reported_files(&request.workspace_root).unwrap_or_default();
     let agent_human_summary_explicit = read_agent_human_summary(&request.workspace_root)
@@ -2097,11 +2101,6 @@ fn print_plan_preview(plan: &SharedPlanData, debug: bool, workspace_root: &Path)
             plan.program_id,
             plan.program_file
         );
-        println!(
-            "  {} {}",
-            color_dim("model:", use_color),
-            plan.model.as_deref().unwrap_or("<provider default>")
-        );
         if let Some(last) = &plan.last_session {
             if let Some(session) = last.session_id.as_deref() {
                 println!(
@@ -2224,6 +2223,22 @@ fn output_artifact_rel_path(workspace_root: &Path, program_id: &str, session_id:
     abs.strip_prefix(workspace_root)
         .map(to_slash_path)
         .unwrap_or_else(|_| to_slash_path(&abs))
+}
+
+fn events_artifact_rel_path(
+    workspace_root: &Path,
+    program_id: &str,
+    session_id: &str,
+) -> Option<String> {
+    let abs = program_session_dir(workspace_root, program_id, session_id).join("events.ndjson");
+    if !abs.exists() {
+        return None;
+    }
+    Some(
+        abs.strip_prefix(workspace_root)
+            .map(to_slash_path)
+            .unwrap_or_else(|_| to_slash_path(&abs)),
+    )
 }
 
 fn format_msg_link(workspace_root: &Path, rel_path: &str, use_color: bool) -> String {

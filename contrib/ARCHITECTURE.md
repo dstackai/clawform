@@ -96,7 +96,7 @@ Variable rules:
 6. Clear prior run protocol files in `.clawform/` and write runtime variables file (`.clawform/agent_variables.json`) when variables are present.
 7. Build runtime prompt; in `workspace` and `auto` modes include explicit verdict-gate rules for sandbox-vs-program blocking.
 8. Run provider in the current workspace (no temp workspace copy).
-9. Normalize provider-native events into shared progress categories, stream them to terminal, and during the run write session `commands/*` and `messages/*`.
+9. Normalize provider-native events into shared progress categories, stream them to terminal, and during the run write session `commands/*` and `messages/*`. In debug mode, also write session `events.ndjson`.
 10. In `auto` mode, allow at most one retry in `full-access` mode only when current-run `.clawform/agent_result.json` reports `status=partial|failure` and `reason=sandbox_blocked` (no stdout/stderr heuristic fallback).
 11. Read agent status from `.clawform/agent_result.json` (required) and validate strict status/reason schema.
 12. Collect reported changed files from `.clawform/agent_outputs.json` when that file exists and was updated in this run.
@@ -106,9 +106,10 @@ Variable rules:
 ## 4.1 Progress Rendering Semantics
 
 - In an interactive TTY, rich progress keeps a spinner plus a live `running` or `running: <activity>` status line.
+- The run-start line includes the session id, execution mode, and a compact `provider:model` suffix, for example `🧵 <session> | workspace | codex:gpt-5-codex`.
 - `running` means the provider run is still alive. It is a liveness indicator, not the same thing as reasoning text.
 - The live activity suffix is derived from the highest-priority active provider item, for example `search ...`, `fetch ...`, `use ...`, `edit ...`, or `update plan`.
-- Completed progress lines are normalized across Claude and Codex into shared categories such as reasoning (`💭`), assistant text (`💬`), search (`🔎`), fetch (`🌐`), command (`❱`), file change (`✎`), plan update (`🗒️`), generic tool (`🔧`), and unknown provider event (`📦`).
+- Completed progress lines are normalized across Claude and Codex into shared categories such as reasoning (`💭`), assistant text (`💬`), search (`🔎`), fetch (`🌐`), command (`❱`), file change (`✏️`), plan update (`update plan | ...`), generic tool (`🔧`), and unknown provider event (`📦`).
 - In `plain` mode, Clawform prints stable progress lines without the interactive spinner/status renderer.
 - Unknown tool-like and non-tool provider items are rendered through generic fallbacks instead of being silently dropped.
 - Interrupting with `Ctrl+C` should surface cancellation rather than a raw provider stdout/stderr dump.
@@ -138,6 +139,7 @@ During the current run:
 
 - Write `<protocol_root>/agent_variables.json` (when variables exist); the agent reads this file for resolved `${{ var.NAME }}` values.
 - Write `<session_root>/commands/*` and `<session_root>/messages/*` as per-session execution artifacts.
+- In debug mode, also write `<session_root>/events.ndjson` as a per-session event trace artifact.
 - Read `<protocol_root>/agent_result.json`, `<protocol_root>/agent_outputs.json`, and optional `<protocol_root>/agent_output.md` at run end to determine status, changed files, and summary.
 
 On the next run of the same program:
@@ -159,6 +161,7 @@ For audit/debug visibility:
 | `<protocol_root>/agent_result.json` | Workspace-global scratch file for the currently running apply (overwritten on each apply) | Receive final structured run verdict (`status`, optional `reason`, `message`) where `reason` is strict enum (`sandbox_blocked` or `program_blocked`) | Read by Clawform at run end; in sandbox auto mode also used as the only retry signal source, only if file mtime is from this run |
 | `<protocol_root>/agent_outputs.json` | Workspace-global scratch file for the currently running apply (overwritten on each apply) | Receive changed-file list from the agent | Read by Clawform at run end for file summary/history, only if file mtime is from this run |
 | `<protocol_root>/agent_output.md` | Workspace-global scratch file for the currently running apply (optional; overwritten on each apply) | Receive agent-written summary text | Read by Clawform at run end; then copied into session `output.md` |
+| `<session_root>/events.ndjson` | Per-session (`<program_id>/<session_id>`), debug mode only | Preserve normalized provider events plus raw source lines for this session | Used for audit/debug flows and event-based validation |
 | `<session_root>/commands/*.txt` | Per-session (`<program_id>/<session_id>`) | Preserve command output artifacts for this session | Used for progress drilldown and debugging |
 | `<session_root>/messages/*.md` | Per-session (`<program_id>/<session_id>`) | Preserve assistant/message artifacts for this session | Used for progress drilldown and fallback summary source |
 | `<session_root>/output.md` | Per-session (`<program_id>/<session_id>`) | Store stable summary artifact for this session | Used on next run of same `program_id` for preview/prompt reference |
@@ -169,7 +172,7 @@ For audit/debug visibility:
 
 Compatibility behavior:
 
-- No read fallback is used for `agent_summary.md` or `events.ndjson`.
+- No read fallback is used for `agent_summary.md`.
 - Current apply reads only the current protocol files documented in this section.
 - Sandbox auto-retry does not parse provider stdout/stderr for sandbox heuristics; it only trusts current-run `agent_result.json`.
 
@@ -186,7 +189,7 @@ Current apply does not persist:
 - `prompt.md`
 - `plan.json`
 - provider stdout/stderr artifact logs
-- canonical `events.ndjson` for new sessions
+- `events.ndjson` on non-debug runs
 
 ## 5.4 Agent Result Protocol Rules
 
