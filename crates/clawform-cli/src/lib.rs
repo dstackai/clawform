@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
@@ -20,6 +21,7 @@ const MAX_REPORTED_FILES_DISPLAY: usize = 20;
 const AGENT_RESULT_REL: &str = ".clawform/agent_result.json";
 const HELP_RENDER_WIDTH: usize = 100;
 const HELP_SPEC_WIDTH: usize = 30;
+static DETAILED_TERMINAL_VERDICT_PRINTED: AtomicBool = AtomicBool::new(false);
 const TOP_LEVEL_HELP_ROWS: &[(&str, &str)] = &[
     ("-h, --help", "print help"),
     ("-V, --version", "print version"),
@@ -205,13 +207,18 @@ enum Commands {
 }
 
 pub fn main_entry() {
+    DETAILED_TERMINAL_VERDICT_PRINTED.store(false, Ordering::Relaxed);
     if let Err(err) = real_main() {
         if is_user_cancelled_error(&err) {
-            print_canceled(true);
+            if !DETAILED_TERMINAL_VERDICT_PRINTED.load(Ordering::Relaxed) {
+                print_canceled(true);
+            }
             std::process::exit(130);
         }
         if is_blocked_error(&err) {
-            print_blocked();
+            if !DETAILED_TERMINAL_VERDICT_PRINTED.load(Ordering::Relaxed) {
+                print_blocked();
+            }
             std::process::exit(2);
         }
         eprintln!("error: {:#}", err);
@@ -875,6 +882,7 @@ fn maybe_print_agent_status_from_result_file(workspace_root: &Path) {
         line.push_str(&result_suffix);
     }
     eprintln!("{}", line);
+    DETAILED_TERMINAL_VERDICT_PRINTED.store(true, Ordering::Relaxed);
 }
 
 fn status_file_separator(use_color: bool) -> &'static str {

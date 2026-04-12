@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::net::ToSocketAddrs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{
@@ -25,6 +25,7 @@ pub struct ProviderRequest {
     pub artifacts_root: Option<PathBuf>,
     pub program_id: Option<String>,
     pub model: Option<String>,
+    pub required_skills: Vec<String>,
     pub agent_result_rel: String,
     pub sandbox_mode: SandboxMode,
     pub prompt: String,
@@ -648,12 +649,15 @@ fn run_claude_once(
     }
 
     if request.progress {
-        let session_context_label =
-            format_session_context_label(ProviderKind::Claude.as_str(), request.model.as_deref());
+        let session_context_label = format_session_context_label(
+            ProviderKind::Claude.as_str(),
+            request.model.as_deref(),
+            &request.required_skills,
+        );
         return collect_claude_with_progress(
             child,
             request.render_progress,
-            request.verbose_output || request.debug_mode,
+            request.debug_mode,
             request.verbose_output,
             request.verbose_events,
             request.debug_mode,
@@ -1411,13 +1415,39 @@ fn preferred_progress_label(
     }
 }
 
-fn format_session_context_label(provider_label: &str, model: Option<&str>) -> String {
+fn format_session_context_label(
+    provider_label: &str,
+    model: Option<&str>,
+    required_skills: &[String],
+) -> String {
     let provider = provider_label.trim();
     let model = model.map(str::trim).filter(|value| !value.is_empty());
-    match model {
+    let provider_model = match model {
         Some(model) if !provider.is_empty() => format!("{provider}:{model}"),
         _ => provider.to_string(),
+    };
+    match format_required_skills_segment(required_skills) {
+        Some(skills) if !provider_model.trim().is_empty() => format!("{provider_model} | {skills}"),
+        Some(skills) => skills,
+        None => provider_model,
     }
+}
+
+fn format_required_skills_segment(required_skills: &[String]) -> Option<String> {
+    let trimmed = required_skills
+        .iter()
+        .map(|skill| skill.trim())
+        .filter(|skill| !skill.is_empty())
+        .collect::<Vec<_>>();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let display = if trimmed.len() <= 2 {
+        trimmed.join(",")
+    } else {
+        format!("{},+{}", trimmed[0], trimmed.len() - 1)
+    };
+    Some(format!("skills:{display}"))
 }
 
 fn format_run_started_progress_line(
@@ -1876,6 +1906,7 @@ fn claude_command_output_payload(
 
 fn claude_tool_result_text(content: &Value, tool_use_result: Option<&Value>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
+    let mut structured_parts: Vec<String> = Vec::new();
 
     if let Some(obj) = tool_use_result.and_then(Value::as_object) {
         if let Some(stdout) = obj
@@ -1884,7 +1915,7 @@ fn claude_tool_result_text(content: &Value, tool_use_result: Option<&Value>) -> 
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            parts.push(stdout.to_string());
+            structured_parts.push(stdout.to_string());
         }
         if let Some(stderr) = obj
             .get("stderr")
@@ -1892,20 +1923,19 @@ fn claude_tool_result_text(content: &Value, tool_use_result: Option<&Value>) -> 
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            parts.push(stderr.to_string());
+            structured_parts.push(stderr.to_string());
         }
     }
+
+    parts.extend(structured_parts.iter().cloned());
 
     if let Some(text) = content
         .get("content")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .and_then(strip_claude_rerun_markers)
     {
-        if !is_low_signal_claude_tool_result_text(text)
-            && parts.iter().all(|part| part.trim() != text)
-        {
-            parts.push(text.to_string());
+        if let Some(extra) = claude_tool_result_extra_text(&text, &structured_parts) {
+            parts.push(extra);
         }
     }
 
@@ -1921,9 +1951,70 @@ fn claude_tool_result_text(content: &Value, tool_use_result: Option<&Value>) -> 
     }
 }
 
-fn is_low_signal_claude_tool_result_text(text: &str) -> bool {
-    let trimmed = text.trim();
-    trimmed.is_empty() || (trimmed.starts_with("[rerun:") && trimmed.ends_with(']'))
+fn strip_claude_rerun_markers(text: &str) -> Option<String> {
+    let kept_lines = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !is_claude_rerun_marker_line(line))
+        .collect::<Vec<_>>();
+    let cleaned = kept_lines.join("\n").trim().to_string();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn is_claude_rerun_marker_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("[rerun:") && trimmed.ends_with(']')
+}
+
+fn claude_tool_result_extra_text(text: &str, structured_parts: &[String]) -> Option<String> {
+    let content_lines = normalized_tool_result_lines(text);
+    if content_lines.is_empty() {
+        return None;
+    }
+
+    let structured_lines = structured_parts
+        .iter()
+        .flat_map(|part| normalized_tool_result_lines(part))
+        .collect::<Vec<_>>();
+    if structured_lines.is_empty() {
+        return Some(text.to_string());
+    }
+
+    if content_lines == structured_lines || structured_lines.starts_with(&content_lines) {
+        return None;
+    }
+
+    if content_lines.starts_with(&structured_lines) {
+        let extra = content_lines[structured_lines.len()..].join("\n");
+        let extra = extra.trim();
+        return if extra.is_empty() {
+            None
+        } else {
+            Some(extra.to_string())
+        };
+    }
+
+    if structured_parts.iter().any(|part| {
+        let part_lines = normalized_tool_result_lines(part);
+        !part_lines.is_empty()
+            && (content_lines == part_lines || part_lines.starts_with(&content_lines))
+    }) {
+        return None;
+    }
+
+    Some(text.to_string())
+}
+
+fn normalized_tool_result_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn display_path_in_workspace(raw_path: &str, workspace_root: &Path) -> String {
@@ -2222,12 +2313,15 @@ fn run_codex_once(
     if request.progress {
         let suppress_turn_usage_lines =
             mode == CodexExecutionMode::Sandboxed && request.sandbox_mode == SandboxMode::Auto;
-        let session_context_label =
-            format_session_context_label(ProviderKind::Codex.as_str(), request.model.as_deref());
+        let session_context_label = format_session_context_label(
+            ProviderKind::Codex.as_str(),
+            request.model.as_deref(),
+            &request.required_skills,
+        );
         return collect_with_progress(
             child,
             request.render_progress,
-            request.verbose_output || request.debug_mode,
+            request.debug_mode,
             request.verbose_output,
             request.verbose_events,
             request.debug_mode,
@@ -3994,6 +4088,12 @@ fn is_low_signal_command(summary: &str) -> bool {
 }
 
 fn is_clawform_housekeeping_summary(summary: &str) -> bool {
+    if let Some(path) = extract_clawform_housekeeping_path(summary) {
+        if is_clawform_housekeeping_path(path.as_str()) {
+            return true;
+        }
+    }
+
     let s = summary.trim().to_ascii_lowercase();
     s.starts_with("write .clawform/agent_output.md")
         || s.starts_with("write .clawform/agent_outputs.json")
@@ -4021,6 +4121,69 @@ fn is_clawform_housekeeping_summary(summary: &str) -> bool {
                     || s.contains("/reports/agent_outputs")
                     || s.contains("/reports/agent_result"))
         }
+}
+
+fn extract_clawform_housekeeping_path(summary: &str) -> Option<String> {
+    let trimmed = summary.trim();
+    let raw_path = if let Some(rest) = strip_ascii_case_prefix(trimmed, "write ") {
+        first_summary_path_token(rest)?
+    } else if let Some(rest) = strip_ascii_case_prefix(trimmed, "read ") {
+        first_summary_path_token(rest)?
+    } else if let Some(rest) = strip_ascii_case_prefix(trimmed, "cat ") {
+        first_summary_path_token(rest)?
+    } else if let Some(rest) = strip_ascii_case_prefix(trimmed, "mkdir -p ") {
+        first_summary_path_token(rest)?
+    } else {
+        return None;
+    };
+
+    normalize_clawform_housekeeping_path(raw_path)
+}
+
+fn first_summary_path_token(summary_tail: &str) -> Option<&str> {
+    let token = summary_tail.split_whitespace().next()?.trim();
+    let token = token.trim_matches(|c| matches!(c, '"' | '\'' | '`'));
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+fn normalize_clawform_housekeeping_path(raw_path: &str) -> Option<String> {
+    let trimmed = raw_path
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`'))
+        .trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    for component in Path::new(trimmed).components() {
+        match component {
+            Component::CurDir | Component::RootDir => {}
+            Component::Prefix(_) => {}
+            Component::ParentDir => parts.push("..".to_string()),
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+        }
+    }
+
+    let start = parts.iter().position(|part| part == ".clawform")?;
+    Some(parts[start..].join("/"))
+}
+
+fn is_clawform_housekeeping_path(path: &str) -> bool {
+    let normalized = path.trim().trim_end_matches('/').to_ascii_lowercase();
+    normalized == ".clawform"
+        || normalized == ".clawform/agent_output.md"
+        || normalized == ".clawform/agent_outputs.json"
+        || normalized == ".clawform/agent_result.json"
+        || normalized == ".clawform/agent_variables.json"
+        || (normalized.starts_with(".clawform/programs/")
+            && (normalized.contains("/reports/agent_output")
+                || normalized.contains("/reports/agent_outputs")
+                || normalized.contains("/reports/agent_result")))
 }
 
 fn is_low_signal_note(text: &str) -> bool {
@@ -4544,6 +4707,9 @@ fn colorize_session_segment(segment: &str) -> String {
     if is_provider_model_session_segment(trimmed) {
         return format!("\x1b[90m{}\x1b[0m", trimmed);
     }
+    if trimmed.starts_with("skills:") {
+        return format!("\x1b[90m{}\x1b[0m", trimmed);
+    }
     if let Some((key, value)) = trimmed.split_once('=') {
         let code = match (key, value) {
             ("sandbox", "workspace") | ("sandbox", "workspace-write") => Some("34"),
@@ -5031,6 +5197,20 @@ mod tests {
     }
 
     #[test]
+    fn session_context_label_includes_skills_compactly() {
+        let label = format_session_context_label(
+            "codex",
+            Some("gpt-5-codex"),
+            &[
+                "dstack".to_string(),
+                "find-skills".to_string(),
+                "openai-docs".to_string(),
+            ],
+        );
+        assert_eq!(label, "codex:gpt-5-codex | skills:dstack,+2");
+    }
+
+    #[test]
     fn parses_item_completed_event() {
         let line =
             r#"{"type":"item.completed","item":{"id":"i1","type":"file_change","path":"out.txt"}}"#;
@@ -5394,6 +5574,40 @@ mod tests {
     }
 
     #[test]
+    fn claude_tool_result_text_dedupes_content_when_it_matches_stdout_plus_rerun_marker() {
+        let content: Value = serde_json::from_str(
+            r#"{"type":"tool_result","content":"NAME  STATUS\nfleet active\n[rerun: b1]"}"#,
+        )
+        .expect("json");
+        let tool_use_result: Value = serde_json::from_str(
+            r#"{"stdout":"NAME  STATUS\nfleet active","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false}"#,
+        )
+        .expect("json");
+
+        assert_eq!(
+            claude_tool_result_text(&content, Some(&tool_use_result)).as_deref(),
+            Some("NAME  STATUS\nfleet active")
+        );
+    }
+
+    #[test]
+    fn claude_tool_result_text_keeps_extra_content_after_structured_output() {
+        let content: Value = serde_json::from_str(
+            r#"{"type":"tool_result","content":"NAME  STATUS\nfleet active\nnote: command was retried\n[rerun: b1]"}"#,
+        )
+        .expect("json");
+        let tool_use_result: Value = serde_json::from_str(
+            r#"{"stdout":"NAME  STATUS\nfleet active","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false}"#,
+        )
+        .expect("json");
+
+        assert_eq!(
+            claude_tool_result_text(&content, Some(&tool_use_result)).as_deref(),
+            Some("NAME  STATUS\nfleet active\nnote: command was retried")
+        );
+    }
+
+    #[test]
     fn parses_claude_json_success_result() {
         let result = parse_claude_json_result(
             r#"{"type":"result","is_error":false,"result":"ok","session_id":"claude-session","num_turns":6,"usage":{"input_tokens":5,"output_tokens":7,"cache_read_input_tokens":11}}"#
@@ -5461,6 +5675,10 @@ mod tests {
 
         let with_provider = colorize_session_payload("019d-session | workspace | claude:sonnet");
         assert!(with_provider.contains("\x1b[90mclaude:sonnet\x1b[0m"));
+
+        let with_skills =
+            colorize_session_payload("019d-session | workspace | codex:gpt-5-codex | skills:dstack,+1");
+        assert!(with_skills.contains("\x1b[90mskills:dstack,+1\x1b[0m"));
     }
 
     #[test]
@@ -5473,7 +5691,8 @@ mod tests {
     #[test]
     fn session_event_line_uses_readable_sandbox_value() {
         let printer = ProgressPrinter::new_test(true);
-        let rendered = printer.render_event_line("🧵 019d-session | full-access | codex:gpt-5-codex");
+        let rendered =
+            printer.render_event_line("🧵 019d-session | full-access | codex:gpt-5-codex");
         assert!(rendered.contains("🧵"));
         assert!(!rendered.contains("🧵 session "));
         assert!(rendered.contains("\x1b[33mfull-access\x1b[0m"));
@@ -5571,6 +5790,7 @@ mod tests {
             artifacts_root: None,
             program_id: Some("release-notes".to_string()),
             model: None,
+            required_skills: Vec::new(),
             agent_result_rel: ".clawform/programs/release-notes/reports/agent_result.json"
                 .to_string(),
             sandbox_mode: SandboxMode::Auto,
@@ -5597,6 +5817,7 @@ mod tests {
             artifacts_root: None,
             program_id: Some("hello-dstack".to_string()),
             model: None,
+            required_skills: Vec::new(),
             agent_result_rel: ".clawform/programs/hello-dstack/reports/agent_result.json"
                 .to_string(),
             sandbox_mode: SandboxMode::Auto,
@@ -5623,6 +5844,7 @@ mod tests {
             artifacts_root: None,
             program_id: Some("release-notes".to_string()),
             model: None,
+            required_skills: Vec::new(),
             agent_result_rel: ".clawform/programs/release-notes/reports/agent_result.json"
                 .to_string(),
             sandbox_mode: SandboxMode::Auto,
@@ -6026,6 +6248,7 @@ mod tests {
             artifacts_root: None,
             program_id: Some("release-notes".to_string()),
             model: None,
+            required_skills: Vec::new(),
             agent_result_rel: ".clawform/programs/release-notes/reports/agent_result.json"
                 .to_string(),
             sandbox_mode: SandboxMode::Auto,
@@ -6058,6 +6281,7 @@ mod tests {
             artifacts_root: None,
             program_id: Some("release-notes".to_string()),
             model: None,
+            required_skills: Vec::new(),
             agent_result_rel: result_rel.to_string(),
             sandbox_mode: SandboxMode::Auto,
             prompt: "x".to_string(),
@@ -6104,6 +6328,7 @@ mod tests {
             artifacts_root: None,
             program_id: Some("hello-dstack".to_string()),
             model: None,
+            required_skills: Vec::new(),
             agent_result_rel: result_rel.to_string(),
             sandbox_mode: SandboxMode::Auto,
             prompt: "x".to_string(),
@@ -6142,6 +6367,7 @@ mod tests {
             artifacts_root: None,
             program_id: Some("hello-dstack".to_string()),
             model: None,
+            required_skills: Vec::new(),
             agent_result_rel: result_rel.to_string(),
             sandbox_mode: SandboxMode::Auto,
             prompt: "x".to_string(),
@@ -6404,7 +6630,9 @@ mod tests {
             &ProviderEvent::ItemUpdated {
                 item_type: "todo_list".to_string(),
                 item_id: Some("x".to_string()),
-                summary: Some("2/3 done | Capture first heading from contrib/DEVELOPMENT.md".to_string()),
+                summary: Some(
+                    "2/3 done | Capture first heading from contrib/DEVELOPMENT.md".to_string(),
+                ),
             },
             true,
             false,
@@ -6483,7 +6711,39 @@ mod tests {
             &ProviderEvent::ItemCompleted {
                 item_type: "file_change".to_string(),
                 item_id: Some("x".to_string()),
-                summary: Some("write .clawform/agent_outputs.json".to_string()),
+                summary: Some("write ./.clawform/agent_outputs.json".to_string()),
+            },
+            true,
+            false,
+            true,
+        );
+        assert!(line.is_none());
+    }
+
+    #[test]
+    fn hides_housekeeping_command_writes_with_dot_slash_even_when_intermediate_enabled() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "command_execution".to_string(),
+                item_id: Some("x".to_string()),
+                summary: Some("write ./.clawform/agent_outputs.json".to_string()),
+            },
+            true,
+            false,
+            true,
+        );
+        assert!(line.is_none());
+    }
+
+    #[test]
+    fn hides_absolute_housekeeping_file_changes_even_when_intermediate_enabled() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "file_change".to_string(),
+                item_id: Some("x".to_string()),
+                summary: Some(
+                    "write /Users/dstack/clawform/.clawform/agent_result.json".to_string(),
+                ),
             },
             true,
             false,
@@ -6643,6 +6903,18 @@ mod tests {
         assert!(!should_count_item_progress(
             "file_change",
             Some("write .clawform/agent_result.json"),
+            false,
+            true
+        ));
+        assert!(!should_count_item_progress(
+            "file_change",
+            Some("write ./.clawform/agent_outputs.json"),
+            false,
+            true
+        ));
+        assert!(!should_count_item_progress(
+            "file_change",
+            Some("write /Users/dstack/clawform/.clawform/agent_result.json"),
             false,
             true
         ));

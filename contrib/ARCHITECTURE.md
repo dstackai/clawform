@@ -9,7 +9,7 @@ Clawform runs agent work from markdown files instead of chat windows.
 
 A **program** is one markdown file (`*.md`) representing one task.
 
-- frontmatter is tool-owned and strict (`id`, `model`, `variables`)
+- frontmatter is tool-owned and strict (`id`, `model`, `skills`, `variables`)
 - markdown body is agent-facing and free-form
 
 ## 2) Implemented v0 Scope
@@ -63,6 +63,7 @@ Frontmatter (strict):
 
 - `id` (optional)
 - `model` (optional override)
+- `skills` (optional list of required provider-native skill names)
 - `variables` (optional map)
   - key: variable name (`[A-Za-z_][A-Za-z0-9_]*`)
   - value:
@@ -83,6 +84,16 @@ Variable rules:
 3. apply-time `--var NAME=VALUE` overrides frontmatter default
 4. variables without default are required at apply time
 
+Skill rules:
+
+1. `skills` is a shared frontmatter list, for example `skills: [dstack]`
+2. each listed skill name must be a single non-empty token without whitespace
+3. Clawform prepends explicit provider-native skill validation/invocation lines to the real session prompt before the normal apply contract
+4. skill command syntax is provider-specific (`$skill` for Codex, `/skill` for Claude)
+5. the injected validation line is phrased as `Fail if skill is not found.`
+6. the injected prelude also instructs the agent to write `.clawform/agent_result.json` with `status: failure` and `reason: program_blocked` before stopping
+7. if the provider still surfaces a missing-skill response without writing the result artifact, Clawform uses provider-specific fallback detection and fails the apply run
+
 ## 4) Apply Session Flow (Current Behavior)
 
 1. Load program + config and resolve provider + model (`-p/--provider` overrides default provider selection).
@@ -94,7 +105,7 @@ Variable rules:
    - variable diff vs last session variable snapshot (if available)
 5. Ask for confirmation (interactive default; skipped by `--yes`).
 6. Clear prior run protocol files in `.clawform/` and write runtime variables file (`.clawform/agent_variables.json`) when variables are present.
-7. Build runtime prompt; in `workspace` and `auto` modes include explicit verdict-gate rules for sandbox-vs-program blocking.
+7. Build runtime prompt; if the program declares `skills`, prepend provider-native skill invocation commands first. In `workspace` and `auto` modes include explicit verdict-gate rules for sandbox-vs-program blocking.
 8. Run provider in the current workspace (no temp workspace copy).
 9. Normalize provider-native events into shared progress categories, stream them to terminal, and during the run write session `commands/*` and `messages/*`. In debug mode, also write session `events.ndjson`.
 10. In `auto` mode, allow at most one retry in `full-access` mode only when current-run `.clawform/agent_result.json` reports `status=partial|failure` and `reason=sandbox_blocked` (no stdout/stderr heuristic fallback).
@@ -106,7 +117,7 @@ Variable rules:
 ## 4.1 Progress Rendering Semantics
 
 - In an interactive TTY, rich progress keeps a spinner plus a live `running` or `running: <activity>` status line.
-- The run-start line includes the session id, execution mode, and a compact `provider:model` suffix, for example `🧵 <session> | workspace | codex:gpt-5-codex`.
+- The run-start line includes the session id, execution mode, a compact `provider:model` suffix, and when applicable a compact `skills:` suffix, for example `🧵 <session> | workspace | codex:gpt-5-codex | skills:dstack`.
 - `running` means the provider run is still alive. It is a liveness indicator, not the same thing as reasoning text.
 - The live activity suffix is derived from the highest-priority active provider item, for example `search ...`, `fetch ...`, `use ...`, `edit ...`, or `update plan`.
 - Completed progress lines are normalized across Claude and Codex into shared categories such as reasoning (`💭`), assistant text (`💬`), search (`🔎`), fetch (`🌐`), command (`❱`), file change (`✏️`), plan update (`update plan | ...`), generic tool (`🔧`), and unknown provider event (`📦`).

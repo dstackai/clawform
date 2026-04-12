@@ -21,6 +21,7 @@ Program frontmatter:
 
 - `id` (optional)
 - `model` (optional)
+- `skills` (optional list of required provider-native skills)
 
 ## How `apply` Works
 
@@ -98,6 +99,16 @@ The confirmation preview includes a variables summary, for example: `variables: 
 
 Program variables are defined in frontmatter under `variables` (`NAME: {}` for required, `NAME: { default: "..." }` for optional defaults) and referenced as `${{ var.NAME }}`.
 
+Required provider-native skills can be declared in frontmatter with `skills`, for example:
+
+```yaml
+---
+skills: [dstack]
+---
+```
+
+If a required skill is unavailable, the run fails early. Implementation details and provider-specific behavior are documented in `contrib/ARCHITECTURE.md` and `contrib/DEVELOPMENT.md`.
+
 Example output (will vary by session/model):
 
 ```text
@@ -106,7 +117,7 @@ Last session: 019d5843-eb2d-70b1-b49a-343033117944 (success, 43m ago)
   program: examples/smoke.md unchanged
   changes: 0 files
 Proceed? [y/N] y
-🧵 019d586b-aa65-78b2-8a0d-27b5543c59bb | workspace
+🧵 019d586b-aa65-78b2-8a0d-27b5543c59bb | workspace | claude:sonnet
 ✔ cat examples/smoke.md | 1ms | out
 💬 Verified `example-data/output-smoke.txt:1` already contains the required `SMOKE_OK` line with trailing newline. | msg
 turn 1 | tokens: in=117k out=1.6k cached=107k
