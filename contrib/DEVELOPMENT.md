@@ -105,6 +105,15 @@ cargo run -p clawform -- apply -f examples/smoke.md -p claude
 
 Interactive progress UI is enabled automatically only when stdin/stdout are attached to an interactive terminal.
 
+Current progress semantics:
+
+- Rich mode keeps a spinner plus a live `running` or `running: <activity>` status line.
+- `running` is a liveness indicator. It does not mean the model is explicitly emitting reasoning.
+- Plain mode prints stable progress lines without the interactive spinner/status renderer.
+- Completed provider items are normalized across Claude and Codex into categories such as `💭`, `💬`, `🔎`, `🌐`, `❱`, `✎`, `🗒️`, `🔧`, and `📦`.
+- Unknown provider item types still surface through `🔧` / `📦` fallbacks instead of being silently dropped.
+- `Ctrl+C` should report cancellation rather than dumping raw provider stdout/stderr.
+
 Show provider raw logs (debug mode):
 
 ```bash

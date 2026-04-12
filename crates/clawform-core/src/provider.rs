@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    OnceLock,
+    Arc, Condvar, Mutex, OnceLock,
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -228,6 +228,7 @@ impl ClaudeExecutionMode {
 const PROVIDER_HEARTBEAT_SECS: u64 = 10;
 const PROVIDER_INTERACTIVE_HEARTBEAT_MS: u64 = 800;
 const PROVIDER_INTERACTIVE_POLL_MS: u64 = 250;
+const PROVIDER_INTERACTIVE_SPINNER_MS: u64 = 80;
 const PROVIDER_MAX_ATTEMPTS: usize = 2;
 const PROVIDER_RETRY_BACKOFF_MS: u64 = 1_500;
 const PROVIDER_CANCEL_POLL_MS: u64 = 100;
@@ -579,6 +580,10 @@ fn run_claude_once(
     }
 
     let output = wait_with_output_interruptible(child)?;
+    if interrupt_requested() {
+        clear_interrupt_request();
+        return Err(user_cancelled_error());
+    }
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -677,7 +682,7 @@ fn collect_claude_with_progress(
     let mut raw_stderr = String::new();
     let mut emitted_progress_events = 0usize;
     let mut last_activity = String::new();
-    let mut active_progress_items: Vec<(String, String)> = Vec::new();
+    let mut active_progress_items: Vec<ActiveProgressItem> = Vec::new();
     let mut last_agent_text_line: Option<String> = None;
     let mut item_started_at: HashMap<String, Instant> = HashMap::new();
     let mut usage_totals = ProviderUsage::default();
@@ -747,7 +752,7 @@ fn collect_claude_with_progress(
             join_reader(stderr_handle, "stderr")?;
             printer.finish();
             clear_interrupt_request();
-            return Err(anyhow!("apply cancelled by user (Ctrl-C)"));
+            return Err(user_cancelled_error());
         }
 
         match rx.recv_timeout(poll_interval) {
@@ -964,6 +969,11 @@ fn collect_claude_with_progress(
 
     join_reader(stdout_handle, "stdout")?;
     join_reader(stderr_handle, "stderr")?;
+    if interrupt_requested() {
+        printer.finish();
+        clear_interrupt_request();
+        return Err(user_cancelled_error());
+    }
 
     if render_progress && show_intermediate_steps && emitted_progress_events == 0 {
         printer.print_event("no_live_events");
@@ -1027,7 +1037,7 @@ fn handle_progress_event(
     session_id: &mut Option<String>,
     emitted_progress_events: &mut usize,
     last_activity: &mut String,
-    active_progress_items: &mut Vec<(String, String)>,
+    active_progress_items: &mut Vec<ActiveProgressItem>,
     last_agent_text_line: &mut Option<String>,
     item_started_at: &mut HashMap<String, Instant>,
     usage_totals: &mut ProviderUsage,
@@ -1061,11 +1071,15 @@ fn handle_progress_event(
                 show_intermediate_steps,
             ) {
                 let label = status_activity_label(item_type, summary.as_deref());
+                let priority = progress_activity_priority(item_type);
                 if let Some(id) = item_id.as_ref() {
-                    active_progress_items.retain(|(active_id, _)| active_id != id);
-                    active_progress_items.push((id.clone(), label.clone()));
+                    upsert_active_progress_item(active_progress_items, id, &label, priority);
+                    *last_activity =
+                        best_active_progress_label(active_progress_items).unwrap_or(label);
+                } else {
+                    *last_activity =
+                        preferred_progress_label(active_progress_items, priority, &label);
                 }
-                *last_activity = label;
             }
         }
         ProviderEvent::ItemCompleted {
@@ -1080,12 +1094,10 @@ fn handle_progress_event(
                 show_intermediate_steps,
             ) {
                 if let Some(id) = item_id.as_ref() {
-                    active_progress_items.retain(|(active_id, _)| active_id != id);
+                    remove_active_progress_item(active_progress_items, id);
                 }
-                *last_activity = active_progress_items
-                    .last()
-                    .map(|(_, label)| label.clone())
-                    .unwrap_or_default();
+                *last_activity =
+                    best_active_progress_label(active_progress_items).unwrap_or_default();
             }
         }
         ProviderEvent::TurnCompleted { usage } => {
@@ -1178,6 +1190,63 @@ fn handle_progress_event(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct ActiveProgressItem {
+    id: String,
+    label: String,
+    priority: u8,
+}
+
+fn progress_activity_priority(item_type: &str) -> u8 {
+    match item_type {
+        "todo_list" => 0,
+        "tool_selection" | "command_execution" | "file_change" | "mcp_tool_call" | "web_search"
+        | "web_fetch" => 2,
+        _ => 1,
+    }
+}
+
+fn upsert_active_progress_item(
+    active_progress_items: &mut Vec<ActiveProgressItem>,
+    id: &str,
+    label: &str,
+    priority: u8,
+) {
+    remove_active_progress_item(active_progress_items, id);
+    active_progress_items.push(ActiveProgressItem {
+        id: id.to_string(),
+        label: label.to_string(),
+        priority,
+    });
+}
+
+fn remove_active_progress_item(active_progress_items: &mut Vec<ActiveProgressItem>, id: &str) {
+    active_progress_items.retain(|active| active.id != id);
+}
+
+fn best_active_progress_label(active_progress_items: &[ActiveProgressItem]) -> Option<String> {
+    active_progress_items
+        .iter()
+        .enumerate()
+        .max_by_key(|(index, active)| (active.priority, *index))
+        .map(|(_, active)| active.label.clone())
+}
+
+fn preferred_progress_label(
+    active_progress_items: &[ActiveProgressItem],
+    priority: u8,
+    label: &str,
+) -> String {
+    match active_progress_items
+        .iter()
+        .enumerate()
+        .max_by_key(|(index, active)| (active.priority, *index))
+    {
+        Some((_, active)) if active.priority > priority => active.label.clone(),
+        _ => label.to_string(),
+    }
+}
+
 fn claude_message_id(message: &Value) -> Option<String> {
     message
         .get("id")
@@ -1215,107 +1284,74 @@ fn claude_pending_tool(content: &Value, workspace_root: &Path) -> Option<ClaudeP
     }
     let input = content.get("input").unwrap_or(&Value::Null);
 
-    let (item_type, summary, command, paths, emits_command_output) = match name {
-        "Bash" => {
-            let command = input
-                .get("command")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            let summary = command
-                .as_deref()
-                .map(simplify_command_summary)
-                .or_else(|| {
-                    input
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .map(|desc| truncate_one_line(desc, 180))
-                });
-            (
-                "command_execution".to_string(),
-                summary,
-                command,
-                Vec::new(),
-                true,
-            )
-        }
-        "Read" => {
-            let path = input.get("file_path").and_then(Value::as_str)?;
-            (
-                "command_execution".to_string(),
-                Some(format!(
-                    "read {}",
-                    display_path_in_workspace(path, workspace_root)
-                )),
-                None,
-                Vec::new(),
-                false,
-            )
-        }
-        "Write" => {
-            let path = input.get("file_path").and_then(Value::as_str)?;
-            let path = path.trim().to_string();
-            (
-                "file_change".to_string(),
-                Some(format!(
-                    "write {}",
-                    display_path_in_workspace(path.as_str(), workspace_root)
-                )),
-                None,
-                vec![path],
-                false,
-            )
-        }
-        "Edit" | "NotebookEdit" => {
-            let path = input
-                .get("file_path")
-                .and_then(Value::as_str)
-                .or_else(|| input.get("notebook_path").and_then(Value::as_str))?;
-            let path = path.trim().to_string();
-            (
-                "file_change".to_string(),
-                Some(format!(
-                    "edit {}",
-                    display_path_in_workspace(path.as_str(), workspace_root)
-                )),
-                None,
-                vec![path],
-                false,
-            )
-        }
-        "Glob" => (
+    let canonical_name = canonical_tool_name(name);
+    let (item_type, summary, command, paths, emits_command_output) = match canonical_name.as_str() {
+        "bash" => (
             "command_execution".to_string(),
-            input
-                .get("pattern")
-                .and_then(Value::as_str)
-                .map(|pattern| format!("glob {}", truncate_one_line(pattern, 180))),
+            summarize_named_tool_event(name, input, Some(workspace_root)),
+            extract_tool_command(input),
+            Vec::new(),
+            true,
+        ),
+        "read" => (
+            "command_execution".to_string(),
+            summarize_named_tool_event(name, input, Some(workspace_root)),
             None,
             Vec::new(),
             false,
         ),
-        "Grep" => (
+        "write" => (
+            "file_change".to_string(),
+            summarize_named_tool_event(name, input, Some(workspace_root)),
+            None,
+            named_tool_paths(name, input),
+            false,
+        ),
+        "edit" | "notebookedit" => (
+            "file_change".to_string(),
+            summarize_named_tool_event(name, input, Some(workspace_root)),
+            None,
+            named_tool_paths(name, input),
+            false,
+        ),
+        "glob" | "grep" => (
             "command_execution".to_string(),
-            input
-                .get("pattern")
-                .and_then(Value::as_str)
-                .map(|pattern| format!("grep {}", truncate_one_line(pattern, 180))),
+            summarize_named_tool_event(name, input, Some(workspace_root)),
             None,
             Vec::new(),
             false,
         ),
-        "ToolSearch" | "WebSearch" | "WebFetch" => (
+        "todowrite" => (
+            "todo_list".to_string(),
+            summarize_named_tool_event(name, input, Some(workspace_root)),
+            None,
+            Vec::new(),
+            false,
+        ),
+        "toolsearch" => (
+            "tool_selection".to_string(),
+            summarize_named_tool_event(name, input, Some(workspace_root)),
+            None,
+            Vec::new(),
+            false,
+        ),
+        "websearch" => (
             "web_search".to_string(),
-            input
-                .get("query")
-                .and_then(Value::as_str)
-                .or_else(|| input.get("url").and_then(Value::as_str))
-                .map(|value| truncate_one_line(value, 180)),
+            summarize_named_tool_event(name, input, Some(workspace_root)),
+            None,
+            Vec::new(),
+            false,
+        ),
+        "webfetch" => (
+            "web_fetch".to_string(),
+            summarize_named_tool_event(name, input, Some(workspace_root)),
             None,
             Vec::new(),
             false,
         ),
         _ => (
             "mcp_tool_call".to_string(),
-            Some(format!("tool={}", name)),
+            summarize_named_tool_event(name, input, Some(workspace_root)),
             None,
             Vec::new(),
             false,
@@ -1330,6 +1366,266 @@ fn claude_pending_tool(content: &Value, workspace_root: &Path) -> Option<ClaudeP
         paths,
         emits_command_output,
     })
+}
+
+fn summarize_named_tool_call(name: &str, input: &Value) -> String {
+    let tool_name = name.trim();
+    match summarize_tool_subject(input) {
+        Some(subject) => format!("{}: {}", tool_name, subject),
+        None => tool_name.to_string(),
+    }
+}
+
+fn named_tool_item_type(name: &str) -> &'static str {
+    match canonical_tool_name(name).as_str() {
+        "bash" | "read" | "glob" | "grep" => "command_execution",
+        "write" | "edit" | "notebookedit" => "file_change",
+        "todowrite" => "todo_list",
+        "toolsearch" => "tool_selection",
+        "websearch" => "web_search",
+        "webfetch" => "web_fetch",
+        _ => "mcp_tool_call",
+    }
+}
+
+fn summarize_named_tool_event(
+    name: &str,
+    input: &Value,
+    workspace_root: Option<&Path>,
+) -> Option<String> {
+    match canonical_tool_name(name).as_str() {
+        "bash" => summarize_bash_value(input),
+        "read" => summarize_read_value(input, workspace_root),
+        "write" => summarize_write_value(input, workspace_root),
+        "edit" | "notebookedit" => summarize_edit_value(input, workspace_root),
+        "glob" => summarize_pattern_tool_value("glob", input),
+        "grep" => summarize_pattern_tool_value("grep", input),
+        "todowrite" => summarize_todo_list_value(input),
+        "toolsearch" => summarize_tool_selection_value(input),
+        "websearch" => summarize_web_search_value(input),
+        "webfetch" => summarize_web_fetch_value(input),
+        _ => Some(summarize_named_tool_call(name, input)),
+    }
+}
+
+fn extract_tool_command(value: &Value) -> Option<String> {
+    extract_tool_string(value, &["command"])
+}
+
+fn named_tool_paths(name: &str, value: &Value) -> Vec<String> {
+    let keys = match canonical_tool_name(name).as_str() {
+        "write" => &["file_path", "path"][..],
+        "edit" | "notebookedit" => &["file_path", "notebook_path", "path"][..],
+        _ => return Vec::new(),
+    };
+
+    extract_tool_string(value, keys)
+        .into_iter()
+        .filter_map(|path| {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .collect()
+}
+
+fn summarize_bash_value(value: &Value) -> Option<String> {
+    extract_tool_command(value)
+        .map(|command| simplify_command_summary(command.as_str()))
+        .or_else(|| {
+            extract_tool_string(value, &["description"])
+                .map(|description| truncate_one_line(description.as_str(), 180))
+        })
+}
+
+fn summarize_read_value(value: &Value, workspace_root: Option<&Path>) -> Option<String> {
+    extract_tool_string(value, &["file_path", "path"])
+        .map(|path| format!("read {}", display_tool_path(path.as_str(), workspace_root)))
+}
+
+fn summarize_write_value(value: &Value, workspace_root: Option<&Path>) -> Option<String> {
+    extract_tool_string(value, &["file_path", "path"])
+        .map(|path| format!("write {}", display_tool_path(path.as_str(), workspace_root)))
+}
+
+fn summarize_edit_value(value: &Value, workspace_root: Option<&Path>) -> Option<String> {
+    extract_tool_string(value, &["file_path", "notebook_path", "path"])
+        .map(|path| format!("edit {}", display_tool_path(path.as_str(), workspace_root)))
+}
+
+fn summarize_pattern_tool_value(prefix: &str, value: &Value) -> Option<String> {
+    extract_tool_string(value, &["pattern"])
+        .map(|pattern| format!("{} {}", prefix, truncate_one_line(pattern.as_str(), 180)))
+}
+
+fn summarize_todo_list_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Array(entries) => summarize_todo_entries(entries),
+        Value::String(raw) => summarize_todo_entry_text(raw),
+        Value::Object(_) => {
+            for key in ["todos", "items", "entries", "tasks", "list"] {
+                if let Some(summary) = value.get(key).and_then(summarize_todo_list_value) {
+                    return Some(summary);
+                }
+            }
+
+            for key in ["input", "args", "arguments", "action"] {
+                if let Some(summary) = value.get(key).and_then(summarize_todo_list_value) {
+                    return Some(summary);
+                }
+            }
+
+            extract_tool_string(
+                value,
+                &[
+                    "content",
+                    "text",
+                    "title",
+                    "task",
+                    "description",
+                    "label",
+                    "name",
+                    "prompt",
+                ],
+            )
+            .map(|text| truncate_one_line(text.as_str(), 180))
+        }
+        _ => None,
+    }
+}
+
+fn summarize_todo_entries(entries: &[Value]) -> Option<String> {
+    let labels: Vec<String> = entries.iter().filter_map(summarize_todo_entry).collect();
+    let first = labels.first()?;
+    if labels.len() == 1 {
+        return Some(first.clone());
+    }
+    Some(format!("{} (+{} more)", first, labels.len() - 1))
+}
+
+fn summarize_todo_entry(value: &Value) -> Option<String> {
+    match value {
+        Value::String(raw) => summarize_todo_entry_text(raw),
+        Value::Object(_) => {
+            for key in ["todo", "item", "entry", "task"] {
+                if let Some(summary) = value.get(key).and_then(summarize_todo_entry) {
+                    return Some(summary);
+                }
+            }
+
+            extract_tool_string(
+                value,
+                &[
+                    "content",
+                    "text",
+                    "title",
+                    "task",
+                    "description",
+                    "label",
+                    "name",
+                    "prompt",
+                ],
+            )
+            .map(|text| truncate_one_line(text.as_str(), 180))
+        }
+        _ => None,
+    }
+}
+
+fn summarize_todo_entry_text(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_one_line(trimmed, 180))
+}
+
+fn display_tool_path(raw_path: &str, workspace_root: Option<&Path>) -> String {
+    match workspace_root {
+        Some(root) => display_path_in_workspace(raw_path, root),
+        None => to_slash_path(Path::new(raw_path.trim())),
+    }
+}
+
+fn extract_tool_string(value: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(text) = value.get(*key).and_then(Value::as_str) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    for parent in ["input", "args", "arguments", "action"] {
+        if let Some(nested) = value.get(parent) {
+            if let Some(text) = extract_tool_string_from_nested(nested, keys) {
+                return Some(text);
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_tool_string_from_nested(value: &Value, keys: &[&str]) -> Option<String> {
+    match value {
+        Value::Object(_) => extract_tool_string(value, keys),
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if !matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'[')) {
+                return None;
+            }
+            let parsed = serde_json::from_str::<Value>(trimmed).ok()?;
+            extract_tool_string(&parsed, keys)
+        }
+        _ => None,
+    }
+}
+
+fn summarize_tool_selection_value(value: &Value) -> Option<String> {
+    extract_tool_string(value, &["query"])
+        .as_deref()
+        .and_then(summarize_tool_selection_query)
+        .or_else(|| {
+            nested_first_array_value_str(value, "action", "queries")
+                .and_then(summarize_tool_selection_query)
+        })
+}
+
+fn summarize_tool_selection_query(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = strip_ascii_case_prefix(trimmed, "select:") {
+        let items: Vec<&str> = rest
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .collect();
+        if !items.is_empty() {
+            return Some(truncate_one_line(&items.join(", "), 180));
+        }
+    }
+
+    Some(truncate_one_line(trimmed, 180))
+}
+
+fn strip_ascii_case_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    if value.len() < prefix.len() {
+        return None;
+    }
+    let (head, tail) = value.split_at(prefix.len());
+    if head.eq_ignore_ascii_case(prefix) {
+        Some(tail)
+    } else {
+        None
+    }
 }
 
 fn claude_command_output_payload(
@@ -1710,6 +2006,10 @@ fn run_codex_once(
     }
 
     let output = wait_with_output_interruptible(child)?;
+    if interrupt_requested() {
+        clear_interrupt_request();
+        return Err(user_cancelled_error());
+    }
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let fallback_session_id = format!("local-{}", now_unix_millis());
@@ -1932,7 +2232,7 @@ fn collect_with_progress(
     let mut raw_stderr = String::new();
     let mut emitted_progress_events = 0usize;
     let mut last_activity = String::new();
-    let mut active_progress_items: Vec<(String, String)> = Vec::new();
+    let mut active_progress_items: Vec<ActiveProgressItem> = Vec::new();
     let mut last_agent_text_line: Option<String> = None;
     let mut item_started_at: HashMap<String, Instant> = HashMap::new();
     let mut usage_totals = ProviderUsage::default();
@@ -1968,7 +2268,7 @@ fn collect_with_progress(
             join_reader(stderr_handle, "stderr")?;
             printer.finish();
             clear_interrupt_request();
-            return Err(anyhow!("apply cancelled by user (Ctrl-C)"));
+            return Err(user_cancelled_error());
         }
 
         match rx.recv_timeout(poll_interval) {
@@ -2019,12 +2319,24 @@ fn collect_with_progress(
                                 ) {
                                     let label =
                                         status_activity_label(item_type, summary.as_deref());
+                                    let priority = progress_activity_priority(item_type);
                                     if let Some(id) = item_id.as_ref() {
-                                        active_progress_items
-                                            .retain(|(active_id, _)| active_id != id);
-                                        active_progress_items.push((id.clone(), label.clone()));
+                                        upsert_active_progress_item(
+                                            &mut active_progress_items,
+                                            id,
+                                            &label,
+                                            priority,
+                                        );
+                                        last_activity =
+                                            best_active_progress_label(&active_progress_items)
+                                                .unwrap_or(label);
+                                    } else {
+                                        last_activity = preferred_progress_label(
+                                            &active_progress_items,
+                                            priority,
+                                            &label,
+                                        );
                                     }
-                                    last_activity = label;
                                 }
                             }
                             ProviderEvent::ItemCompleted {
@@ -2040,13 +2352,11 @@ fn collect_with_progress(
                                     show_intermediate_steps,
                                 ) {
                                     if let Some(id) = item_id.as_ref() {
-                                        active_progress_items
-                                            .retain(|(active_id, _)| active_id != id);
+                                        remove_active_progress_item(&mut active_progress_items, id);
                                     }
-                                    last_activity = active_progress_items
-                                        .last()
-                                        .map(|(_, label)| label.clone())
-                                        .unwrap_or_default();
+                                    last_activity =
+                                        best_active_progress_label(&active_progress_items)
+                                            .unwrap_or_default();
                                 }
                             }
                             ProviderEvent::TurnCompleted { ref usage } => {
@@ -2185,6 +2495,11 @@ fn collect_with_progress(
 
     join_reader(stdout_handle, "stdout")?;
     join_reader(stderr_handle, "stderr")?;
+    if interrupt_requested() {
+        printer.finish();
+        clear_interrupt_request();
+        return Err(user_cancelled_error());
+    }
 
     if render_progress && show_intermediate_steps && emitted_progress_events == 0 {
         printer.print_event("no_live_events");
@@ -2281,11 +2596,7 @@ fn item_completion_duration_label(
         _ => return None,
     };
 
-    if item_type != "command_execution"
-        && item_type != "file_change"
-        && item_type != "mcp_tool_call"
-        && item_type != "web_search"
-    {
+    if is_reasoning_item_type(item_type) || is_agent_text_item_type(item_type) {
         return None;
     }
 
@@ -2297,7 +2608,15 @@ fn add_completion_duration_suffix(line: &str, duration: Option<String>) -> Strin
     let Some(d) = duration else {
         return line.to_string();
     };
-    if line.strip_prefix("✔ ").is_some() {
+    if line.strip_prefix("✔ ").is_some()
+        || line.starts_with("❱")
+        || line.starts_with("✎")
+        || line.starts_with("🗒️")
+        || line.starts_with("🔧")
+        || line.starts_with("🔎")
+        || line.starts_with("🌐")
+        || line.starts_with("📦")
+    {
         return format!("{} | {}", line, d);
     }
     line.to_string()
@@ -2438,7 +2757,7 @@ fn extract_command_output_payload(line: &str) -> Option<CommandOutputPayload> {
         return None;
     }
     let item = value.get("item")?;
-    if item.get("type").and_then(Value::as_str) != Some("command_execution") {
+    if normalize_codex_item_type(item) != "command_execution" {
         return None;
     }
     let item_id = item.get("id").and_then(Value::as_str)?.trim().to_string();
@@ -2454,10 +2773,11 @@ fn extract_command_output_payload(line: &str) -> Option<CommandOutputPayload> {
         return None;
     }
 
-    let command = item
-        .get("command")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
+    let command = extract_tool_command(item).or_else(|| {
+        item.get("command")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    });
 
     Some(CommandOutputPayload {
         item_id,
@@ -2515,7 +2835,7 @@ fn extract_file_change_payload(line: &str) -> Option<FileChangePayload> {
     }
 
     let item = value.get("item")?;
-    if item.get("type").and_then(Value::as_str) != Some("file_change") {
+    if normalize_codex_item_type(item) != "file_change" {
         return None;
     }
 
@@ -2540,6 +2860,12 @@ fn extract_file_change_payload(line: &str) -> Option<FileChangePayload> {
             if !trimmed.is_empty() {
                 paths.push(trimmed.to_string());
             }
+        }
+    }
+
+    if paths.is_empty() {
+        if let Some(tool_name) = normalized_tool_name_for_item(item) {
+            paths.extend(named_tool_paths(tool_name, item));
         }
     }
 
@@ -2631,7 +2957,7 @@ fn wait_with_output_interruptible(mut child: std::process::Child) -> Result<std:
                 .wait_with_output()
                 .context("failed while collecting provider output after cancellation")?;
             clear_interrupt_request();
-            return Err(anyhow!("apply cancelled by user (Ctrl-C)"));
+            return Err(user_cancelled_error());
         }
 
         if child
@@ -2668,6 +2994,10 @@ pub(crate) fn interrupt_requested() -> bool {
 
 pub(crate) fn clear_interrupt_request() {
     INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
+}
+
+fn user_cancelled_error() -> anyhow::Error {
+    anyhow!("apply cancelled by user (Ctrl-C)")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2748,32 +3078,27 @@ fn parse_codex_stream_line(line: &str) -> Option<ProviderEvent> {
         }),
         "item.started" | "item.updated" | "item.completed" => {
             let item = value.get("item").unwrap_or(&Value::Null);
-            let item_type = item
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string();
+            let normalized = normalize_codex_item(item);
             let item_id = item
                 .get("id")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
-            let summary = summarize_item(item);
 
             match event_type {
                 "item.started" => Some(ProviderEvent::ItemStarted {
-                    item_type,
+                    item_type: normalized.item_type,
                     item_id,
-                    summary,
+                    summary: normalized.summary,
                 }),
                 "item.updated" => Some(ProviderEvent::ItemUpdated {
-                    item_type,
+                    item_type: normalized.item_type,
                     item_id,
-                    summary,
+                    summary: normalized.summary,
                 }),
                 _ => Some(ProviderEvent::ItemCompleted {
-                    item_type,
+                    item_type: normalized.item_type,
                     item_id,
-                    summary,
+                    summary: normalized.summary,
                 }),
             }
         }
@@ -2784,6 +3109,71 @@ fn parse_codex_stream_line(line: &str) -> Option<ProviderEvent> {
             provider_event_type: event_type.to_string(),
         }),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedCodexItem {
+    item_type: String,
+    summary: Option<String>,
+}
+
+fn normalize_codex_item(item: &Value) -> NormalizedCodexItem {
+    let item_type = normalize_codex_item_type(item);
+    let summary = summarize_codex_item(item, item_type.as_str());
+    NormalizedCodexItem { item_type, summary }
+}
+
+fn normalize_codex_item_type(item: &Value) -> String {
+    let raw_item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+
+    if is_reasoning_item_type(raw_item_type)
+        || is_agent_text_item_type(raw_item_type)
+        || matches!(
+            raw_item_type,
+            "command_execution"
+                | "file_change"
+                | "mcp_tool_call"
+                | "tool_selection"
+                | "web_search"
+                | "web_fetch"
+                | "todo_list"
+        )
+    {
+        return raw_item_type.to_string();
+    }
+
+    let raw_named_type = named_tool_item_type(raw_item_type);
+    if raw_named_type != "mcp_tool_call" {
+        return raw_named_type.to_string();
+    }
+
+    if let Some(tool_name) = normalized_tool_name_for_item(item) {
+        let tool_item_type = named_tool_item_type(tool_name);
+        if tool_item_type != "mcp_tool_call" {
+            return tool_item_type.to_string();
+        }
+    }
+
+    if is_codex_tool_selection_item(raw_item_type, item) {
+        return "tool_selection".to_string();
+    }
+
+    if is_codex_web_fetch_item(raw_item_type, item) {
+        return "web_fetch".to_string();
+    }
+
+    if is_codex_search_item(raw_item_type, item) {
+        return "web_search".to_string();
+    }
+
+    if is_codex_tool_item(raw_item_type, item) {
+        return "mcp_tool_call".to_string();
+    }
+
+    raw_item_type.to_string()
 }
 
 fn parse_usage(value: &Value) -> ProviderUsage {
@@ -2811,7 +3201,41 @@ fn extract_error_message(value: &Value) -> Option<String> {
         })
 }
 
-fn summarize_item(item: &Value) -> Option<String> {
+fn summarize_codex_item(item: &Value, item_type: &str) -> Option<String> {
+    match item_type {
+        "tool_selection" => {
+            if let Some(summary) = summarize_tool_selection_value(item) {
+                return Some(summary);
+            }
+        }
+        "web_search" => {
+            if let Some(summary) = summarize_web_search_value(item) {
+                return Some(summary);
+            }
+        }
+        "web_fetch" => {
+            if let Some(summary) = summarize_web_fetch_value(item) {
+                return Some(summary);
+            }
+        }
+        "todo_list" => {
+            if let Some(summary) = summarize_todo_list_value(item) {
+                return Some(summary);
+            }
+        }
+        "mcp_tool_call" => {
+            if let Some(summary) = summarize_tool_call_item(item) {
+                return Some(summary);
+            }
+        }
+        "file_change" => {
+            if let Some(summary) = summarize_file_change_item(item) {
+                return Some(summary);
+            }
+        }
+        _ => {}
+    }
+
     if let Some(text) = item.get("text").and_then(Value::as_str) {
         return Some(truncate_one_line(text, 120));
     }
@@ -2820,25 +3244,250 @@ fn summarize_item(item: &Value) -> Option<String> {
         return Some(simplify_command_summary(command));
     }
 
-    if item.get("type").and_then(Value::as_str) == Some("file_change") {
-        if let Some(summary) = summarize_file_change_item(item) {
-            return Some(summary);
-        }
-    }
-
     if let Some(path) = item.get("path").and_then(Value::as_str) {
         return Some(format!("path={}", path));
     }
 
-    if let Some(tool_name) = item
-        .get("tool_name")
-        .and_then(Value::as_str)
-        .or_else(|| item.get("name").and_then(Value::as_str))
-    {
-        return Some(format!("tool={}", tool_name));
+    if let Some(summary) = summarize_tool_call_item(item) {
+        return Some(summary);
     }
 
     None
+}
+
+fn summarize_web_search_value(value: &Value) -> Option<String> {
+    extract_tool_string(value, &["query", "url"])
+        .map(|text| truncate_one_line(text.as_str(), 180))
+        .or_else(|| {
+            nested_first_array_value_str(value, "action", "queries")
+                .map(|query| truncate_one_line(query, 180))
+        })
+}
+
+fn summarize_web_fetch_value(value: &Value) -> Option<String> {
+    extract_tool_string(value, &["url", "query"]).map(|text| truncate_one_line(text.as_str(), 180))
+}
+
+fn summarize_tool_call_item(item: &Value) -> Option<String> {
+    normalized_tool_name_for_item(item)
+        .and_then(|tool_name| summarize_named_tool_event(tool_name, item, None))
+}
+
+fn summarize_tool_subject(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(_) => summarize_tool_subject_object(value),
+        Value::String(raw) => summarize_tool_subject_string(raw),
+        _ => None,
+    }
+}
+
+fn summarize_tool_subject_object(value: &Value) -> Option<String> {
+    if let Some(query) = extract_tool_string(value, &["query"]) {
+        return Some(truncate_one_line(query.as_str(), 180));
+    }
+    if let Some(url) = extract_tool_string(value, &["url"]) {
+        return Some(truncate_one_line(url.as_str(), 180));
+    }
+    if let Some(path) = extract_tool_string(value, &["path", "file_path", "notebook_path"]) {
+        return Some(truncate_one_line(
+            &to_slash_path(Path::new(path.as_str())),
+            180,
+        ));
+    }
+    if let Some(pattern) = extract_tool_string(value, &["pattern"]) {
+        return Some(truncate_one_line(pattern.as_str(), 180));
+    }
+    if let Some(command) = extract_tool_string(value, &["command"]) {
+        return Some(simplify_command_summary(command.as_str()));
+    }
+    if let Some(subject) = extract_tool_string(
+        value,
+        &[
+            "question",
+            "prompt",
+            "description",
+            "message",
+            "title",
+            "content",
+            "task",
+            "note",
+            "schedule",
+            "expression",
+            "cron_expression",
+            "cron",
+        ],
+    ) {
+        return Some(truncate_one_line(subject.as_str(), 180));
+    }
+
+    None
+}
+
+fn summarize_tool_subject_string(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'[')) {
+        if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+            if let Some(subject) = summarize_tool_subject(&parsed) {
+                return Some(subject);
+            }
+        }
+    }
+
+    Some(truncate_one_line(trimmed, 180))
+}
+
+fn is_codex_tool_selection_item(raw_item_type: &str, item: &Value) -> bool {
+    let raw = raw_item_type.trim().to_ascii_lowercase();
+    raw == "tool_selection"
+        || raw == "tool_search"
+        || raw == "toolsearch"
+        || codex_tool_name(item, raw_item_type)
+            .map(is_tool_selection_name)
+            .unwrap_or(false)
+}
+
+fn is_codex_web_fetch_item(raw_item_type: &str, item: &Value) -> bool {
+    let raw = raw_item_type.trim().to_ascii_lowercase();
+    if matches!(raw.as_str(), "web_fetch" | "fetch") {
+        return true;
+    }
+
+    if codex_tool_name(item, raw_item_type)
+        .map(is_web_fetch_name)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    matches!(
+        nested_value_str(item, "action", "type").map(|value| value.to_ascii_lowercase()),
+        Some(action_type) if action_type == "fetch"
+    )
+}
+
+fn is_codex_search_item(raw_item_type: &str, item: &Value) -> bool {
+    let raw = raw_item_type.trim().to_ascii_lowercase();
+    if matches!(raw.as_str(), "web_search" | "search") {
+        return true;
+    }
+
+    if let Some(tool_name) = codex_tool_name(item, raw_item_type) {
+        if is_web_search_name(tool_name) {
+            return true;
+        }
+    }
+
+    matches!(
+        nested_value_str(item, "action", "type").map(|value| value.to_ascii_lowercase()),
+        Some(action_type) if action_type == "search"
+    )
+}
+
+fn is_codex_tool_item(raw_item_type: &str, item: &Value) -> bool {
+    let raw = raw_item_type.trim().to_ascii_lowercase();
+    if named_tool_item_type(raw_item_type) != "mcp_tool_call" {
+        return true;
+    }
+    if raw == "mcp_tool_call"
+        || raw == "tool_call"
+        || raw.ends_with("_tool_call")
+        || raw.contains("mcp")
+    {
+        return true;
+    }
+
+    codex_tool_name(item, raw_item_type)
+        .map(|tool_name| {
+            !is_tool_selection_name(tool_name)
+                && !is_web_search_name(tool_name)
+                && !is_web_fetch_name(tool_name)
+        })
+        .unwrap_or(false)
+}
+
+fn normalized_tool_name_for_item<'a>(item: &'a Value) -> Option<&'a str> {
+    let raw_item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("mcp_tool_call");
+
+    codex_tool_name(item, raw_item_type).or_else(|| {
+        if named_tool_item_type(raw_item_type) != "mcp_tool_call" {
+            Some(raw_item_type.trim())
+        } else {
+            None
+        }
+    })
+}
+
+fn canonical_tool_name(name: &str) -> String {
+    name.trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_tool_selection_name(name: &str) -> bool {
+    canonical_tool_name(name) == "toolsearch"
+}
+
+fn is_web_search_name(name: &str) -> bool {
+    canonical_tool_name(name) == "websearch"
+}
+
+fn is_web_fetch_name(name: &str) -> bool {
+    canonical_tool_name(name) == "webfetch"
+}
+
+fn codex_tool_name<'a>(item: &'a Value, raw_item_type: &str) -> Option<&'a str> {
+    if let Some(tool_name) = value_str(item, "tool_name") {
+        return Some(tool_name);
+    }
+
+    let raw = raw_item_type.trim().to_ascii_lowercase();
+    let has_tool_context = raw.contains("tool")
+        || raw.contains("mcp")
+        || item.get("input").is_some()
+        || item.get("arguments").is_some()
+        || item.get("args").is_some()
+        || item.get("action").is_some();
+    if !has_tool_context {
+        return None;
+    }
+
+    value_str(item, "name")
+}
+
+fn value_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn nested_value_str<'a>(value: &'a Value, parent: &str, key: &str) -> Option<&'a str> {
+    value
+        .get(parent)
+        .and_then(|nested| nested.get(key))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn nested_first_array_value_str<'a>(value: &'a Value, parent: &str, key: &str) -> Option<&'a str> {
+    value
+        .get(parent)
+        .and_then(|nested| nested.get(key))
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.iter().find_map(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 fn summarize_file_change_item(item: &Value) -> Option<String> {
@@ -3020,7 +3669,7 @@ fn format_terminal_event(
             provider_event_type,
         } => {
             if verbose_events {
-                Some(provider_event_type.clone())
+                Some(format_unknown_raw_event_line(provider_event_type))
             } else {
                 None
             }
@@ -3063,29 +3712,92 @@ fn format_item_event(
         return Some(format!("💬 {}", truncate_one_line(text, 180)));
     }
 
-    let kind = match item_type {
-        "command_execution" => "cmd",
-        "file_change" => "file",
-        "mcp_tool_call" => "tool",
-        "web_search" => "search",
-        "todo_list" => "todo",
-        _ => return None,
+    if matches!(item_type, "tool_selection" | "mcp_tool_call") {
+        return Some(format_symbol_item_line("🔧", summary));
+    }
+    if item_type == "web_search" {
+        return Some(format_symbol_item_line("🔎", summary));
+    }
+    if item_type == "web_fetch" {
+        return Some(format_symbol_item_line("🌐", summary));
+    }
+    if item_type == "todo_list" {
+        return Some(format_todo_item_line(summary));
+    }
+
+    let symbol = match item_type {
+        "command_execution" => "❱",
+        "file_change" => "✎",
+        _ => return Some(format_unknown_item_line(item_type, summary)),
     };
 
     let _ = phase;
     let _ = item_id;
-    let summary = summary?.trim();
-    if !show_housekeeping
-        && (kind == "cmd" || kind == "file")
-        && is_clawform_housekeeping_summary(summary)
-    {
-        return None;
-    }
-    if kind == "cmd" {
-        return Some(format!("✔ {}", summary));
+    let summary = summary.map(str::trim).filter(|text| !text.is_empty());
+    if let Some(summary) = summary {
+        if !show_housekeeping
+            && matches!(item_type, "command_execution" | "file_change")
+            && is_clawform_housekeeping_summary(summary)
+        {
+            return None;
+        }
+        return Some(format_symbol_item_line(symbol, Some(summary)));
     }
 
-    Some(format!("✔ {} {}", kind, summary))
+    if item_type == "command_execution" {
+        return None;
+    }
+
+    Some(symbol.to_string())
+}
+
+fn format_symbol_item_line(symbol: &str, summary: Option<&str>) -> String {
+    match summary.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(summary) => format!("{} {}", symbol, summary),
+        None => symbol.to_string(),
+    }
+}
+
+fn format_todo_item_line(summary: Option<&str>) -> String {
+    match summary.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(summary) => format!("🗒️ plan: {}", truncate_one_line(summary, 180)),
+        None => "🗒️ plan updated".to_string(),
+    }
+}
+
+fn format_unknown_item_line(item_type: &str, summary: Option<&str>) -> String {
+    let symbol = if is_tool_like_item_type(item_type) {
+        "🔧"
+    } else {
+        "📦"
+    };
+    let label = display_item_type_label(item_type);
+    match summary.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(summary) => format!("{} {}: {}", symbol, label, truncate_one_line(summary, 180)),
+        None => format!("{} {}", symbol, label),
+    }
+}
+
+fn format_unknown_raw_event_line(provider_event_type: &str) -> String {
+    format!("📦 event {}", display_item_type_label(provider_event_type))
+}
+
+fn is_tool_like_item_type(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "tool_selection" | "mcp_tool_call" | "web_search" | "web_fetch"
+    ) || {
+        let lower = item_type.trim().to_ascii_lowercase();
+        lower.contains("tool") || lower.contains("mcp")
+    }
+}
+
+fn display_item_type_label(item_type: &str) -> String {
+    let trimmed = item_type.trim();
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+    truncate_one_line(trimmed, 48)
 }
 
 fn is_agent_text_item_type(item_type: &str) -> bool {
@@ -3209,19 +3921,40 @@ fn format_token_compact(value: u64) -> String {
 }
 
 fn status_activity_label(item_type: &str, summary: Option<&str>) -> String {
-    match (item_type, summary) {
-        ("command_execution", Some(summary)) => truncate_one_line(summary, 56),
-        ("file_change", Some(summary)) => format!("file: {}", truncate_one_line(summary, 48)),
-        ("mcp_tool_call", Some(summary)) => format!("tool: {}", truncate_one_line(summary, 48)),
-        ("web_search", Some(summary)) => format!("search: {}", truncate_one_line(summary, 48)),
-        ("todo_list", Some(summary)) => format!("todo: {}", truncate_one_line(summary, 48)),
+    let summary = summary
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| truncate_one_line(text, 48));
+
+    match (item_type, summary.as_deref()) {
+        ("tool_selection", Some(summary)) => format!("select {}", summary),
+        ("command_execution", Some(summary)) => summary.to_string(),
+        ("file_change", Some(summary)) => summary.to_string(),
+        ("mcp_tool_call", Some(summary)) => format!("use {}", summary),
+        ("web_search", Some(summary)) => format!("search {}", summary),
+        ("web_fetch", Some(summary)) => format!("fetch {}", summary),
+        ("todo_list", Some(_)) => "update plan".to_string(),
+        ("tool_selection", None) => "select".to_string(),
         ("command_execution", None) => "command".to_string(),
         ("file_change", None) => "file change".to_string(),
-        ("mcp_tool_call", None) => "tool call".to_string(),
+        ("mcp_tool_call", None) => "use tool".to_string(),
         ("web_search", None) => "search".to_string(),
-        ("todo_list", None) => "todo".to_string(),
-        (_, Some(summary)) => truncate_one_line(summary, 56),
-        (_, None) => "working".to_string(),
+        ("web_fetch", None) => "fetch".to_string(),
+        ("todo_list", None) => "update plan".to_string(),
+        (_, Some(summary)) => format_unknown_status_activity(item_type, Some(summary)),
+        (_, None) => format_unknown_status_activity(item_type, None),
+    }
+}
+
+fn format_unknown_status_activity(item_type: &str, summary: Option<&str>) -> String {
+    let label = display_item_type_label(item_type);
+    match summary.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(summary) if is_tool_like_item_type(item_type) => {
+            format!("tool {}: {}", label, truncate_one_line(summary, 48))
+        }
+        Some(summary) => format!("{}: {}", label, truncate_one_line(summary, 48)),
+        None if is_tool_like_item_type(item_type) => format!("tool {}", label),
+        None => label,
     }
 }
 
@@ -3248,21 +3981,52 @@ fn should_count_item_progress(
     }
 }
 
-#[derive(Debug)]
 struct ProgressPrinter {
     interactive: bool,
+    shared: Arc<(Mutex<ProgressPrinterState>, Condvar)>,
+    spinner_thread: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+struct ProgressPrinterState {
     status_line: Option<String>,
     spinner_idx: usize,
     cursor_hidden: bool,
+    shutdown: bool,
 }
 
 impl ProgressPrinter {
     fn new(prefer_interactive: bool) -> Self {
+        Self::new_inner(prefer_interactive && std::io::stdout().is_terminal(), true)
+    }
+
+    #[cfg(test)]
+    fn new_test(interactive: bool) -> Self {
+        Self::new_inner(interactive, false)
+    }
+
+    fn new_inner(interactive: bool, spawn_spinner_thread: bool) -> Self {
+        let shared = Arc::new((
+            Mutex::new(ProgressPrinterState {
+                status_line: None,
+                spinner_idx: 0,
+                cursor_hidden: false,
+                shutdown: false,
+            }),
+            Condvar::new(),
+        ));
+
+        let spinner_thread = if interactive && spawn_spinner_thread {
+            let shared = Arc::clone(&shared);
+            Some(thread::spawn(move || spinner_redraw_loop(shared)))
+        } else {
+            None
+        };
+
         Self {
-            interactive: prefer_interactive && std::io::stdout().is_terminal(),
-            status_line: None,
-            spinner_idx: 0,
-            cursor_hidden: false,
+            interactive,
+            shared,
+            spinner_thread,
         }
     }
 
@@ -3273,126 +4037,222 @@ impl ProgressPrinter {
     fn print_event(&mut self, line: &str) {
         let rendered = self.render_event_line(line);
         if self.interactive {
-            self.clear_line();
+            let (lock, condvar) = &*self.shared;
+            let mut state = lock.lock().expect("progress printer mutex poisoned");
+            Self::clear_line_locked();
             println!("{}", rendered);
-            self.redraw_status();
+            if state.status_line.is_some() {
+                Self::redraw_status_locked(&mut state);
+            }
+            condvar.notify_one();
         } else {
             println!("{}", rendered);
         }
     }
 
     fn print_status(&mut self, line: &str) {
-        self.status_line = Some(line.to_string());
+        if !self.interactive && line.trim().is_empty() {
+            return;
+        }
         if self.interactive {
-            self.hide_cursor();
-            self.clear_line();
-            self.redraw_status();
+            let (lock, condvar) = &*self.shared;
+            let mut state = lock.lock().expect("progress printer mutex poisoned");
+            state.status_line = Some(line.to_string());
+            Self::hide_cursor_locked(&mut state);
+            Self::clear_line_locked();
+            Self::redraw_status_locked(&mut state);
+            condvar.notify_one();
         } else {
             println!("{}", line);
         }
     }
 
     fn finish(&mut self) {
-        if self.interactive && self.status_line.is_some() {
-            self.clear_line();
-            self.status_line = None;
+        if self.interactive {
+            let (lock, condvar) = &*self.shared;
+            if let Ok(mut state) = lock.lock() {
+                if state.status_line.is_some() {
+                    Self::clear_line_locked();
+                    state.status_line = None;
+                }
+                Self::show_cursor_locked(&mut state);
+                state.shutdown = true;
+                condvar.notify_one();
+            }
         }
-        self.show_cursor();
+        if let Some(handle) = self.spinner_thread.take() {
+            let _ = handle.join();
+        }
     }
 
-    fn redraw_status(&mut self) {
-        if let Some(status) = self.status_line.clone() {
-            print!(
-                "\x1b[36m{}\x1b[0m {}",
-                self.next_spinner(),
-                self.render_status_line(&status)
-            );
+    fn redraw_status_locked(state: &mut ProgressPrinterState) {
+        if let Some(status) = state.status_line.clone() {
+            let spinner = next_spinner_frame(&mut state.spinner_idx);
+            let rendered = render_status_line_interactive(&status);
+            if rendered.trim().is_empty() {
+                print!("\x1b[32m{}\x1b[0m", spinner);
+            } else {
+                print!("\x1b[32m{}\x1b[0m {}", spinner, rendered);
+            }
             let _ = std::io::stdout().flush();
         }
     }
 
-    fn clear_line(&self) {
+    fn clear_line_locked() {
         print!("\r\x1b[2K");
         let _ = std::io::stdout().flush();
     }
 
-    fn hide_cursor(&mut self) {
-        if !self.interactive || self.cursor_hidden {
+    fn hide_cursor_locked(state: &mut ProgressPrinterState) {
+        if state.cursor_hidden {
             return;
         }
         print!("\x1b[?25l");
         let _ = std::io::stdout().flush();
-        self.cursor_hidden = true;
+        state.cursor_hidden = true;
     }
 
-    fn show_cursor(&mut self) {
-        if !self.interactive || !self.cursor_hidden {
+    fn show_cursor_locked(state: &mut ProgressPrinterState) {
+        if !state.cursor_hidden {
             return;
         }
         print!("\x1b[?25h");
         let _ = std::io::stdout().flush();
-        self.cursor_hidden = false;
-    }
-
-    fn next_spinner(&mut self) -> char {
-        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-        let frame = FRAMES[self.spinner_idx % FRAMES.len()];
-        self.spinner_idx = self.spinner_idx.wrapping_add(1);
-        frame
+        state.cursor_hidden = false;
     }
 
     fn render_event_line(&self, line: &str) -> String {
         if !self.interactive {
             return line.to_string();
         }
-
-        if let Some(rest) = line.strip_prefix("✔ ") {
-            return format!("\x1b[32m✔\x1b[0m {}", colorize_done_payload(rest));
-        }
-        if let Some(rest) = line.strip_prefix("💬 ") {
-            return format!("\x1b[35m💬\x1b[0m {}", colorize_paths(rest));
-        }
-        if let Some(rest) = line.strip_prefix("💭 ") {
-            return format!("\x1b[34m💭\x1b[0m {}", colorize_paths(rest));
-        }
-        if line.starts_with("turn ") && line.contains(" | tokens: ") {
-            return format_turn_usage_event_line(line, true);
-        }
-        if let Some(rest) = line.strip_prefix("🧵 session ") {
-            return format!("\x1b[36m🧵\x1b[0m {}", colorize_session_payload(rest));
-        }
-        if let Some(rest) = line.strip_prefix("🧵 ") {
-            return format!("\x1b[36m🧵\x1b[0m {}", colorize_session_payload(rest));
-        }
-        if let Some(rest) = line.strip_prefix("session ") {
-            return format!("\x1b[2msession\x1b[0m {}", colorize_session_payload(rest));
-        }
-        if line.starts_with("turn.failed") || line.starts_with("error |") {
-            return format!("\x1b[31m{}\x1b[0m", line);
-        }
-        if line.starts_with("startup_hint") {
-            return format!("\x1b[33m{}\x1b[0m", line);
-        }
-
-        colorize_paths(line)
+        render_event_line_interactive(line)
     }
 
+    #[cfg(test)]
     fn render_status_line(&self, line: &str) -> String {
         if !self.interactive {
             return line.to_string();
         }
-
-        if let Some(rest) = line.strip_prefix("running: ") {
-            return format!("\x1b[2mrunning\x1b[0m: {}", colorize_paths(rest));
-        }
-        colorize_paths(line)
+        render_status_line_interactive(line)
     }
 }
 
 impl Drop for ProgressPrinter {
     fn drop(&mut self) {
-        self.show_cursor();
+        self.finish();
     }
+}
+
+fn spinner_redraw_loop(shared: Arc<(Mutex<ProgressPrinterState>, Condvar)>) {
+    let (lock, condvar) = &*shared;
+    let mut state = lock.lock().expect("progress printer mutex poisoned");
+
+    loop {
+        if state.shutdown {
+            break;
+        }
+
+        if state.status_line.is_none() {
+            state = condvar
+                .wait(state)
+                .expect("progress printer condvar wait poisoned");
+            continue;
+        }
+
+        let (next_state, wait_result) = condvar
+            .wait_timeout(
+                state,
+                Duration::from_millis(PROVIDER_INTERACTIVE_SPINNER_MS),
+            )
+            .expect("progress printer timed wait poisoned");
+        state = next_state;
+
+        if state.shutdown {
+            break;
+        }
+
+        if state.status_line.is_some() && wait_result.timed_out() {
+            ProgressPrinter::clear_line_locked();
+            ProgressPrinter::redraw_status_locked(&mut state);
+        }
+    }
+}
+
+fn next_spinner_frame(spinner_idx: &mut usize) -> &'static str {
+    const FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+    let frame = FRAMES[*spinner_idx % FRAMES.len()];
+    *spinner_idx = (*spinner_idx).wrapping_add(1);
+    frame
+}
+
+fn render_event_line_interactive(line: &str) -> String {
+    if let Some(rest) = line.strip_prefix("✔ ") {
+        return format!("\x1b[32m✔\x1b[0m {}", colorize_done_payload(rest));
+    }
+    if let Some(rendered) = render_emoji_done_line(line, "❱", "\x1b[32m") {
+        return rendered;
+    }
+    if let Some(rendered) = render_emoji_done_line(line, "✎", "\x1b[32m") {
+        return rendered;
+    }
+    if let Some(rendered) = render_emoji_done_line(line, "🗒️", "\x1b[36m") {
+        return rendered;
+    }
+    if let Some(rest) = line.strip_prefix("💬 ") {
+        return format!("\x1b[35m💬\x1b[0m {}", colorize_paths(rest));
+    }
+    if let Some(rest) = line.strip_prefix("💭 ") {
+        return format!("\x1b[34m💭\x1b[0m {}", colorize_paths(rest));
+    }
+    if line.starts_with("turn ") && line.contains(" | tokens: ") {
+        return format_turn_usage_event_line(line, true);
+    }
+    if let Some(rest) = line.strip_prefix("🧵 session ") {
+        return format!("\x1b[36m🧵\x1b[0m {}", colorize_session_payload(rest));
+    }
+    if let Some(rest) = line.strip_prefix("🧵 ") {
+        return format!("\x1b[36m🧵\x1b[0m {}", colorize_session_payload(rest));
+    }
+    if let Some(rest) = line.strip_prefix("session ") {
+        return format!("\x1b[2msession\x1b[0m {}", colorize_session_payload(rest));
+    }
+    if line.starts_with("turn.failed") || line.starts_with("error |") {
+        return format!("\x1b[31m{}\x1b[0m", line);
+    }
+    if line.starts_with("startup_hint") {
+        return format!("\x1b[33m{}\x1b[0m", line);
+    }
+
+    colorize_paths(line)
+}
+
+fn render_status_line_interactive(line: &str) -> String {
+    if line == "running" {
+        return "\x1b[2mrunning\x1b[0m".to_string();
+    }
+    if let Some(rest) = line.strip_prefix("running: ") {
+        return format!("\x1b[2mrunning\x1b[0m: {}", colorize_paths(rest));
+    }
+    colorize_paths(line)
+}
+
+fn render_emoji_done_line(line: &str, symbol: &str, color_prefix: &str) -> Option<String> {
+    if line == symbol {
+        return Some(format!("{}{}\x1b[0m", color_prefix, symbol));
+    }
+
+    let prefix = format!("{} ", symbol);
+    let rest = line.strip_prefix(&prefix)?;
+    if rest.starts_with("| ") {
+        return None;
+    }
+
+    Some(format!(
+        "{}{}\x1b[0m {}",
+        color_prefix,
+        symbol,
+        colorize_done_payload(rest)
+    ))
 }
 
 fn colorize_done_payload(payload: &str) -> String {
@@ -3661,6 +4521,15 @@ impl ProviderRunResult {
             return Ok(());
         }
 
+        if interrupt_requested() {
+            clear_interrupt_request();
+            return Err(user_cancelled_error());
+        }
+
+        if looks_like_cancelled_stream_run(self.exit_code, &self.stdout, &self.stderr) {
+            return Err(user_cancelled_error());
+        }
+
         Err(anyhow!(
             "provider execution failed (exit={:?})\nstdout:\n{}\nstderr:\n{}",
             self.exit_code,
@@ -3668,6 +4537,54 @@ impl ProviderRunResult {
             self.stderr
         ))
     }
+}
+
+fn looks_like_cancelled_stream_run(exit_code: Option<i32>, stdout: &str, stderr: &str) -> bool {
+    if exit_code != Some(1) || !stderr.trim().is_empty() {
+        return false;
+    }
+
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let has_stream_progress = [
+        "\"type\":\"thread.started\"",
+        "\"type\":\"turn.started\"",
+        "\"type\":\"item.started\"",
+        "\"type\":\"item.completed\"",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if !has_stream_progress {
+        return false;
+    }
+
+    let has_terminal_success = [
+        "\"type\":\"turn.completed\"",
+        "\"type\":\"response.completed\"",
+        "\"type\":\"result\"",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if has_terminal_success {
+        return false;
+    }
+
+    let has_explicit_error = [
+        "\"type\":\"error\"",
+        "\"is_error\":true",
+        "\"status\":\"failed\"",
+        "invalid_request_error",
+        "model_not_found",
+        "\"subtype\":\"error\"",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+
+    !has_explicit_error
 }
 
 #[cfg(test)]
@@ -3770,6 +4687,67 @@ mod tests {
     }
 
     #[test]
+    fn ensure_success_returns_cancel_for_interrupted_failure() {
+        clear_interrupt_request();
+        INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
+
+        let run = ProviderRunResult {
+            session_id: Some("s1".to_string()),
+            exit_code: Some(1),
+            stdout: "{\"type\":\"item.completed\"}".to_string(),
+            stderr: String::new(),
+            usage: ProviderUsage::default(),
+            turn_count: 1,
+        };
+
+        let err = run.ensure_success().expect_err("expected cancellation");
+        assert_eq!(err.to_string(), "apply cancelled by user (Ctrl-C)");
+        assert!(!interrupt_requested());
+    }
+
+    #[test]
+    fn ensure_success_returns_cancel_for_partial_stream_without_stderr() {
+        clear_interrupt_request();
+
+        let run = ProviderRunResult {
+            session_id: Some("s1".to_string()),
+            exit_code: Some(1),
+            stdout: concat!(
+                "{\"type\":\"thread.started\",\"thread_id\":\"019d\"}\n",
+                "{\"type\":\"turn.started\"}\n"
+            )
+            .to_string(),
+            stderr: String::new(),
+            usage: ProviderUsage::default(),
+            turn_count: 1,
+        };
+
+        let err = run.ensure_success().expect_err("expected cancellation");
+        assert_eq!(err.to_string(), "apply cancelled by user (Ctrl-C)");
+    }
+
+    #[test]
+    fn ensure_success_keeps_explicit_stream_errors_as_failures() {
+        clear_interrupt_request();
+
+        let run = ProviderRunResult {
+            session_id: Some("s1".to_string()),
+            exit_code: Some(1),
+            stdout: concat!(
+                "{\"type\":\"thread.started\",\"thread_id\":\"019d\"}\n",
+                "{\"type\":\"error\",\"message\":\"boom\"}\n"
+            )
+            .to_string(),
+            stderr: String::new(),
+            usage: ProviderUsage::default(),
+            turn_count: 1,
+        };
+
+        let err = run.ensure_success().expect_err("expected failure");
+        assert!(err.to_string().contains("provider execution failed"));
+    }
+
+    #[test]
     fn parses_thread_started_event() {
         let line = r#"{"type":"thread.started","thread_id":"abc"}"#;
         let ev = parse_codex_stream_line(line).expect("expected event");
@@ -3808,6 +4786,126 @@ mod tests {
                 item_type: "file_change".to_string(),
                 item_id: Some("i1".to_string()),
                 summary: Some("path=out.txt".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_web_search_query_summary() {
+        let line = r#"{"type":"item.completed","item":{"id":"i3","type":"web_search","query":"Example Domain example.com","action":{"type":"search","query":"Example Domain example.com"}}}"#;
+        let ev = parse_codex_stream_line(line).expect("expected event");
+
+        assert_eq!(
+            ev,
+            ProviderEvent::ItemCompleted {
+                item_type: "web_search".to_string(),
+                item_id: Some("i3".to_string()),
+                summary: Some("Example Domain example.com".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn normalizes_search_tool_call_item() {
+        let line = r#"{"type":"item.completed","item":{"id":"i4","type":"tool_call","name":"WebSearch","input":{"query":"Example Domain example.com"}}}"#;
+        let ev = parse_codex_stream_line(line).expect("expected event");
+
+        assert_eq!(
+            ev,
+            ProviderEvent::ItemCompleted {
+                item_type: "web_search".to_string(),
+                item_id: Some("i4".to_string()),
+                summary: Some("Example Domain example.com".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn normalizes_tool_selection_item() {
+        let line = r#"{"type":"item.completed","item":{"id":"i5","type":"tool_call","name":"ToolSearch","input":{"query":"select:WebSearch,WebFetch"}}}"#;
+        let ev = parse_codex_stream_line(line).expect("expected event");
+
+        assert_eq!(
+            ev,
+            ProviderEvent::ItemCompleted {
+                item_type: "tool_selection".to_string(),
+                item_id: Some("i5".to_string()),
+                summary: Some("WebSearch, WebFetch".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn normalizes_web_fetch_tool_call_item() {
+        let line = r#"{"type":"item.completed","item":{"id":"i6","type":"tool_call","name":"WebFetch","input":{"url":"https://example.com"}}}"#;
+        let ev = parse_codex_stream_line(line).expect("expected event");
+
+        assert_eq!(
+            ev,
+            ProviderEvent::ItemCompleted {
+                item_type: "web_fetch".to_string(),
+                item_id: Some("i6".to_string()),
+                summary: Some("https://example.com".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn normalizes_generic_tool_call_item() {
+        let line = r#"{"type":"item.completed","item":{"id":"i7","type":"function_call","name":"search_docs","arguments":"{\"query\":\"provider events\"}"}}"#;
+        let ev = parse_codex_stream_line(line).expect("expected event");
+
+        assert_eq!(
+            ev,
+            ProviderEvent::ItemCompleted {
+                item_type: "mcp_tool_call".to_string(),
+                item_id: Some("i7".to_string()),
+                summary: Some("search_docs: provider events".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn normalizes_read_tool_call_item() {
+        let line = r#"{"type":"item.completed","item":{"id":"i8","type":"tool_call","name":"Read","input":{"file_path":"src/main.rs"}}}"#;
+        let ev = parse_codex_stream_line(line).expect("expected event");
+
+        assert_eq!(
+            ev,
+            ProviderEvent::ItemCompleted {
+                item_type: "command_execution".to_string(),
+                item_id: Some("i8".to_string()),
+                summary: Some("read src/main.rs".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn normalizes_write_tool_call_item() {
+        let line = r#"{"type":"item.completed","item":{"id":"i9","type":"tool_call","name":"Write","input":{"file_path":"src/main.rs"}}}"#;
+        let ev = parse_codex_stream_line(line).expect("expected event");
+
+        assert_eq!(
+            ev,
+            ProviderEvent::ItemCompleted {
+                item_type: "file_change".to_string(),
+                item_id: Some("i9".to_string()),
+                summary: Some("write src/main.rs".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn normalizes_todo_write_tool_call_item() {
+        let line = r#"{"type":"item.completed","item":{"id":"i10","type":"tool_call","name":"TodoWrite","input":{"todos":[{"content":"investigate search traces"},{"content":"update formatter"}]}}}"#;
+        let ev = parse_codex_stream_line(line).expect("expected event");
+
+        assert_eq!(
+            ev,
+            ProviderEvent::ItemCompleted {
+                item_type: "todo_list".to_string(),
+                item_id: Some("i10".to_string()),
+                summary: Some("investigate search traces (+1 more)".to_string()),
             }
         );
     }
@@ -3916,6 +5014,75 @@ mod tests {
     }
 
     #[test]
+    fn claude_pending_tool_formats_tool_selection_summary() {
+        let content: Value = serde_json::from_str(
+            r#"{"id":"toolu_3","name":"ToolSearch","input":{"query":"select:WebSearch,WebFetch"}}"#,
+        )
+        .expect("json");
+
+        let tool = claude_pending_tool(&content, Path::new("/tmp/work")).expect("tool");
+        assert_eq!(tool.item_type, "tool_selection");
+        assert_eq!(tool.summary.as_deref(), Some("WebSearch, WebFetch"));
+    }
+
+    #[test]
+    fn claude_pending_tool_formats_web_fetch_summary() {
+        let content: Value = serde_json::from_str(
+            r#"{"id":"toolu_4","name":"WebFetch","input":{"url":"https://example.com"}}"#,
+        )
+        .expect("json");
+
+        let tool = claude_pending_tool(&content, Path::new("/tmp/work")).expect("tool");
+        assert_eq!(tool.item_type, "web_fetch");
+        assert_eq!(tool.summary.as_deref(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn claude_pending_tool_formats_generic_tool_subject() {
+        let content: Value = serde_json::from_str(
+            r#"{"id":"toolu_5","name":"search_docs","input":{"query":"provider events"}}"#,
+        )
+        .expect("json");
+
+        let tool = claude_pending_tool(&content, Path::new("/tmp/work")).expect("tool");
+        assert_eq!(tool.item_type, "mcp_tool_call");
+        assert_eq!(
+            tool.summary.as_deref(),
+            Some("search_docs: provider events")
+        );
+    }
+
+    #[test]
+    fn claude_pending_tool_formats_todo_write_summary() {
+        let content: Value = serde_json::from_str(
+            r#"{"id":"toolu_6","name":"TodoWrite","input":{"todos":[{"content":"investigate search traces"},{"content":"update formatter"}]}}"#,
+        )
+        .expect("json");
+
+        let tool = claude_pending_tool(&content, Path::new("/tmp/work")).expect("tool");
+        assert_eq!(tool.item_type, "todo_list");
+        assert_eq!(
+            tool.summary.as_deref(),
+            Some("investigate search traces (+1 more)")
+        );
+    }
+
+    #[test]
+    fn claude_pending_tool_picks_question_for_generic_tool_subject() {
+        let content: Value = serde_json::from_str(
+            r#"{"id":"toolu_7","name":"AskUserQuestion","input":{"question":"Which model should we use?"}}"#,
+        )
+        .expect("json");
+
+        let tool = claude_pending_tool(&content, Path::new("/tmp/work")).expect("tool");
+        assert_eq!(tool.item_type, "mcp_tool_call");
+        assert_eq!(
+            tool.summary.as_deref(),
+            Some("AskUserQuestion: Which model should we use?")
+        );
+    }
+
+    #[test]
     fn claude_tool_result_text_ignores_rerun_marker_without_output() {
         let content: Value =
             serde_json::from_str(r#"{"type":"tool_result","content":"[rerun: b1]"}"#)
@@ -4004,16 +5171,44 @@ mod tests {
 
     #[test]
     fn session_event_line_uses_readable_sandbox_value() {
-        let printer = ProgressPrinter {
-            interactive: true,
-            status_line: None,
-            spinner_idx: 0,
-            cursor_hidden: false,
-        };
+        let printer = ProgressPrinter::new_test(true);
         let rendered = printer.render_event_line("🧵 019d-session | full-access");
         assert!(rendered.contains("🧵"));
         assert!(!rendered.contains("🧵 session "));
         assert!(rendered.contains("\x1b[33mfull-access\x1b[0m"));
+    }
+
+    #[test]
+    fn format_status_line_includes_running_prefix() {
+        assert_eq!(format_status_line(""), "running");
+        assert_eq!(format_status_line("  "), "running");
+        assert_eq!(
+            format_status_line("search Example Domain example.com"),
+            "running: search Example Domain example.com"
+        );
+    }
+
+    #[test]
+    fn status_line_renders_with_dimmed_running_prefix() {
+        let printer = ProgressPrinter::new_test(true);
+        let rendered = printer.render_status_line("running: search Example Domain example.com");
+        assert_eq!(
+            rendered,
+            "\u{1b}[2mrunning\u{1b}[0m: search Example Domain example.com"
+        );
+        assert_eq!(
+            printer.render_status_line("running"),
+            "\u{1b}[2mrunning\u{1b}[0m"
+        );
+    }
+
+    #[test]
+    fn spinner_uses_dots2_frames() {
+        let mut spinner_idx = 0usize;
+        let frames: Vec<&str> = (0..8)
+            .map(|_| next_spinner_frame(&mut spinner_idx))
+            .collect();
+        assert_eq!(frames, vec!["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]);
     }
 
     #[test]
@@ -4714,6 +5909,112 @@ mod tests {
     }
 
     #[test]
+    fn shows_tool_events_without_summary_when_intermediate_enabled() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "mcp_tool_call".to_string(),
+                item_id: Some("tool-1".to_string()),
+                summary: None,
+            },
+            true,
+            false,
+            true,
+        )
+        .expect("expected tool line");
+        assert_eq!(line, "🔧");
+    }
+
+    #[test]
+    fn shows_tool_selection_without_raw_select_prefix() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "tool_selection".to_string(),
+                item_id: Some("tool-2".to_string()),
+                summary: Some("WebSearch, WebFetch".to_string()),
+            },
+            true,
+            false,
+            true,
+        )
+        .expect("expected tool selection line");
+        assert_eq!(line, "🔧 WebSearch, WebFetch");
+    }
+
+    #[test]
+    fn shows_web_fetch_with_globe_symbol() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "web_fetch".to_string(),
+                item_id: Some("fetch-1".to_string()),
+                summary: Some("https://example.com".to_string()),
+            },
+            true,
+            false,
+            true,
+        )
+        .expect("expected fetch line");
+        assert_eq!(line, "🌐 https://example.com");
+    }
+
+    #[test]
+    fn shows_unknown_item_type_with_package_symbol() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "cache_refresh".to_string(),
+                item_id: Some("u1".to_string()),
+                summary: Some("syncing remote metadata".to_string()),
+            },
+            true,
+            false,
+            true,
+        )
+        .expect("expected unknown line");
+        assert_eq!(line, "📦 cache_refresh: syncing remote metadata");
+    }
+
+    #[test]
+    fn shows_unknown_tool_like_item_type_with_tool_symbol() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "tool_result".to_string(),
+                item_id: Some("u2".to_string()),
+                summary: Some("permission denied".to_string()),
+            },
+            true,
+            false,
+            true,
+        )
+        .expect("expected unknown tool line");
+        assert_eq!(line, "🔧 tool_result: permission denied");
+    }
+
+    #[test]
+    fn shows_unknown_raw_event_with_package_symbol() {
+        let line = format_terminal_event(
+            &ProviderEvent::RawEvent {
+                provider_event_type: "response.refreshed".to_string(),
+            },
+            true,
+            false,
+            true,
+        )
+        .expect("expected raw event line");
+        assert_eq!(line, "📦 event response.refreshed");
+    }
+
+    #[test]
+    fn status_label_uses_fallback_for_unknown_item_type() {
+        let label = status_activity_label("cache_refresh", Some("syncing remote metadata"));
+        assert_eq!(label, "cache_refresh: syncing remote metadata");
+    }
+
+    #[test]
+    fn adds_duration_suffix_for_unknown_item_line() {
+        let rendered = add_completion_duration_suffix("📦 cache_refresh", Some("2ms".to_string()));
+        assert_eq!(rendered, "📦 cache_refresh | 2ms");
+    }
+
+    #[test]
     fn filters_low_signal_read_only_command() {
         let line = format_terminal_event(
             &ProviderEvent::ItemCompleted {
@@ -4741,7 +6042,39 @@ mod tests {
             true,
         )
         .expect("expected command line");
-        assert!(line.contains("ls src"));
+        assert_eq!(line, "❱ ls src");
+    }
+
+    #[test]
+    fn shows_file_change_with_note_symbol() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "file_change".to_string(),
+                item_id: Some("x".to_string()),
+                summary: Some("edit src/main.rs".to_string()),
+            },
+            true,
+            false,
+            true,
+        )
+        .expect("expected file line");
+        assert_eq!(line, "✎ edit src/main.rs");
+    }
+
+    #[test]
+    fn shows_todo_as_plan_update() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "todo_list".to_string(),
+                item_id: Some("x".to_string()),
+                summary: Some("refresh provider trace coverage".to_string()),
+            },
+            true,
+            false,
+            true,
+        )
+        .expect("expected todo line");
+        assert_eq!(line, "🗒️ plan: refresh provider trace coverage");
     }
 
     #[test]
@@ -4847,7 +6180,73 @@ mod tests {
             true,
         )
         .expect("expected line");
+        assert!(line.starts_with("❱ "));
         assert!(line.contains("read .clawform/agent_variables.json"));
+    }
+
+    #[test]
+    fn status_label_uses_text_for_live_activity() {
+        assert_eq!(
+            status_activity_label("command_execution", Some("cargo test -q")),
+            "cargo test -q"
+        );
+        assert_eq!(
+            status_activity_label("file_change", Some("edit src/main.rs")),
+            "edit src/main.rs"
+        );
+        assert_eq!(
+            status_activity_label("todo_list", Some("refresh provider trace coverage")),
+            "update plan"
+        );
+    }
+
+    #[test]
+    fn todo_status_uses_generic_plan_label() {
+        assert_eq!(status_activity_label("todo_list", None), "update plan");
+        assert_eq!(
+            status_activity_label(
+                "todo_list",
+                Some("Perform required built-in search for query 'Example Domain example.com'.")
+            ),
+            "update plan"
+        );
+    }
+
+    #[test]
+    fn active_progress_prefers_real_activity_over_todo() {
+        let mut active = Vec::new();
+        upsert_active_progress_item(&mut active, "todo-1", "update plan", 0);
+        upsert_active_progress_item(
+            &mut active,
+            "search-1",
+            "search Example Domain example.com",
+            progress_activity_priority("web_search"),
+        );
+
+        assert_eq!(
+            best_active_progress_label(&active),
+            Some("search Example Domain example.com".to_string())
+        );
+        assert_eq!(
+            preferred_progress_label(&active, 0, "update plan"),
+            "search Example Domain example.com"
+        );
+    }
+
+    #[test]
+    fn todo_completion_without_summary_is_plan_updated() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemCompleted {
+                item_type: "todo_list".to_string(),
+                item_id: Some("x".to_string()),
+                summary: None,
+            },
+            true,
+            false,
+            true,
+        )
+        .expect("expected todo line");
+        assert_eq!(line, "🗒️ plan updated");
     }
 
     #[test]
@@ -4921,6 +6320,15 @@ mod tests {
     }
 
     #[test]
+    fn extracts_command_output_payload_from_bash_tool_call() {
+        let line = r#"{"type":"item.completed","item":{"id":"item_8","type":"tool_call","name":"Bash","input":{"command":"printf hi"},"aggregated_output":"hi","status":"completed","exit_code":0}}"#;
+        let payload = extract_command_output_payload(line).expect("expected payload");
+        assert_eq!(payload.item_id, "item_8");
+        assert_eq!(payload.command.as_deref(), Some("printf hi"));
+        assert_eq!(payload.output, "hi");
+    }
+
+    #[test]
     fn adds_plain_output_suffix_for_completed_command() {
         let event = ProviderEvent::ItemCompleted {
             item_type: "command_execution".to_string(),
@@ -4932,9 +6340,9 @@ mod tests {
             "item_9".to_string(),
             PathBuf::from("/tmp/clawform/programs/smoke/sessions/session/commands/item_9.txt"),
         );
-        let rendered = add_command_output_link_suffix(&event, "✔ ls", &links, false);
+        let rendered = add_command_output_link_suffix(&event, "❱ ls", &links, false);
         assert!(rendered.contains(
-            "✔ ls | out=/tmp/clawform/programs/smoke/sessions/session/commands/item_9.txt"
+            "❱ ls | out=/tmp/clawform/programs/smoke/sessions/session/commands/item_9.txt"
         ));
     }
 
@@ -4977,9 +6385,16 @@ mod tests {
             "item_5".to_string(),
             PathBuf::from("/tmp/clawform/src/main.rs"),
         );
-        let rendered =
-            add_file_change_link_suffix(&event, "✔ file update src/main.rs", &links, false);
-        assert!(rendered.contains("✔ file update src/main.rs | file=/tmp/clawform/src/main.rs"));
+        let rendered = add_file_change_link_suffix(&event, "✎ update src/main.rs", &links, false);
+        assert!(rendered.contains("✎ update src/main.rs | file=/tmp/clawform/src/main.rs"));
+    }
+
+    #[test]
+    fn extracts_file_change_payload_from_write_tool_call() {
+        let line = r#"{"type":"item.completed","item":{"id":"item_10","type":"tool_call","name":"Write","input":{"file_path":"src/main.rs"}}}"#;
+        let payload = extract_file_change_payload(line).expect("expected payload");
+        assert_eq!(payload.item_id, "item_10");
+        assert_eq!(payload.paths, vec!["src/main.rs".to_string()]);
     }
 
     #[test]
