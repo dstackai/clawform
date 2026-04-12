@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::config::ProviderKind;
 use crate::path_utils::to_slash_path;
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone)]
@@ -125,14 +125,15 @@ impl Default for ProviderCapabilities {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ProviderUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderEvent {
     RunStarted {
         run_id: Option<String>,
@@ -322,6 +323,16 @@ struct FileChangePayload {
     paths: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct PersistedProviderEventRecord {
+    sequence: u64,
+    turn_index: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_provider_event_type: Option<String>,
+    raw_line: String,
+    normalized: ProviderEvent,
+}
+
 #[derive(Debug, Clone)]
 struct EarlyAutoRetryMonitor {
     agent_result_path: PathBuf,
@@ -423,11 +434,84 @@ impl CommandOutputSink {
     }
 }
 
+#[derive(Debug)]
+struct EventTraceSink {
+    root: Option<PathBuf>,
+}
+
+impl EventTraceSink {
+    fn new(root: Option<PathBuf>) -> Self {
+        Self { root }
+    }
+
+    fn persist(
+        &self,
+        program_id: Option<&str>,
+        session_id: Option<&str>,
+        sequence: u64,
+        turn_index: u64,
+        raw_line: &str,
+        normalized: &ProviderEvent,
+    ) -> Result<Option<PathBuf>> {
+        let Some(root) = &self.root else {
+            return Ok(None);
+        };
+
+        let out_path = session_base_dir(root, program_id, session_id.unwrap_or("unknown"))
+            .join("events.ndjson");
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed creating event trace directory '{}'",
+                    parent.display()
+                )
+            })?;
+        }
+
+        let record = PersistedProviderEventRecord {
+            sequence,
+            turn_index,
+            raw_provider_event_type: raw_provider_event_type(raw_line),
+            raw_line: raw_line.to_string(),
+            normalized: normalized.clone(),
+        };
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&out_path)
+            .with_context(|| format!("failed opening event trace '{}'", out_path.display()))?;
+        serde_json::to_writer(&mut file, &record)
+            .with_context(|| format!("failed serializing event trace '{}'", out_path.display()))?;
+        file.write_all(b"\n")
+            .with_context(|| format!("failed appending newline to '{}'", out_path.display()))?;
+
+        Ok(Some(out_path))
+    }
+}
+
 fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn raw_provider_event_type(raw_line: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(raw_line).ok()?;
+    let event_type = value.get("type").and_then(Value::as_str)?.trim();
+    if event_type.is_empty() {
+        return None;
+    }
+    let subtype = value
+        .get("subtype")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match subtype {
+        Some(subtype) => Some(format!("{event_type}.{subtype}")),
+        None => Some(event_type.to_string()),
+    }
 }
 
 fn session_base_dir(root: &Path, program_id: Option<&str>, session_id: &str) -> PathBuf {
@@ -564,15 +648,19 @@ fn run_claude_once(
     }
 
     if request.progress {
+        let session_context_label =
+            format_session_context_label(ProviderKind::Claude.as_str(), request.model.as_deref());
         return collect_claude_with_progress(
             child,
             request.render_progress,
             request.verbose_output || request.debug_mode,
             request.verbose_output,
             request.verbose_events,
+            request.debug_mode,
             request.interactive_ui,
             request.show_intermediate_steps,
             mode,
+            session_context_label.as_str(),
             &request.workspace_root,
             request.artifacts_root.as_deref(),
             request.program_id.as_deref(),
@@ -658,9 +746,11 @@ fn collect_claude_with_progress(
     show_housekeeping: bool,
     verbose_output: bool,
     verbose_events: bool,
+    debug_mode: bool,
     interactive_ui: bool,
     show_intermediate_steps: bool,
     execution_mode: ClaudeExecutionMode,
+    session_context_label: &str,
     workspace_root: &Path,
     artifacts_root: Option<&Path>,
     program_id: Option<&str>,
@@ -706,24 +796,33 @@ fn collect_claude_with_progress(
         Duration::from_secs(1)
     };
     let sink = CommandOutputSink::new(artifacts_root.map(Path::to_path_buf));
+    let event_sink = EventTraceSink::new(if debug_mode {
+        artifacts_root.map(Path::to_path_buf)
+    } else {
+        None
+    });
+    let mut event_sequence: u64 = 0;
     let supports_hyperlinks = supports_terminal_hyperlinks();
     let mut command_output_links: HashMap<String, PathBuf> = HashMap::new();
     let mut message_output_links: HashMap<String, PathBuf> = HashMap::new();
     let mut file_change_links: HashMap<String, PathBuf> = HashMap::new();
 
     macro_rules! emit_event {
-        ($event:expr, $command_payload:expr, $message_payload:expr, $file_payload:expr $(,)?) => {
+        ($raw_line:expr, $event:expr, $command_payload:expr, $message_payload:expr, $file_payload:expr $(,)?) => {
             handle_progress_event(
                 &$event,
                 $command_payload,
                 $message_payload,
                 $file_payload,
+                Some($raw_line),
                 render_progress,
                 show_housekeeping,
                 verbose_output,
                 verbose_events,
                 show_intermediate_steps,
+                false,
                 execution_mode.label(),
+                session_context_label,
                 turn_index,
                 program_id,
                 &mut session_id,
@@ -735,6 +834,8 @@ fn collect_claude_with_progress(
                 &mut usage_totals,
                 &mut printer,
                 &sink,
+                &event_sink,
+                &mut event_sequence,
                 &mut command_output_links,
                 &mut message_output_links,
                 &mut file_change_links,
@@ -776,7 +877,13 @@ fn collect_claude_with_progress(
                                 .get("session_id")
                                 .and_then(Value::as_str)
                                 .map(ToOwned::to_owned);
-                            emit_event!(ProviderEvent::RunStarted { run_id }, None, None, None);
+                            emit_event!(
+                                line.as_str(),
+                                ProviderEvent::RunStarted { run_id },
+                                None,
+                                None,
+                                None,
+                            );
                         }
                         Some("assistant") => {
                             let message = value.get("message").unwrap_or(&Value::Null);
@@ -787,6 +894,7 @@ fn collect_claude_with_progress(
                                     last_visible_turn_message_id = Some(message_id);
                                     turn_index = turn_index.saturating_add(1);
                                     emit_event!(
+                                        line.as_str(),
                                         ProviderEvent::TurnCompleted {
                                             usage: claude_message_usage(message),
                                         },
@@ -819,6 +927,7 @@ fn collect_claude_with_progress(
                                                 text: text.to_string(),
                                             };
                                             emit_event!(
+                                                line.as_str(),
                                                 ProviderEvent::ItemCompleted {
                                                     item_type: "reasoning".to_string(),
                                                     item_id: Some(item_id),
@@ -846,6 +955,7 @@ fn collect_claude_with_progress(
                                                 text: text.to_string(),
                                             };
                                             emit_event!(
+                                                line.as_str(),
                                                 ProviderEvent::ItemCompleted {
                                                     item_type: "assistant_message".to_string(),
                                                     item_id: Some(item_id),
@@ -863,6 +973,7 @@ fn collect_claude_with_progress(
                                                 continue;
                                             };
                                             emit_event!(
+                                                line.as_str(),
                                                 ProviderEvent::ItemStarted {
                                                     item_type: tool.item_type.clone(),
                                                     item_id: Some(tool.item_id.clone()),
@@ -921,6 +1032,7 @@ fn collect_claude_with_progress(
                                 };
 
                                 emit_event!(
+                                    line.as_str(),
                                     ProviderEvent::ItemCompleted {
                                         item_type: tool.item_type,
                                         item_id: Some(tool.item_id),
@@ -1026,12 +1138,15 @@ fn handle_progress_event(
     command_payload: Option<&CommandOutputPayload>,
     message_payload: Option<&MessageOutputPayload>,
     file_payload: Option<&FileChangePayload>,
+    raw_line: Option<&str>,
     render_progress: bool,
     show_housekeeping: bool,
     verbose_output: bool,
     verbose_events: bool,
     show_intermediate_steps: bool,
+    suppress_turn_usage_lines: bool,
     execution_mode_label: &str,
+    session_context_label: &str,
     turn_index: u64,
     program_id: Option<&str>,
     session_id: &mut Option<String>,
@@ -1043,6 +1158,8 @@ fn handle_progress_event(
     usage_totals: &mut ProviderUsage,
     printer: &mut ProgressPrinter,
     sink: &CommandOutputSink,
+    event_sink: &EventTraceSink,
+    event_sequence: &mut u64,
     command_output_links: &mut HashMap<String, PathBuf>,
     message_output_links: &mut HashMap<String, PathBuf>,
     file_change_links: &mut HashMap<String, PathBuf>,
@@ -1082,6 +1199,37 @@ fn handle_progress_event(
                 }
             }
         }
+        ProviderEvent::ItemUpdated {
+            item_id,
+            item_type,
+            summary,
+        } => {
+            if should_count_item_progress(
+                item_type,
+                summary.as_deref(),
+                show_housekeeping,
+                show_intermediate_steps,
+            ) {
+                if should_clear_live_progress_on_update(item_type, summary.as_deref()) {
+                    if let Some(id) = item_id.as_ref() {
+                        remove_active_progress_item(active_progress_items, id);
+                    }
+                    *last_activity =
+                        best_active_progress_label(active_progress_items).unwrap_or_default();
+                    return Ok(());
+                }
+                let label = status_activity_label(item_type, summary.as_deref());
+                let priority = progress_activity_priority(item_type);
+                if let Some(id) = item_id.as_ref() {
+                    upsert_active_progress_item(active_progress_items, id, &label, priority);
+                    *last_activity =
+                        best_active_progress_label(active_progress_items).unwrap_or(label);
+                } else {
+                    *last_activity =
+                        preferred_progress_label(active_progress_items, priority, &label);
+                }
+            }
+        }
         ProviderEvent::ItemCompleted {
             item_id,
             item_type,
@@ -1104,6 +1252,18 @@ fn handle_progress_event(
             merge_usage(usage_totals, usage);
         }
         _ => {}
+    }
+
+    if let Some(raw_line) = raw_line {
+        let _ = event_sink.persist(
+            program_id,
+            session_id.as_deref(),
+            *event_sequence,
+            turn_index,
+            raw_line,
+            normalized,
+        );
+        *event_sequence = event_sequence.saturating_add(1);
     }
 
     if !matches!(normalized, ProviderEvent::RawText { .. }) {
@@ -1134,7 +1294,7 @@ fn handle_progress_event(
         show_housekeeping,
         show_intermediate_steps,
     );
-    if show_intermediate_steps && progress_line.is_none() {
+    if show_intermediate_steps && !suppress_turn_usage_lines && progress_line.is_none() {
         if let ProviderEvent::TurnCompleted { usage } = normalized {
             progress_line = format_turn_usage_line(turn_index, usage);
         }
@@ -1142,7 +1302,11 @@ fn handle_progress_event(
 
     if let Some(progress_line) = progress_line {
         let progress_line = if matches!(normalized, ProviderEvent::RunStarted { .. }) {
-            format!("{} | {}", progress_line, execution_mode_label)
+            format_run_started_progress_line(
+                &progress_line,
+                execution_mode_label,
+                session_context_label,
+            )
         } else {
             progress_line
         };
@@ -1245,6 +1409,29 @@ fn preferred_progress_label(
         Some((_, active)) if active.priority > priority => active.label.clone(),
         _ => label.to_string(),
     }
+}
+
+fn format_session_context_label(provider_label: &str, model: Option<&str>) -> String {
+    let provider = provider_label.trim();
+    let model = model.map(str::trim).filter(|value| !value.is_empty());
+    match model {
+        Some(model) if !provider.is_empty() => format!("{provider}:{model}"),
+        _ => provider.to_string(),
+    }
+}
+
+fn format_run_started_progress_line(
+    base_line: &str,
+    execution_mode_label: &str,
+    session_context_label: &str,
+) -> String {
+    let mut line = format!("{base_line} | {execution_mode_label}");
+    let session_context_label = session_context_label.trim();
+    if !session_context_label.is_empty() {
+        line.push_str(" | ");
+        line.push_str(session_context_label);
+    }
+    line
 }
 
 fn claude_message_id(message: &Value) -> Option<String> {
@@ -1498,12 +1685,32 @@ fn summarize_todo_list_value(value: &Value) -> Option<String> {
 }
 
 fn summarize_todo_entries(entries: &[Value]) -> Option<String> {
-    let labels: Vec<String> = entries.iter().filter_map(summarize_todo_entry).collect();
-    let first = labels.first()?;
-    if labels.len() == 1 {
-        return Some(first.clone());
+    let mut labels: Vec<String> = Vec::new();
+    let mut completed_labels: Vec<String> = Vec::new();
+
+    for entry in entries {
+        let Some(label) = summarize_todo_entry(entry) else {
+            continue;
+        };
+        if todo_entry_completed(entry) {
+            completed_labels.push(label.clone());
+        }
+        labels.push(label);
     }
-    Some(format!("{} (+{} more)", first, labels.len() - 1))
+
+    let total = labels.len();
+    if total == 0 {
+        return None;
+    }
+
+    let done = completed_labels.len();
+    let focus = if done > 0 {
+        completed_labels.last()
+    } else {
+        labels.first()
+    }?;
+
+    Some(format!("{done}/{total} done | {focus}"))
 }
 
 fn summarize_todo_entry(value: &Value) -> Option<String> {
@@ -1541,6 +1748,32 @@ fn summarize_todo_entry_text(raw: &str) -> Option<String> {
         return None;
     }
     Some(truncate_one_line(trimmed, 180))
+}
+
+fn todo_entry_completed(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            if let Some(completed) = map.get("completed").and_then(Value::as_bool) {
+                return completed;
+            }
+
+            for key in ["status", "state"] {
+                let Some(status) = map.get(key).and_then(Value::as_str) else {
+                    continue;
+                };
+                let status = status.trim();
+                if status.eq_ignore_ascii_case("completed")
+                    || status.eq_ignore_ascii_case("complete")
+                    || status.eq_ignore_ascii_case("done")
+                {
+                    return true;
+                }
+            }
+
+            false
+        }
+        _ => false,
+    }
 }
 
 fn display_tool_path(raw_path: &str, workspace_root: Option<&Path>) -> String {
@@ -1989,16 +2222,20 @@ fn run_codex_once(
     if request.progress {
         let suppress_turn_usage_lines =
             mode == CodexExecutionMode::Sandboxed && request.sandbox_mode == SandboxMode::Auto;
+        let session_context_label =
+            format_session_context_label(ProviderKind::Codex.as_str(), request.model.as_deref());
         return collect_with_progress(
             child,
             request.render_progress,
             request.verbose_output || request.debug_mode,
             request.verbose_output,
             request.verbose_events,
+            request.debug_mode,
             request.interactive_ui,
             request.show_intermediate_steps,
             suppress_turn_usage_lines,
             mode,
+            session_context_label.as_str(),
             request.artifacts_root.as_deref(),
             request.program_id.as_deref(),
             early_auto_retry_monitor,
@@ -2207,10 +2444,12 @@ fn collect_with_progress(
     show_housekeeping: bool,
     verbose_output: bool,
     verbose_events: bool,
+    debug_mode: bool,
     interactive_ui: bool,
     show_intermediate_steps: bool,
     suppress_turn_usage_lines: bool,
     execution_mode: CodexExecutionMode,
+    session_context_label: &str,
     artifacts_root: Option<&Path>,
     program_id: Option<&str>,
     early_auto_retry_monitor: Option<EarlyAutoRetryMonitor>,
@@ -2255,6 +2494,12 @@ fn collect_with_progress(
         Duration::from_secs(1)
     };
     let sink = CommandOutputSink::new(artifacts_root.map(Path::to_path_buf));
+    let event_sink = EventTraceSink::new(if debug_mode {
+        artifacts_root.map(Path::to_path_buf)
+    } else {
+        None
+    });
+    let mut event_sequence: u64 = 0;
     let supports_hyperlinks = supports_terminal_hyperlinks();
     let mut command_output_links: HashMap<String, PathBuf> = HashMap::new();
     let mut message_output_links: HashMap<String, PathBuf> = HashMap::new();
@@ -2290,167 +2535,45 @@ fn collect_with_progress(
                 // Stderr can contain banners or transport noise, but we still surface useful startup hints.
                 if is_stdout {
                     if let Some(normalized) = normalized {
+                        if matches!(normalized, ProviderEvent::TurnStarted) {
+                            turn_index = turn_index.saturating_add(1);
+                        }
                         let command_payload = extract_command_output_payload(&line);
                         let message_payload = extract_message_output_payload(&line);
-
-                        match normalized {
-                            ProviderEvent::RunStarted { ref run_id } => {
-                                if let Some(id) = run_id.as_ref() {
-                                    session_id = Some(id.clone());
-                                }
-                            }
-                            ProviderEvent::TurnStarted => {
-                                turn_index = turn_index.saturating_add(1);
-                            }
-                            ProviderEvent::ItemStarted {
-                                ref item_id,
-                                ref item_type,
-                                ref summary,
-                                ..
-                            } => {
-                                if let Some(id) = item_id.clone() {
-                                    item_started_at.insert(id, Instant::now());
-                                }
-                                if should_count_item_progress(
-                                    item_type,
-                                    summary.as_deref(),
-                                    show_housekeeping,
-                                    show_intermediate_steps,
-                                ) {
-                                    let label =
-                                        status_activity_label(item_type, summary.as_deref());
-                                    let priority = progress_activity_priority(item_type);
-                                    if let Some(id) = item_id.as_ref() {
-                                        upsert_active_progress_item(
-                                            &mut active_progress_items,
-                                            id,
-                                            &label,
-                                            priority,
-                                        );
-                                        last_activity =
-                                            best_active_progress_label(&active_progress_items)
-                                                .unwrap_or(label);
-                                    } else {
-                                        last_activity = preferred_progress_label(
-                                            &active_progress_items,
-                                            priority,
-                                            &label,
-                                        );
-                                    }
-                                }
-                            }
-                            ProviderEvent::ItemCompleted {
-                                ref item_id,
-                                ref item_type,
-                                ref summary,
-                                ..
-                            } => {
-                                if should_count_item_progress(
-                                    item_type,
-                                    summary.as_deref(),
-                                    show_housekeeping,
-                                    show_intermediate_steps,
-                                ) {
-                                    if let Some(id) = item_id.as_ref() {
-                                        remove_active_progress_item(&mut active_progress_items, id);
-                                    }
-                                    last_activity =
-                                        best_active_progress_label(&active_progress_items)
-                                            .unwrap_or_default();
-                                }
-                            }
-                            ProviderEvent::TurnCompleted { ref usage } => {
-                                merge_usage(&mut usage_totals, usage);
-                            }
-                            _ => {}
-                        }
-                        if !matches!(normalized, ProviderEvent::RawText { .. }) {
-                            emitted_progress_events += 1;
-                        }
-                        if let Some(payload) = command_payload.as_ref() {
-                            if let Ok(Some(path)) =
-                                sink.persist(program_id, session_id.as_deref(), payload)
-                            {
-                                command_output_links.insert(payload.item_id.clone(), path);
-                            }
-                        }
-                        if let Some(payload) = message_payload.as_ref() {
-                            if let Ok(Some(path)) =
-                                sink.persist_message(program_id, session_id.as_deref(), payload)
-                            {
-                                message_output_links.insert(payload.item_id.clone(), path);
-                            }
-                        }
-                        if let Some(payload) = extract_file_change_payload(&line) {
-                            if let Some(first_path) = payload.paths.first() {
-                                let path = make_clickable_path(first_path, artifacts_root);
-                                file_change_links.insert(payload.item_id, path);
-                            }
-                        }
-                        let completion_duration =
-                            item_completion_duration_label(&normalized, &mut item_started_at);
-                        let mut progress_line = format_terminal_event(
+                        let file_payload = extract_file_change_payload(&line);
+                        handle_progress_event(
                             &normalized,
-                            verbose_events,
+                            command_payload.as_ref(),
+                            message_payload.as_ref(),
+                            file_payload.as_ref(),
+                            Some(line.as_str()),
+                            render_progress,
                             show_housekeeping,
+                            verbose_output,
+                            verbose_events,
                             show_intermediate_steps,
-                        );
-                        if show_intermediate_steps
-                            && !suppress_turn_usage_lines
-                            && progress_line.is_none()
-                        {
-                            if let ProviderEvent::TurnCompleted { ref usage } = normalized {
-                                progress_line = format_turn_usage_line(turn_index, usage);
-                            }
-                        }
-                        if let Some(progress_line) = progress_line {
-                            let progress_line =
-                                if matches!(normalized, ProviderEvent::RunStarted { .. }) {
-                                    format!("{} | {}", progress_line, execution_mode.label())
-                                } else {
-                                    progress_line
-                                };
-                            let progress_line =
-                                add_completion_duration_suffix(&progress_line, completion_duration);
-                            let progress_line = if verbose_output {
-                                expand_verbose_progress_line(
-                                    &normalized,
-                                    &progress_line,
-                                    command_payload.as_ref(),
-                                    message_payload.as_ref(),
-                                )
-                            } else {
-                                let progress_line = add_command_output_link_suffix(
-                                    &normalized,
-                                    &progress_line,
-                                    &command_output_links,
-                                    supports_hyperlinks,
-                                );
-                                add_message_output_link_suffix(
-                                    &normalized,
-                                    &progress_line,
-                                    &message_output_links,
-                                    supports_hyperlinks,
-                                )
-                            };
-                            let progress_line = add_file_change_link_suffix(
-                                &normalized,
-                                &progress_line,
-                                &file_change_links,
-                                supports_hyperlinks,
-                            );
-                            if is_text_event_line(&progress_line)
-                                && last_agent_text_line.as_deref() == Some(progress_line.as_str())
-                            {
-                                continue;
-                            }
-                            if is_text_event_line(&progress_line) {
-                                last_agent_text_line = Some(progress_line.clone());
-                            }
-                            if render_progress {
-                                printer.print_event(&progress_line);
-                            }
-                        }
+                            suppress_turn_usage_lines,
+                            execution_mode.label(),
+                            session_context_label,
+                            turn_index,
+                            program_id,
+                            &mut session_id,
+                            &mut emitted_progress_events,
+                            &mut last_activity,
+                            &mut active_progress_items,
+                            &mut last_agent_text_line,
+                            &mut item_started_at,
+                            &mut usage_totals,
+                            &mut printer,
+                            &sink,
+                            &event_sink,
+                            &mut event_sequence,
+                            &mut command_output_links,
+                            &mut message_output_links,
+                            &mut file_change_links,
+                            supports_hyperlinks,
+                            artifacts_root,
+                        )?;
                     }
                 } else if emitted_progress_events == 0 {
                     if let Some(hint) = extract_startup_stderr_hint(&line) {
@@ -2610,8 +2733,8 @@ fn add_completion_duration_suffix(line: &str, duration: Option<String>) -> Strin
     };
     if line.strip_prefix("✔ ").is_some()
         || line.starts_with("❱")
-        || line.starts_with("✎")
-        || line.starts_with("🗒️")
+        || line.starts_with("✏️")
+        || line.starts_with("update plan")
         || line.starts_with("🔧")
         || line.starts_with("🔎")
         || line.starts_with("🌐")
@@ -3129,6 +3252,10 @@ fn normalize_codex_item_type(item: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("unknown");
 
+    if is_codex_web_fetch_item(raw_item_type, item) {
+        return "web_fetch".to_string();
+    }
+
     if is_reasoning_item_type(raw_item_type)
         || is_agent_text_item_type(raw_item_type)
         || matches!(
@@ -3159,10 +3286,6 @@ fn normalize_codex_item_type(item: &Value) -> String {
 
     if is_codex_tool_selection_item(raw_item_type, item) {
         return "tool_selection".to_string();
-    }
-
-    if is_codex_web_fetch_item(raw_item_type, item) {
-        return "web_fetch".to_string();
     }
 
     if is_codex_search_item(raw_item_type, item) {
@@ -3363,10 +3486,37 @@ fn is_codex_web_fetch_item(raw_item_type: &str, item: &Value) -> bool {
         return true;
     }
 
+    // TODO: Codex sometimes appears to route direct URL opens/fetches through
+    // `web_search` with `action.type = "other"` instead of surfacing an
+    // explicit fetch event. Keep this heuristic narrow until the provider
+    // exposes stable open/fetch semantics in its event stream.
+    if matches!(raw.as_str(), "web_search" | "search") && is_codex_url_lookup_fetch(item) {
+        return true;
+    }
+
     matches!(
         nested_value_str(item, "action", "type").map(|value| value.to_ascii_lowercase()),
         Some(action_type) if action_type == "fetch"
     )
+}
+
+fn is_codex_url_lookup_fetch(item: &Value) -> bool {
+    let action_type =
+        nested_value_str(item, "action", "type").map(|value| value.trim().to_ascii_lowercase());
+    if !matches!(action_type.as_deref(), Some("other")) {
+        return false;
+    }
+
+    extract_tool_string(item, &["query", "url"])
+        .map(|value| is_absolute_http_url(value.as_str()))
+        .unwrap_or(false)
+}
+
+fn is_absolute_http_url(value: &str) -> bool {
+    let trimmed = value.trim();
+    (trimmed.starts_with("https://") || trimmed.starts_with("http://"))
+        && trimmed.len() > "https://".len()
+        && !trimmed.chars().any(char::is_whitespace)
 }
 
 fn is_codex_search_item(raw_item_type: &str, item: &Value) -> bool {
@@ -3663,7 +3813,23 @@ fn format_terminal_event(
                 show_intermediate_steps,
             )
         }
-        ProviderEvent::ItemUpdated { .. } => None,
+        ProviderEvent::ItemUpdated {
+            item_type,
+            item_id,
+            summary,
+        } => {
+            if !verbose_events || item_type != "todo_list" {
+                return None;
+            }
+            format_item_event(
+                "item.updated",
+                item_type,
+                item_id.as_deref(),
+                summary.as_deref(),
+                show_housekeeping,
+                show_intermediate_steps,
+            )
+        }
         ProviderEvent::Error { message } => Some(format!("error | {}", message)),
         ProviderEvent::RawEvent {
             provider_event_type,
@@ -3727,7 +3893,7 @@ fn format_item_event(
 
     let symbol = match item_type {
         "command_execution" => "❱",
-        "file_change" => "✎",
+        "file_change" => "✏️",
         _ => return Some(format_unknown_item_line(item_type, summary)),
     };
 
@@ -3760,8 +3926,8 @@ fn format_symbol_item_line(symbol: &str, summary: Option<&str>) -> String {
 
 fn format_todo_item_line(summary: Option<&str>) -> String {
     match summary.map(str::trim).filter(|text| !text.is_empty()) {
-        Some(summary) => format!("🗒️ plan: {}", truncate_one_line(summary, 180)),
-        None => "🗒️ plan updated".to_string(),
+        Some(summary) => format!("update plan | {}", truncate_one_line(summary, 180)),
+        None => "update plan".to_string(),
     }
 }
 
@@ -3933,7 +4099,13 @@ fn status_activity_label(item_type: &str, summary: Option<&str>) -> String {
         ("mcp_tool_call", Some(summary)) => format!("use {}", summary),
         ("web_search", Some(summary)) => format!("search {}", summary),
         ("web_fetch", Some(summary)) => format!("fetch {}", summary),
-        ("todo_list", Some(_)) => "update plan".to_string(),
+        ("todo_list", Some(summary)) => {
+            if let Some((done, total)) = parse_todo_progress_summary(summary) {
+                format!("plan {done}/{total}")
+            } else {
+                "update plan".to_string()
+            }
+        }
         ("tool_selection", None) => "select".to_string(),
         ("command_execution", None) => "command".to_string(),
         ("file_change", None) => "file change".to_string(),
@@ -3944,6 +4116,24 @@ fn status_activity_label(item_type: &str, summary: Option<&str>) -> String {
         (_, Some(summary)) => format_unknown_status_activity(item_type, Some(summary)),
         (_, None) => format_unknown_status_activity(item_type, None),
     }
+}
+
+fn should_clear_live_progress_on_update(item_type: &str, summary: Option<&str>) -> bool {
+    item_type == "todo_list" && todo_progress_is_complete(summary)
+}
+
+fn todo_progress_is_complete(summary: Option<&str>) -> bool {
+    matches!(
+        summary.and_then(parse_todo_progress_summary),
+        Some((done, total)) if total > 0 && done >= total
+    )
+}
+
+fn parse_todo_progress_summary(summary: &str) -> Option<(usize, usize)> {
+    let prefix = summary.split('|').next()?.trim();
+    let counts = prefix.strip_suffix(" done")?.trim();
+    let (done, total) = counts.split_once('/')?;
+    Some((done.parse().ok()?, total.parse().ok()?))
 }
 
 fn format_unknown_status_activity(item_type: &str, summary: Option<&str>) -> String {
@@ -4189,13 +4379,16 @@ fn render_event_line_interactive(line: &str) -> String {
     if let Some(rest) = line.strip_prefix("✔ ") {
         return format!("\x1b[32m✔\x1b[0m {}", colorize_done_payload(rest));
     }
+    if is_plan_event_line(line) {
+        return format!("\x1b[90m{}\x1b[0m", line);
+    }
     if let Some(rendered) = render_emoji_done_line(line, "❱", "\x1b[32m") {
         return rendered;
     }
-    if let Some(rendered) = render_emoji_done_line(line, "✎", "\x1b[32m") {
+    if let Some(rendered) = render_emoji_done_line(line, "✏️", "\x1b[32m") {
         return rendered;
     }
-    if let Some(rendered) = render_emoji_done_line(line, "🗒️", "\x1b[36m") {
+    if let Some(rendered) = render_fetch_done_line(line) {
         return rendered;
     }
     if let Some(rest) = line.strip_prefix("💬 ") {
@@ -4231,9 +4424,21 @@ fn render_status_line_interactive(line: &str) -> String {
         return "\x1b[2mrunning\x1b[0m".to_string();
     }
     if let Some(rest) = line.strip_prefix("running: ") {
+        if is_plan_status_label(rest) {
+            return format!("\x1b[2mrunning\x1b[0m: \x1b[90m{}\x1b[0m", rest);
+        }
         return format!("\x1b[2mrunning\x1b[0m: {}", colorize_paths(rest));
     }
     colorize_paths(line)
+}
+
+fn is_plan_event_line(line: &str) -> bool {
+    line == "update plan" || line.starts_with("update plan | ")
+}
+
+fn is_plan_status_label(label: &str) -> bool {
+    let trimmed = label.trim();
+    trimmed == "update plan" || trimmed.starts_with("plan ")
 }
 
 fn render_emoji_done_line(line: &str, symbol: &str, color_prefix: &str) -> Option<String> {
@@ -4253,6 +4458,37 @@ fn render_emoji_done_line(line: &str, symbol: &str, color_prefix: &str) -> Optio
         symbol,
         colorize_done_payload(rest)
     ))
+}
+
+fn render_fetch_done_line(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("🌐 ")?;
+    if rest.starts_with("| ") {
+        return None;
+    }
+
+    Some(format!(
+        "\x1b[36m🌐\x1b[0m {}",
+        colorize_fetch_done_payload(rest)
+    ))
+}
+
+fn colorize_fetch_done_payload(payload: &str) -> String {
+    let trimmed = payload.trim();
+    let segments = trimmed.split(" | ").collect::<Vec<_>>();
+    if segments.len() > 1 {
+        let mut out = Vec::with_capacity(segments.len());
+        out.push(colorize_fetch_target_segment(segments[0]));
+        for seg in segments.iter().skip(1) {
+            out.push(colorize_done_segment(seg));
+        }
+        return out.join(" \x1b[2m|\x1b[0m ");
+    }
+
+    colorize_fetch_target_segment(trimmed)
+}
+
+fn colorize_fetch_target_segment(segment: &str) -> String {
+    colorize_paths(segment)
 }
 
 fn colorize_done_payload(payload: &str) -> String {
@@ -4305,6 +4541,9 @@ fn colorize_session_segment(segment: &str) -> String {
         "full-access" | "danger-full-access" => return "\x1b[33mfull-access\x1b[0m".to_string(),
         _ => {}
     }
+    if is_provider_model_session_segment(trimmed) {
+        return format!("\x1b[90m{}\x1b[0m", trimmed);
+    }
     if let Some((key, value)) = trimmed.split_once('=') {
         let code = match (key, value) {
             ("sandbox", "workspace") | ("sandbox", "workspace-write") => Some("34"),
@@ -4317,6 +4556,16 @@ fn colorize_session_segment(segment: &str) -> String {
     }
 
     colorize_paths(segment)
+}
+
+fn is_provider_model_session_segment(segment: &str) -> bool {
+    if matches!(segment, "claude" | "codex") {
+        return true;
+    }
+    let Some((provider, model)) = segment.split_once(':') else {
+        return false;
+    };
+    !model.trim().is_empty() && matches!(provider.trim(), "claude" | "codex")
 }
 
 fn colorize_done_segment(segment: &str) -> String {
@@ -4775,6 +5024,13 @@ mod tests {
     }
 
     #[test]
+    fn run_started_progress_line_includes_execution_mode_and_provider_model() {
+        let line =
+            format_run_started_progress_line("🧵 thread_123", "workspace", "codex:gpt-5-codex");
+        assert_eq!(line, "🧵 thread_123 | workspace | codex:gpt-5-codex");
+    }
+
+    #[test]
     fn parses_item_completed_event() {
         let line =
             r#"{"type":"item.completed","item":{"id":"i1","type":"file_change","path":"out.txt"}}"#;
@@ -4851,6 +5107,36 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_codex_url_lookup_other_action_as_web_fetch() {
+        let line = r#"{"type":"item.completed","item":{"id":"i6b","type":"web_search","query":"https://example.com/","action":{"type":"other"}}}"#;
+        let ev = parse_codex_stream_line(line).expect("expected event");
+
+        assert_eq!(
+            ev,
+            ProviderEvent::ItemCompleted {
+                item_type: "web_fetch".to_string(),
+                item_id: Some("i6b".to_string()),
+                summary: Some("https://example.com/".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn keeps_url_search_action_as_web_search() {
+        let line = r#"{"type":"item.completed","item":{"id":"i6c","type":"web_search","query":"https://example.com/","action":{"type":"search","query":"https://example.com/"}}}"#;
+        let ev = parse_codex_stream_line(line).expect("expected event");
+
+        assert_eq!(
+            ev,
+            ProviderEvent::ItemCompleted {
+                item_type: "web_search".to_string(),
+                item_id: Some("i6c".to_string()),
+                summary: Some("https://example.com/".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn normalizes_generic_tool_call_item() {
         let line = r#"{"type":"item.completed","item":{"id":"i7","type":"function_call","name":"search_docs","arguments":"{\"query\":\"provider events\"}"}}"#;
         let ev = parse_codex_stream_line(line).expect("expected event");
@@ -4905,7 +5191,7 @@ mod tests {
             ProviderEvent::ItemCompleted {
                 item_type: "todo_list".to_string(),
                 item_id: Some("i10".to_string()),
-                summary: Some("investigate search traces (+1 more)".to_string()),
+                summary: Some("0/2 done | investigate search traces".to_string()),
             }
         );
     }
@@ -5063,8 +5349,20 @@ mod tests {
         assert_eq!(tool.item_type, "todo_list");
         assert_eq!(
             tool.summary.as_deref(),
-            Some("investigate search traces (+1 more)")
+            Some("0/2 done | investigate search traces")
         );
+    }
+
+    #[test]
+    fn claude_pending_tool_formats_todo_write_status_progress() {
+        let content: Value = serde_json::from_str(
+            r#"{"id":"toolu_6b","name":"TodoWrite","input":{"todos":[{"content":"read README.md","status":"completed"},{"content":"read DEVELOPMENT.md","status":"in_progress"},{"content":"write report","status":"pending"}]}}"#,
+        )
+        .expect("json");
+
+        let tool = claude_pending_tool(&content, Path::new("/tmp/work")).expect("tool");
+        assert_eq!(tool.item_type, "todo_list");
+        assert_eq!(tool.summary.as_deref(), Some("1/3 done | read README.md"));
     }
 
     #[test]
@@ -5160,6 +5458,9 @@ mod tests {
 
         let unsandboxed = colorize_session_payload("019d-session | full-access");
         assert!(unsandboxed.contains("full-access"));
+
+        let with_provider = colorize_session_payload("019d-session | workspace | claude:sonnet");
+        assert!(with_provider.contains("\x1b[90mclaude:sonnet\x1b[0m"));
     }
 
     #[test]
@@ -5172,10 +5473,11 @@ mod tests {
     #[test]
     fn session_event_line_uses_readable_sandbox_value() {
         let printer = ProgressPrinter::new_test(true);
-        let rendered = printer.render_event_line("🧵 019d-session | full-access");
+        let rendered = printer.render_event_line("🧵 019d-session | full-access | codex:gpt-5-codex");
         assert!(rendered.contains("🧵"));
         assert!(!rendered.contains("🧵 session "));
         assert!(rendered.contains("\x1b[33mfull-access\x1b[0m"));
+        assert!(rendered.contains("\x1b[90mcodex:gpt-5-codex\x1b[0m"));
     }
 
     #[test]
@@ -5196,9 +5498,25 @@ mod tests {
             rendered,
             "\u{1b}[2mrunning\u{1b}[0m: search Example Domain example.com"
         );
+        let plan_rendered = printer.render_status_line("running: plan 2/3");
+        assert_eq!(
+            plan_rendered,
+            "\u{1b}[2mrunning\u{1b}[0m: \u{1b}[90mplan 2/3\u{1b}[0m"
+        );
         assert_eq!(
             printer.render_status_line("running"),
             "\u{1b}[2mrunning\u{1b}[0m"
+        );
+    }
+
+    #[test]
+    fn event_line_renders_plan_updates_gray() {
+        let printer = ProgressPrinter::new_test(true);
+        let rendered =
+            printer.render_event_line("update plan | 2/3 done | Read first heading from README.md");
+        assert_eq!(
+            rendered,
+            "\u{1b}[90mupdate plan | 2/3 done | Read first heading from README.md\u{1b}[0m"
         );
     }
 
@@ -6058,7 +6376,7 @@ mod tests {
             true,
         )
         .expect("expected file line");
-        assert_eq!(line, "✎ edit src/main.rs");
+        assert_eq!(line, "✏️ edit src/main.rs");
     }
 
     #[test]
@@ -6067,14 +6385,51 @@ mod tests {
             &ProviderEvent::ItemCompleted {
                 item_type: "todo_list".to_string(),
                 item_id: Some("x".to_string()),
-                summary: Some("refresh provider trace coverage".to_string()),
+                summary: Some("1/4 done | refresh provider trace coverage".to_string()),
             },
             true,
             false,
             true,
         )
         .expect("expected todo line");
-        assert_eq!(line, "🗒️ plan: refresh provider trace coverage");
+        assert_eq!(
+            line,
+            "update plan | 1/4 done | refresh provider trace coverage"
+        );
+    }
+
+    #[test]
+    fn shows_todo_update_as_plan_update() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemUpdated {
+                item_type: "todo_list".to_string(),
+                item_id: Some("x".to_string()),
+                summary: Some("2/3 done | Capture first heading from contrib/DEVELOPMENT.md".to_string()),
+            },
+            true,
+            false,
+            true,
+        )
+        .expect("expected todo update line");
+        assert_eq!(
+            line,
+            "update plan | 2/3 done | Capture first heading from contrib/DEVELOPMENT.md"
+        );
+    }
+
+    #[test]
+    fn hides_non_todo_item_updates() {
+        let line = format_terminal_event(
+            &ProviderEvent::ItemUpdated {
+                item_type: "web_search".to_string(),
+                item_id: Some("x".to_string()),
+                summary: Some("Example Domain example.com".to_string()),
+            },
+            true,
+            false,
+            true,
+        );
+        assert!(line.is_none());
     }
 
     #[test]
@@ -6195,8 +6550,11 @@ mod tests {
             "edit src/main.rs"
         );
         assert_eq!(
-            status_activity_label("todo_list", Some("refresh provider trace coverage")),
-            "update plan"
+            status_activity_label(
+                "todo_list",
+                Some("1/4 done | refresh provider trace coverage")
+            ),
+            "plan 1/4"
         );
     }
 
@@ -6210,6 +6568,25 @@ mod tests {
             ),
             "update plan"
         );
+        assert_eq!(
+            status_activity_label(
+                "todo_list",
+                Some("3/4 done | Write outputs to required files and prepare final report.")
+            ),
+            "plan 3/4"
+        );
+    }
+
+    #[test]
+    fn clears_live_status_for_completed_todo_progress_update() {
+        assert!(should_clear_live_progress_on_update(
+            "todo_list",
+            Some("3/3 done | write outputs/plan-trace/report.txt")
+        ));
+        assert!(!should_clear_live_progress_on_update(
+            "todo_list",
+            Some("2/3 done | read contrib/DEVELOPMENT.md")
+        ));
     }
 
     #[test]
@@ -6246,7 +6623,7 @@ mod tests {
             true,
         )
         .expect("expected todo line");
-        assert_eq!(line, "🗒️ plan updated");
+        assert_eq!(line, "update plan");
     }
 
     #[test]
@@ -6385,8 +6762,8 @@ mod tests {
             "item_5".to_string(),
             PathBuf::from("/tmp/clawform/src/main.rs"),
         );
-        let rendered = add_file_change_link_suffix(&event, "✎ update src/main.rs", &links, false);
-        assert!(rendered.contains("✎ update src/main.rs | file=/tmp/clawform/src/main.rs"));
+        let rendered = add_file_change_link_suffix(&event, "✏️ update src/main.rs", &links, false);
+        assert!(rendered.contains("✏️ update src/main.rs | file=/tmp/clawform/src/main.rs"));
     }
 
     #[test]
@@ -6423,5 +6800,110 @@ mod tests {
             rendered,
             "\x1b]8;;file:///tmp/clawform/commands/item_9.txt\x1b\\\x1b[95mout\x1b[0m\x1b]8;;\x1b\\"
         );
+    }
+
+    #[test]
+    fn render_fetch_done_line_keeps_full_url_with_duration() {
+        let rendered = render_fetch_done_line("🌐 https://example.com/docs/api?ref=1 | 220ms")
+            .expect("expected fetch line");
+        assert_eq!(
+            rendered,
+            "\x1b[36m🌐\x1b[0m \x1b[36mhttps://example.com/docs/api?ref=1\x1b[0m \x1b[2m|\x1b[0m \x1b[2m220ms\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn render_fetch_done_line_keeps_full_url_without_duration() {
+        let rendered = render_fetch_done_line("🌐 https://example.com/docs/api?ref=1")
+            .expect("expected fetch line");
+        assert_eq!(
+            rendered,
+            "\x1b[36m🌐\x1b[0m \x1b[36mhttps://example.com/docs/api?ref=1\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn raw_provider_event_type_includes_subtype_when_present() {
+        assert_eq!(
+            raw_provider_event_type(r#"{"type":"system","subtype":"init","session_id":"abc"}"#)
+                .as_deref(),
+            Some("system.init")
+        );
+        assert_eq!(
+            raw_provider_event_type(r#"{"type":"item.completed","item":{"id":"x"}}"#).as_deref(),
+            Some("item.completed")
+        );
+    }
+
+    #[test]
+    fn event_trace_sink_persists_normalized_event_records() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sink = EventTraceSink::new(Some(dir.path().to_path_buf()));
+        let event = ProviderEvent::ItemCompleted {
+            item_type: "web_fetch".to_string(),
+            item_id: Some("item_6".to_string()),
+            summary: Some("https://example.com".to_string()),
+        };
+
+        let path = sink
+            .persist(
+                Some("fetch-link-trace"),
+                Some("session-123"),
+                7,
+                2,
+                r#"{"type":"item.completed","item":{"id":"item_6","type":"tool_call","name":"WebFetch","input":{"url":"https://example.com"}}}"#,
+                &event,
+            )
+            .expect("persist should succeed")
+            .expect("path should be returned");
+
+        let raw = fs::read_to_string(&path).expect("read persisted events");
+        let line = raw.lines().next().expect("expected first line");
+        let parsed: Value = serde_json::from_str(line).expect("valid event json");
+
+        assert_eq!(parsed.get("sequence").and_then(Value::as_u64), Some(7));
+        assert_eq!(parsed.get("turn_index").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            parsed
+                .get("raw_provider_event_type")
+                .and_then(Value::as_str),
+            Some("item.completed")
+        );
+        let normalized = parsed.get("normalized").expect("normalized payload");
+        assert_eq!(
+            normalized.get("kind").and_then(Value::as_str),
+            Some("item_completed")
+        );
+        assert_eq!(
+            normalized.get("item_type").and_then(Value::as_str),
+            Some("web_fetch")
+        );
+        assert_eq!(
+            normalized.get("summary").and_then(Value::as_str),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn event_trace_sink_is_disabled_without_root() {
+        let sink = EventTraceSink::new(None);
+        let event = ProviderEvent::ItemCompleted {
+            item_type: "web_search".to_string(),
+            item_id: Some("item_7".to_string()),
+            summary: Some("Example Domain example.com".to_string()),
+        };
+
+        let persisted = sink
+            .persist(
+                Some("search-fetch-diff-trace"),
+                Some("session-456"),
+                1,
+                1,
+                r#"{"type":"item.completed","item":{"id":"item_7","type":"web_search","query":"Example Domain example.com"}}"#,
+                &event,
+            )
+            .expect("persist should succeed");
+
+        assert!(persisted.is_none());
     }
 }
