@@ -50,7 +50,7 @@ curl -fsSL https://raw.githubusercontent.com/dstackai/clawform/main/install.sh |
 Install a specific version:
 
 ```bash
-CLAWFORM_VERSION=v0.0.10 curl -fsSL https://raw.githubusercontent.com/dstackai/clawform/main/install.sh | sh
+CLAWFORM_VERSION=v0.0.11 curl -fsSL https://raw.githubusercontent.com/dstackai/clawform/main/install.sh | sh
 ```
 
 ## Quick Start
